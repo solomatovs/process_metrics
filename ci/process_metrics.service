@@ -1,0 +1,93 @@
+# process_metrics.service — event-driven process metrics collector (eBPF)
+#
+# Запуск от непривилегированного пользователя с минимальными capabilities.
+# Не требует root — только точечные caps для BPF и чтения /proc.
+#
+# Установка:
+#   sudo cp ci/process_metrics.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now process_metrics
+#
+# Capabilities:
+#   CAP_BPF        — загрузка eBPF программ и работа с BPF-картами
+#   CAP_PERFMON    — подключение к tracepoints, kprobes, raw_tracepoints
+#   CAP_SYS_PTRACE — чтение /proc/PID/* процессов других пользователей
+#   CAP_KILL       — kill(pid, 0) для проверки liveness чужих процессов
+#   CAP_DAC_READ_SEARCH — чтение /sys/fs/cgroup/* и /proc/*/cgroup
+#
+# Kernel requirements (см. ci/99-process-metrics.conf):
+#   kernel.perf_event_paranoid <= 2  (Debian default=3 блокирует CAP_PERFMON)
+#   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
+#   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
+
+[Unit]
+Description=Process Metrics Collector (eBPF)
+Documentation=file:/etc/process_metrics/process_metrics.conf
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# --- Непривилегированный пользователь ---
+User=process_metrics
+Group=process_metrics
+
+# --- Capabilities (минимальный набор) ---
+AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+SecureBits=no-setuid-fixup
+
+# --- Запуск ---
+ExecStart=/usr/local/bin/process_metrics \
+    -c /etc/process_metrics/process_metrics.conf \
+    -o /var/lib/process_metrics \
+    -f process_metrics.prom \
+    -i 30
+
+# --- Перезагрузка конфига по SIGHUP ---
+ExecReload=/bin/kill -HUP $MAINPID
+
+# --- Рестарт при падении ---
+Restart=on-failure
+RestartSec=5
+
+# --- Ограничение ресурсов ---
+MemoryMax=64M
+CPUQuota=10%
+
+# --- Hardening ---
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectControlGroups=no
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+PrivateNetwork=no
+PrivateDevices=yes
+
+# Доступ к файловой системе
+ReadOnlyPaths=/proc /sys/fs/cgroup /sys/kernel/btf
+ReadWritePaths=/var/lib/process_metrics
+
+# BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
+ReadOnlyPaths=/sys/fs/bpf
+ReadOnlyPaths=-/sys/kernel/debug/tracing
+ReadOnlyPaths=-/sys/kernel/tracing
+
+# Syscall фильтр: разрешаем bpf() и perf_event_open()
+SystemCallFilter=@system-service
+SystemCallFilter=bpf perf_event_open
+
+[Install]
+WantedBy=multi-user.target

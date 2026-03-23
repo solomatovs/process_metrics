@@ -59,6 +59,101 @@ static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
+/* ── exited process cache (circular buffer for last N exits) ──────── */
+
+#define MAX_EXITED 256
+
+struct exited_proc {
+	__u32 tgid;
+	__u32 ppid;
+	__u32 exit_code;
+	__u16 rule_id;
+	__u32 root_pid;
+	__u64 cpu_ns;
+	__u64 rss_max_pages;
+	__u64 rss_min_pages;
+	__u8  oom_killed;
+	__u64 net_tx_bytes;
+	__u64 net_rx_bytes;
+	__u64 timestamp_ns;       /* when process exited */
+	char  comm[COMM_LEN];
+	char  cmdline[CMDLINE_MAX];
+	__u16 cmdline_len;
+};
+
+static struct exited_proc exited_ring[MAX_EXITED];
+static int exited_head;   /* next write position */
+static int exited_count;  /* total entries (max MAX_EXITED) */
+
+static void record_exit(const struct event *e)
+{
+	struct exited_proc *ep = &exited_ring[exited_head % MAX_EXITED];
+	ep->tgid         = e->tgid;
+	ep->ppid         = e->ppid;
+	ep->exit_code    = e->exit_code;
+	ep->rule_id      = e->rule_id;
+	ep->root_pid     = e->root_pid;
+	ep->cpu_ns       = e->cpu_ns;
+	ep->rss_max_pages = e->rss_max_pages;
+	ep->rss_min_pages = e->rss_min_pages;
+	ep->oom_killed   = e->oom_killed;
+	ep->net_tx_bytes = e->net_tx_bytes;
+	ep->net_rx_bytes = e->net_rx_bytes;
+	ep->timestamp_ns = e->timestamp_ns;
+	memcpy(ep->comm, e->comm, COMM_LEN);
+	memcpy(ep->cmdline, e->cmdline, CMDLINE_MAX);
+	ep->cmdline_len  = e->cmdline_len;
+	exited_head = (exited_head + 1) % MAX_EXITED;
+	if (exited_count < MAX_EXITED)
+		exited_count++;
+}
+
+/* ── CPU usage cache (for computing per-interval ratio) ───────────── */
+
+#define MAX_CPU_PREV 8192
+
+struct cpu_prev {
+	__u32 tgid;
+	__u64 cpu_ns;
+};
+
+static struct cpu_prev cpu_prev_cache[MAX_CPU_PREV];
+static int cpu_prev_count;
+static struct timespec prev_snapshot_ts;
+
+static __u64 cpu_prev_lookup(__u32 tgid)
+{
+	for (int i = 0; i < cpu_prev_count; i++)
+		if (cpu_prev_cache[i].tgid == tgid)
+			return cpu_prev_cache[i].cpu_ns;
+	return 0;
+}
+
+static void cpu_prev_update(__u32 tgid, __u64 cpu_ns)
+{
+	for (int i = 0; i < cpu_prev_count; i++) {
+		if (cpu_prev_cache[i].tgid == tgid) {
+			cpu_prev_cache[i].cpu_ns = cpu_ns;
+			return;
+		}
+	}
+	if (cpu_prev_count < MAX_CPU_PREV) {
+		cpu_prev_cache[cpu_prev_count].tgid = tgid;
+		cpu_prev_cache[cpu_prev_count].cpu_ns = cpu_ns;
+		cpu_prev_count++;
+	}
+}
+
+static void cpu_prev_remove(__u32 tgid)
+{
+	for (int i = 0; i < cpu_prev_count; i++) {
+		if (cpu_prev_cache[i].tgid == tgid) {
+			cpu_prev_cache[i] = cpu_prev_cache[--cpu_prev_count];
+			return;
+		}
+	}
+}
+
 /* ── cgroup cache ─────────────────────────────────────────────────── */
 
 struct cgroup_entry {
@@ -290,6 +385,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	char *p = rp + 2;
 	char state;
 	int ppid;
+	unsigned long minflt, cminflt, majflt, cmajflt;
 	unsigned long utime, stime, starttime, vsize;
 	long rss;
 	int threads;
@@ -297,18 +393,23 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	   minflt cminflt majflt cmajflt utime stime cutime cstime
 	   priority nice num_threads itrealvalue starttime vsize rss */
 	if (sscanf(p,
-		   "%c %d %*d %*d %*d %*d %*u "
-		   "%*lu %*lu %*lu %*lu %lu %lu %*ld %*ld "
-		   "%*d %*d %d %*ld %lu %lu %ld",
-		   &state, &ppid, &utime, &stime,
-		   &threads, &starttime, &vsize, &rss) != 8)
+		   "%c %d %*d %*d %*d %*d %*d "
+		   "%lu %lu %lu %lu %lu %lu %*d %*d "
+		   "%*d %*d %d %*d %lu %lu %ld",
+		   &state, &ppid,
+		   &minflt, &cminflt, &majflt, &cmajflt,
+		   &utime, &stime,
+		   &threads, &starttime, &vsize, &rss) != 12)
 		return -1;
 
 	pi->ppid = (__u32)ppid;
 	pi->state = (__u8)state;
 	pi->threads = (__u32)threads;
 	pi->rss_pages = rss > 0 ? (__u64)rss : 0;
+	pi->rss_min_pages = pi->rss_pages;
 	pi->rss_max_pages = pi->rss_pages;
+	pi->maj_flt = (__u64)(majflt + cmajflt);
+	pi->min_flt = (__u64)(minflt + cminflt);
 
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0) page_size = 4096;
@@ -318,6 +419,42 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	if (clk_tck <= 0) clk_tck = 100;
 	pi->cpu_ns = ((__u64)(utime + stime) * 1000000000ULL) / (__u64)clk_tck;
 	pi->start_ns = ((__u64)starttime * 1000000000ULL) / (__u64)clk_tck;
+
+	/* Read extra fields from /proc/PID/status */
+	char spath[64];
+	snprintf(spath, sizeof(spath), "/proc/%u/status", pid);
+	FILE *sf = fopen(spath, "r");
+	if (sf) {
+		char sline[256];
+		while (fgets(sline, sizeof(sline), sf)) {
+			unsigned long val;
+			if (sscanf(sline, "RssShmem: %lu kB", &val) == 1)
+				pi->shmem_pages = (__u64)(val * 1024 / page_size);
+			else if (sscanf(sline, "VmSwap: %lu kB", &val) == 1)
+				pi->swap_pages = (__u64)(val * 1024 / page_size);
+			else if (sscanf(sline, "voluntary_ctxt_switches: %lu", &val) == 1)
+				pi->nvcsw = (__u64)val;
+			else if (sscanf(sline, "nonvoluntary_ctxt_switches: %lu", &val) == 1)
+				pi->nivcsw = (__u64)val;
+		}
+		fclose(sf);
+	}
+
+	/* Read IO from /proc/PID/io (requires root or ptrace) */
+	char iopath[64];
+	snprintf(iopath, sizeof(iopath), "/proc/%u/io", pid);
+	FILE *iof = fopen(iopath, "r");
+	if (iof) {
+		char ioline[128];
+		while (fgets(ioline, sizeof(ioline), iof)) {
+			unsigned long long val;
+			if (sscanf(ioline, "read_bytes: %llu", &val) == 1)
+				pi->io_read_bytes = (__u64)val;
+			else if (sscanf(ioline, "write_bytes: %llu", &val) == 1)
+				pi->io_write_bytes = (__u64)val;
+		}
+		fclose(iof);
+	}
 
 	return 0;
 }
@@ -596,16 +733,37 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	case EVENT_EXIT: {
-		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0) {
-			const char *rname = (ti.rule_id < num_rules)
-				? rules[ti.rule_id].name : "?";
-			log_ts("INFO", "EXIT: pid=%u rule=%s cpu=%.2fs rss_max=%lluMB",
-			       e->tgid, rname,
-			       (double)e->cpu_ns / 1e9,
-			       (unsigned long long)(e->rss_max_pages * 4 / 1024));
-		}
+		const char *rname = (e->rule_id < num_rules)
+			? rules[e->rule_id].name : "?";
+		/*
+		 * exit_code encodes: bits 0-7 = signal, bits 8-15 = status.
+		 * signal>0 means killed by signal; status = normal exit code.
+		 */
+		int sig = e->exit_code & 0x7f;
+		int status = (e->exit_code >> 8) & 0xff;
+
+		log_ts("INFO", "EXIT: pid=%u rule=%s exit_code=%d "
+		       "signal=%d cpu=%.2fs rss_max=%lluMB%s",
+		       e->tgid, rname, status, sig,
+		       (double)e->cpu_ns / 1e9,
+		       (unsigned long long)(e->rss_max_pages * 4 / 1024),
+		       e->oom_killed ? " [OOM]" : "");
+
+		record_exit(e);
 		/* BPF already deleted from maps */
+		break;
+	}
+
+	case EVENT_OOM_KILL: {
+		struct track_info ti;
+		const char *rname = "?";
+		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
+			rname = (ti.rule_id < num_rules)
+				? rules[ti.rule_id].name : "?";
+		log_ts("WARN", "OOM_KILL: pid=%u rule=%s comm=%.16s "
+		       "rss=%lluMB",
+		       e->tgid, rname, e->comm,
+		       (unsigned long long)(e->rss_pages * 4 / 1024));
 		break;
 	}
 	}
@@ -653,35 +811,78 @@ static void write_snapshot(void)
 	time_t now_epoch = time(NULL);
 	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
 
+	/* Elapsed time since previous snapshot (for cpu_usage_ratio) */
+	double elapsed_ns = 0;
+	if (prev_snapshot_ts.tv_sec > 0) {
+		elapsed_ns = (double)(mono.tv_sec - prev_snapshot_ts.tv_sec) * 1e9
+			   + (double)(mono.tv_nsec - prev_snapshot_ts.tv_nsec);
+	}
+	prev_snapshot_ts = mono;
+
 	const char *pfx = cfg_metric_prefix;
 
-	/* HELP/TYPE headers */
+	/* HELP/TYPE headers — always present */
 	fprintf(f,
 		"# HELP %s_info Process info (value always 1, metadata in labels)\n"
 		"# TYPE %s_info gauge\n"
-		"# HELP %s_rss_bytes Process RSS memory in bytes\n"
-		"# TYPE %s_rss_bytes gauge\n"
-		"# HELP %s_rss_max_bytes Max observed RSS memory in bytes\n"
-		"# TYPE %s_rss_max_bytes gauge\n"
-		"# HELP %s_vsize_bytes Process virtual memory in bytes\n"
-		"# TYPE %s_vsize_bytes gauge\n"
-		"# HELP %s_cpu_seconds_total Total CPU time (user + system) in seconds\n"
-		"# TYPE %s_cpu_seconds_total counter\n"
-		"# HELP %s_threads Number of threads\n"
-		"# TYPE %s_threads gauge\n"
 		"# HELP %s_start_time_seconds Process start time as unix epoch\n"
 		"# TYPE %s_start_time_seconds gauge\n"
 		"# HELP %s_uptime_seconds Process uptime in seconds\n"
 		"# TYPE %s_uptime_seconds gauge\n"
-		"# HELP %s_oom_score_adj Current OOM score adjustment\n"
-		"# TYPE %s_oom_score_adj gauge\n"
 		"# HELP %s_is_root Whether PID is a root of tracked tree (1=root, 0=child)\n"
-		"# TYPE %s_is_root gauge\n"
-		"# HELP %s_state Process state (R=running, S=sleeping, D=disk_sleep, T=stopped, Z=zombie)\n"
-		"# TYPE %s_state gauge\n",
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-		pfx, pfx);
+		"# TYPE %s_is_root gauge\n",
+		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
+
+	/* HELP/TYPE headers — sched_switch metrics */
+	fprintf(f,
+			"# HELP %s_rss_bytes Process RSS memory in bytes\n"
+			"# TYPE %s_rss_bytes gauge\n"
+			"# HELP %s_rss_min_bytes Min observed RSS memory in bytes\n"
+			"# TYPE %s_rss_min_bytes gauge\n"
+			"# HELP %s_rss_max_bytes Max observed RSS memory in bytes\n"
+			"# TYPE %s_rss_max_bytes gauge\n"
+			"# HELP %s_shmem_bytes Shared memory in bytes\n"
+			"# TYPE %s_shmem_bytes gauge\n"
+			"# HELP %s_swap_bytes Swap usage in bytes\n"
+			"# TYPE %s_swap_bytes gauge\n"
+			"# HELP %s_oom_kill Process was killed by OOM killer (1=killed)\n"
+			"# TYPE %s_oom_kill gauge\n"
+			"# HELP %s_vsize_bytes Process virtual memory in bytes\n"
+			"# TYPE %s_vsize_bytes gauge\n"
+			"# HELP %s_cpu_seconds_total Total CPU time (user + system) in seconds\n"
+			"# TYPE %s_cpu_seconds_total counter\n"
+			"# HELP %s_cpu_usage_ratio CPU usage ratio over last snapshot interval (1.0 = 1 core)\n"
+			"# TYPE %s_cpu_usage_ratio gauge\n"
+			"# HELP %s_io_read_bytes_total Actual disk read bytes\n"
+			"# TYPE %s_io_read_bytes_total counter\n"
+			"# HELP %s_io_write_bytes_total Actual disk write bytes\n"
+			"# TYPE %s_io_write_bytes_total counter\n"
+			"# HELP %s_major_page_faults_total Major page faults (required disk IO)\n"
+			"# TYPE %s_major_page_faults_total counter\n"
+			"# HELP %s_minor_page_faults_total Minor page faults (no disk IO)\n"
+			"# TYPE %s_minor_page_faults_total counter\n"
+			"# HELP %s_voluntary_ctxsw_total Voluntary context switches (process yielded CPU)\n"
+			"# TYPE %s_voluntary_ctxsw_total counter\n"
+			"# HELP %s_involuntary_ctxsw_total Involuntary context switches (preempted by kernel)\n"
+			"# TYPE %s_involuntary_ctxsw_total counter\n"
+			"# HELP %s_threads Number of threads\n"
+			"# TYPE %s_threads gauge\n"
+			"# HELP %s_oom_score_adj Current OOM score adjustment\n"
+			"# TYPE %s_oom_score_adj gauge\n"
+			"# HELP %s_state Process state (R=running, S=sleeping, D=disk_sleep, T=stopped, Z=zombie)\n"
+			"# TYPE %s_state gauge\n",
+			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+			pfx, pfx, pfx, pfx, pfx, pfx);
+
+	/* HELP/TYPE headers — network kretprobe metrics */
+	fprintf(f,
+			"# HELP %s_net_tx_bytes_total TCP+UDP bytes sent\n"
+			"# TYPE %s_net_tx_bytes_total counter\n"
+			"# HELP %s_net_rx_bytes_total TCP+UDP bytes received\n"
+			"# TYPE %s_net_rx_bytes_total counter\n",
+			pfx, pfx, pfx, pfx);
 
 	/* Iterate proc_map */
 	__u32 key = 0, next_key;
@@ -716,6 +917,34 @@ static void write_snapshot(void)
 		const char *rule_name = (ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : "unknown";
 
+		/* Refresh cmdline + comm from /proc (processes like postgres
+		 * rewrite argv after exec, e.g. "postgres: checkpointer") */
+		{
+			char fresh[CMDLINE_MAX];
+			int flen = read_proc_cmdline(key, fresh, sizeof(fresh));
+			if (flen > 0) {
+				memcpy(pi.cmdline, fresh, CMDLINE_MAX);
+				pi.cmdline_len = (__u16)flen;
+				/* Update BPF map so ring buffer events
+				 * (exit) carry the current cmdline */
+				bpf_map_update_elem(proc_map_fd, &key, &pi,
+						    BPF_EXIST);
+			}
+			/* Refresh comm from /proc/PID/comm */
+			char cpath[128];
+			snprintf(cpath, sizeof(cpath), "/proc/%u/comm", key);
+			FILE *cf = fopen(cpath, "r");
+			if (cf) {
+				char cbuf[COMM_LEN];
+				if (fgets(cbuf, sizeof(cbuf), cf)) {
+					/* strip trailing newline */
+					cbuf[strcspn(cbuf, "\n")] = '\0';
+					memcpy(pi.comm, cbuf, COMM_LEN);
+				}
+				fclose(cf);
+			}
+		}
+
 		/* Convert cmdline */
 		char cmdline[CMDLINE_MAX + 4];
 		cmdline_to_str(pi.cmdline, pi.cmdline_len, cmdline, sizeof(cmdline));
@@ -739,38 +968,98 @@ static void write_snapshot(void)
 		if (uptime_sec < 0) uptime_sec = 0;
 		time_t start_epoch = now_epoch - (time_t)uptime_sec;
 
-		/* Write metrics */
+		/* Write metrics — always present */
 		fprintf(f, "%s_info{rule=\"%s\",root_pid=\"%u\",pid=\"%u\","
 			"comm=\"%s\",cmdline=\"%s\",cgroup=\"%s\"} 1\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			comm_esc, cmdline_esc, cg_esc);
+		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
+			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
+		fprintf(f, "%s_uptime_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(long)(uptime_sec > 0 ? uptime_sec : 0));
+		fprintf(f, "%s_is_root{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
+			pfx, rule_name, ti.root_pid, pi.tgid, ti.is_root);
+
+		/* Metrics from sched_switch probe */
 		fprintf(f, "%s_rss_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(unsigned long long)(pi.rss_pages * page_size));
+		fprintf(f, "%s_rss_min_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)(pi.rss_min_pages * page_size));
 		fprintf(f, "%s_rss_max_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(unsigned long long)(pi.rss_max_pages * page_size));
+		fprintf(f, "%s_shmem_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)(pi.shmem_pages * page_size));
+		fprintf(f, "%s_swap_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)(pi.swap_pages * page_size));
+		fprintf(f, "%s_oom_kill{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
+			pfx, rule_name, ti.root_pid, pi.tgid, pi.oom_killed);
 		fprintf(f, "%s_vsize_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(unsigned long long)(pi.vsize_pages * page_size));
 		fprintf(f, "%s_cpu_seconds_total{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %.2f\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(double)pi.cpu_ns / 1e9);
+
+		/* CPU usage ratio: delta_cpu / delta_time over last interval */
+		if (elapsed_ns > 0) {
+			__u64 prev_ns = cpu_prev_lookup(key);
+			double delta = (double)(pi.cpu_ns - prev_ns);
+			double ratio = (prev_ns > 0 && delta >= 0)
+				? delta / elapsed_ns : 0;
+			fprintf(f, "%s_cpu_usage_ratio{rule=\"%s\",root_pid=\"%u\","
+				"pid=\"%u\"} %.4f\n",
+				pfx, rule_name, ti.root_pid, pi.tgid, ratio);
+		}
+		cpu_prev_update(key, pi.cpu_ns);
+
+		fprintf(f, "%s_io_read_bytes_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.io_read_bytes);
+		fprintf(f, "%s_io_write_bytes_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.io_write_bytes);
+		fprintf(f, "%s_major_page_faults_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.maj_flt);
+		fprintf(f, "%s_minor_page_faults_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.min_flt);
+		fprintf(f, "%s_voluntary_ctxsw_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.nvcsw);
+		fprintf(f, "%s_involuntary_ctxsw_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.nivcsw);
 		fprintf(f, "%s_threads{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, pi.threads);
-		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
-		fprintf(f, "%s_uptime_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(long)(uptime_sec > 0 ? uptime_sec : 0));
 		fprintf(f, "%s_oom_score_adj{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %d\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, pi.oom_score_adj);
-		fprintf(f, "%s_is_root{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, ti.is_root);
 		char state_str[2] = { (char)(pi.state ? pi.state : '?'), '\0' };
 		fprintf(f, "%s_state{rule=\"%s\",root_pid=\"%u\",pid=\"%u\","
 			"state=\"%s\"} 1\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, state_str);
+
+		/* Metrics from network kretprobes */
+		fprintf(f, "%s_net_tx_bytes_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.net_tx_bytes);
+		fprintf(f, "%s_net_rx_bytes_total{rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\"} %llu\n",
+			pfx, rule_name, ti.root_pid, pi.tgid,
+			(unsigned long long)pi.net_rx_bytes);
 
 		/* Collect unique cgroup for cgroup-level metrics */
 		if (cg_path[0] && seen_cg_count < MAX_CGROUPS) {
@@ -798,9 +1087,83 @@ next:
 	for (int i = 0; i < dead_count; i++) {
 		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
 		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
+		cpu_prev_remove(dead_keys[i]);
 	}
 	if (dead_count > 0)
 		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
+
+	/* Recently exited processes */
+	if (exited_count > 0) {
+		fprintf(f,
+			"# HELP %s_exited_exit_code Exit code of recently exited process\n"
+			"# TYPE %s_exited_exit_code gauge\n"
+			"# HELP %s_exited_signal Signal that killed recently exited process (0=normal)\n"
+			"# TYPE %s_exited_signal gauge\n"
+			"# HELP %s_exited_oom_kill Process was killed by OOM killer\n"
+			"# TYPE %s_exited_oom_kill gauge\n"
+			"# HELP %s_exited_cpu_seconds_total Total CPU of exited process\n"
+			"# TYPE %s_exited_cpu_seconds_total gauge\n"
+			"# HELP %s_exited_rss_max_bytes Max RSS of exited process\n"
+			"# TYPE %s_exited_rss_max_bytes gauge\n",
+			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
+
+		fprintf(f,
+			"# HELP %s_exited_net_tx_bytes_total TCP+UDP bytes sent by exited process\n"
+			"# TYPE %s_exited_net_tx_bytes_total gauge\n"
+			"# HELP %s_exited_net_rx_bytes_total TCP+UDP bytes received by exited process\n"
+			"# TYPE %s_exited_net_rx_bytes_total gauge\n",
+			pfx, pfx, pfx, pfx);
+
+		int start = (exited_count < MAX_EXITED) ? 0 : exited_head;
+		for (int i = 0; i < exited_count; i++) {
+			int idx = (start + i) % MAX_EXITED;
+			struct exited_proc *ep = &exited_ring[idx];
+			const char *rname = (ep->rule_id < num_rules)
+				? rules[ep->rule_id].name : "unknown";
+
+			char cmdline[CMDLINE_MAX + 4];
+			cmdline_to_str(ep->cmdline, ep->cmdline_len,
+				       cmdline, sizeof(cmdline));
+			if ((int)strlen(cmdline) > cfg_cmdline_max_len) {
+				cmdline[cfg_cmdline_max_len] = '\0';
+				strcat(cmdline, "...");
+			}
+
+			char comm_esc[64], cmdline_esc[CMDLINE_MAX * 2];
+			escape_label(ep->comm, comm_esc, sizeof(comm_esc));
+			escape_label(cmdline, cmdline_esc, sizeof(cmdline_esc));
+
+			int sig = ep->exit_code & 0x7f;
+			int status = (ep->exit_code >> 8) & 0xff;
+
+			fprintf(f, "%s_exited_exit_code{rule=\"%s\",root_pid=\"%u\","
+				"pid=\"%u\",comm=\"%s\",cmdline=\"%s\"} %d\n",
+				pfx, rname, ep->root_pid, ep->tgid,
+				comm_esc, cmdline_esc, status);
+			fprintf(f, "%s_exited_signal{rule=\"%s\",root_pid=\"%u\","
+				"pid=\"%u\"} %d\n",
+				pfx, rname, ep->root_pid, ep->tgid, sig);
+			fprintf(f, "%s_exited_oom_kill{rule=\"%s\",root_pid=\"%u\","
+				"pid=\"%u\"} %u\n",
+				pfx, rname, ep->root_pid, ep->tgid, ep->oom_killed);
+			fprintf(f, "%s_exited_cpu_seconds_total{rule=\"%s\","
+				"root_pid=\"%u\",pid=\"%u\"} %.2f\n",
+				pfx, rname, ep->root_pid, ep->tgid,
+				(double)ep->cpu_ns / 1e9);
+			fprintf(f, "%s_exited_rss_max_bytes{rule=\"%s\","
+				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
+				pfx, rname, ep->root_pid, ep->tgid,
+				(unsigned long long)(ep->rss_max_pages * page_size));
+			fprintf(f, "%s_exited_net_tx_bytes_total{rule=\"%s\","
+				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
+				pfx, rname, ep->root_pid, ep->tgid,
+				(unsigned long long)ep->net_tx_bytes);
+			fprintf(f, "%s_exited_net_rx_bytes_total{rule=\"%s\","
+				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
+				pfx, rname, ep->root_pid, ep->tgid,
+				(unsigned long long)ep->net_rx_bytes);
+		}
+	}
 
 	/* Cgroup v2 metrics from /sys/fs/cgroup */
 	if (seen_cg_count > 0) {
@@ -900,8 +1263,11 @@ int main(int argc, char *argv[])
 	if ((env = getenv("exec_rate_limit"))) cfg_exec_rate_limit = atoi(env);
 
 	/* Command-line overrides */
+	static struct option long_opts[] = {
+		{NULL, 0, NULL, 0}
+	};
 	int opt;
-	while ((opt = getopt(argc, argv, "c:o:f:i:p:l:r:h")) != -1) {
+	while ((opt = getopt_long(argc, argv, "c:o:f:i:p:l:r:h", long_opts, NULL)) != -1) {
 		switch (opt) {
 		case 'c': cfg_config_file = optarg; break;
 		case 'o': cfg_output_dir = optarg; break;
@@ -968,7 +1334,6 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Attach all probes */
 	if (process_metrics_bpf__attach(skel)) {
 		fprintf(stderr, "FATAL: failed to attach BPF programs\n");
 		process_metrics_bpf__destroy(skel);
@@ -996,7 +1361,8 @@ int main(int argc, char *argv[])
 	/* One-time startup scan: find already-running processes */
 	initial_scan();
 
-	log_ts("INFO", "started: %d rules, snapshot every %ds, output=%s/%s, exec_rate_limit=%d/s",
+	log_ts("INFO", "started: %d rules, snapshot every %ds, output=%s/%s, "
+	       "exec_rate_limit=%d/s",
 	       num_rules, cfg_snapshot_interval, cfg_output_dir, cfg_output_file,
 	       cfg_exec_rate_limit);
 
@@ -1026,6 +1392,9 @@ int main(int argc, char *argv[])
 
 			parse_config(cfg_config_file);
 			build_cgroup_cache();
+			exited_head = exited_count = 0;
+			cpu_prev_count = 0;
+			prev_snapshot_ts = (struct timespec){0};
 			initial_scan();
 		}
 

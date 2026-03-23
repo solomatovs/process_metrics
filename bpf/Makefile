@@ -47,13 +47,13 @@ BPFTOOL ?= $(BPFTOOL_BIN)
 CC      ?= gcc
 
 # Flags
-BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR)
+BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 LDFLAGS    := -lbpf -lelf -lz
 
 # Dependency packages
-APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev linux-headers-$(shell uname -r) llvm
-YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel kernel-devel-$(shell uname -r) llvm
+APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm
+YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel llvm
 
 # Minimum clang version for BPF CO-RE
 MIN_CLANG_VER := 10
@@ -109,6 +109,9 @@ deps:
 deps-apt:
 	apt-get update
 	apt-get install -y $(APT_PKGS)
+	@# kernel headers — optional, may not exist in containers
+	apt-get install -y linux-headers-$(shell uname -r) 2>/dev/null || \
+		echo "Note: linux-headers not found (OK for containers, needed only for vmlinux.h regeneration)"
 	@# Install clang >= 10: try clang-10..clang-18, then generic clang
 	@found=0; \
 	for pkg in clang-10 clang-11 clang-12 clang-13 clang-14 clang-15 clang-16 clang-17 clang-18 clang; do \
@@ -126,6 +129,9 @@ deps-apt:
 
 deps-yum:
 	yum install -y $(YUM_PKGS) clang
+	@# kernel headers — optional, may not exist in containers
+	yum install -y kernel-devel-$(shell uname -r) 2>/dev/null || \
+		echo "Note: kernel-devel not found (OK for containers, needed only for vmlinux.h regeneration)"
 
 # --- bpftool from vendored source ---
 
@@ -135,6 +141,7 @@ $(BPFTOOL_BIN): | $(BUILDDIR)
 	mkdir -p $(CURDIR)/$(BUILDDIR)/bpftool-build
 	$(MAKE) -C $(BPFTOOL_SRCDIR) -j$$(nproc) \
 		OUTPUT=$(CURDIR)/$(BUILDDIR)/bpftool-build/ \
+		CC=gcc \
 		EXTRA_CFLAGS="-Wno-error=discarded-qualifiers" \
 		LLVM_STRIP="$(shell command -v llvm-strip 2>/dev/null || echo true)"
 	cp $(CURDIR)/$(BUILDDIR)/bpftool-build/bpftool $@

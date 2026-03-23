@@ -7,6 +7,7 @@
  *   sched_process_fork  → inherit tracking from parent (raw_tp)
  *   sched_switch        → update rss, cpu, vsize for tracked PIDs
  *   sched_process_exit  → finalize metrics, send to userspace
+ *   mark_victim         → OOM killer selected process (raw_tp)
  *
  * Maps:
  *   proc_map    — per-process live metrics    (hash: tgid → proc_info)
@@ -90,20 +91,31 @@ static __always_inline int exec_rate_check(void)
 
 /* ── helpers ──────────────────────────────────────────────────────── */
 
-static __always_inline __u64 read_rss_pages(struct task_struct *task)
+struct mem_info {
+	__u64 rss_pages;    /* file + anon + shmem */
+	__u64 shmem_pages;  /* shared memory only */
+	__u64 swap_pages;   /* swap entries */
+};
+
+static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 {
+	struct mem_info mi = {0};
 	struct mm_struct *mm = BPF_CORE_READ(task, mm);
 	if (!mm)
-		return 0;
+		return mi;
 
-	/* MM_FILEPAGES=0, MM_ANONPAGES=1, MM_SHMEMPAGES=3 */
-	long v0 = 0, v1 = 0, v3 = 0;
+	/* MM_FILEPAGES=0, MM_ANONPAGES=1, MM_SWAPENTS=2, MM_SHMEMPAGES=3 */
+	long v0 = 0, v1 = 0, v2 = 0, v3 = 0;
 	bpf_core_read(&v0, sizeof(v0), &mm->rss_stat.count[0].counter);
 	bpf_core_read(&v1, sizeof(v1), &mm->rss_stat.count[1].counter);
+	bpf_core_read(&v2, sizeof(v2), &mm->rss_stat.count[2].counter);
 	bpf_core_read(&v3, sizeof(v3), &mm->rss_stat.count[3].counter);
 
 	long total = v0 + v1 + v3;
-	return total > 0 ? (__u64)total : 0;
+	mi.rss_pages   = total > 0 ? (__u64)total : 0;
+	mi.shmem_pages = v3 > 0 ? (__u64)v3 : 0;
+	mi.swap_pages  = v2 > 0 ? (__u64)v2 : 0;
+	return mi;
 }
 
 static __always_inline __u64 read_cpu_ns(struct task_struct *task)
@@ -138,6 +150,58 @@ static __always_inline __u32 read_nr_threads(struct task_struct *task)
 static __always_inline __s16 read_oom_score_adj(struct task_struct *task)
 {
 	return (__s16)BPF_CORE_READ(task, signal, oom_score_adj);
+}
+
+/*
+ * IO accounting: actual disk bytes read/written.
+ * task->ioac accumulates across all threads via signal->ioac on exit,
+ * but for live threads we read from group_leader + signal.
+ */
+static __always_inline void read_io_bytes(struct task_struct *task,
+					  __u64 *r, __u64 *w)
+{
+	/* signal->ioac accumulates dead threads' IO */
+	*r = BPF_CORE_READ(task, signal, ioac.read_bytes);
+	*w = BPF_CORE_READ(task, signal, ioac.write_bytes);
+
+	/* Add group_leader's live IO */
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader) {
+		*r += BPF_CORE_READ(leader, ioac.read_bytes);
+		*w += BPF_CORE_READ(leader, ioac.write_bytes);
+	}
+}
+
+/*
+ * Page faults: signal accumulates dead threads, add leader's live counts.
+ */
+static __always_inline void read_faults(struct task_struct *task,
+					__u64 *maj, __u64 *min)
+{
+	*maj = BPF_CORE_READ(task, signal, cmaj_flt);
+	*min = BPF_CORE_READ(task, signal, cmin_flt);
+
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader) {
+		*maj += BPF_CORE_READ(leader, maj_flt);
+		*min += BPF_CORE_READ(leader, min_flt);
+	}
+}
+
+/*
+ * Context switches: signal accumulates dead threads, add leader's live counts.
+ */
+static __always_inline void read_ctxsw(struct task_struct *task,
+					__u64 *vol, __u64 *invol)
+{
+	*vol   = BPF_CORE_READ(task, signal, nvcsw);
+	*invol = BPF_CORE_READ(task, signal, nivcsw);
+
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader) {
+		*vol   += BPF_CORE_READ(leader, nvcsw);
+		*invol += BPF_CORE_READ(leader, nivcsw);
+	}
 }
 
 /*
@@ -289,11 +353,16 @@ int handle_sched_switch(void *ctx)
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-	/* RSS (pages) */
-	__u64 rss = read_rss_pages(task);
-	info->rss_pages = rss;
-	if (rss > info->rss_max_pages)
-		info->rss_max_pages = rss;
+	/* Memory (pages) — RSS, shared, swap */
+	struct mem_info mi = read_mem_pages(task);
+	info->rss_pages   = mi.rss_pages;
+	info->shmem_pages = mi.shmem_pages;
+	info->swap_pages  = mi.swap_pages;
+	if (mi.rss_pages > 0 &&
+	    (info->rss_min_pages == 0 || mi.rss_pages < info->rss_min_pages))
+		info->rss_min_pages = mi.rss_pages;
+	if (mi.rss_pages > info->rss_max_pages)
+		info->rss_max_pages = mi.rss_pages;
 
 	/* CPU time (ns) — approximate for multi-threaded */
 	info->cpu_ns = read_cpu_ns(task);
@@ -306,6 +375,18 @@ int handle_sched_switch(void *ctx)
 
 	/* OOM score adjustment */
 	info->oom_score_adj = read_oom_score_adj(task);
+
+	/* IO bytes (actual disk reads/writes) */
+	read_io_bytes(task, &info->io_read_bytes, &info->io_write_bytes);
+
+	/* Page faults */
+	read_faults(task, &info->maj_flt, &info->min_flt);
+
+	/* Context switches */
+	read_ctxsw(task, &info->nvcsw, &info->nivcsw);
+
+	/* Cgroup — may change if process is moved between cgroups */
+	info->cgroup_id = bpf_get_current_cgroup_id();
 
 	/* Process state — task->__state (kernel 5.14+) */
 	unsigned int task_state = BPF_CORE_READ(task, __state);
@@ -328,7 +409,8 @@ int handle_exit(void *ctx)
 		return 0;
 
 	/* Only for tracked processes */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+	struct track_info *ti = bpf_map_lookup_elem(&tracked_map, &tgid);
+	if (!ti)
 		return 0;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -344,21 +426,31 @@ int handle_exit(void *ctx)
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
+	/* Copy tracking info before maps are deleted */
+	e->root_pid = ti->root_pid;
+	e->rule_id  = ti->rule_id;
+
 	/* Final metrics snapshot */
 	e->cpu_ns        = read_cpu_ns(task);
-	e->rss_pages     = read_rss_pages(task);
+	struct mem_info exit_mi = read_mem_pages(task);
+	e->rss_pages     = exit_mi.rss_pages;
 	e->vsize_pages   = read_vsize_pages(task);
 	e->threads       = read_nr_threads(task);
 	e->oom_score_adj = read_oom_score_adj(task);
+	e->exit_code     = BPF_CORE_READ(task, exit_code);
 
-	/* Carry over rss_max and start_ns from proc_info */
+	/* Carry over min/max rss, start_ns, oom_killed from proc_info */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
+		e->rss_min_pages = info->rss_min_pages;
 		e->rss_max_pages = info->rss_max_pages;
 		e->start_ns      = info->start_ns;
 		e->cgroup_id     = info->cgroup_id;
 		e->ppid          = info->ppid;
 		e->cmdline_len   = info->cmdline_len;
+		e->oom_killed    = info->oom_killed;
+		e->net_tx_bytes  = info->net_tx_bytes;
+		e->net_rx_bytes  = info->net_rx_bytes;
 		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
 	}
 
@@ -367,6 +459,114 @@ int handle_exit(void *ctx)
 cleanup:
 	bpf_map_delete_elem(&tracked_map, &tgid);
 	bpf_map_delete_elem(&proc_map, &tgid);
+	return 0;
+}
+
+/* ── OOM KILL — mark_victim tracepoint ─────────────────────────────── */
+
+/*
+ * mark_victim fires when OOM killer selects a process to kill.
+ * raw_tracepoint args: (struct task_struct *task)
+ */
+SEC("raw_tracepoint/mark_victim")
+int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
+{
+	struct task_struct *task = (struct task_struct *)ctx->args[0];
+	__u32 tgid = BPF_CORE_READ(task, tgid);
+
+	/* Only for tracked processes */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	/* Mark in proc_info */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info)
+		info->oom_killed = 1;
+
+	/* Send OOM_KILL event to userspace */
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type         = EVENT_OOM_KILL;
+	e->tgid         = tgid;
+	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm),
+				  BPF_CORE_READ(task, comm));
+
+	if (info) {
+		e->ppid          = info->ppid;
+		e->cgroup_id     = info->cgroup_id;
+		e->rss_pages     = info->rss_pages;
+		e->rss_min_pages = info->rss_min_pages;
+		e->rss_max_pages = info->rss_max_pages;
+		e->cpu_ns        = info->cpu_ns;
+		e->start_ns      = info->start_ns;
+		e->cmdline_len   = info->cmdline_len;
+		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
+	}
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* ── Network: TCP/UDP send/receive (kretprobe for actual byte count) ── */
+
+/*
+ * Hook tcp_sendmsg / tcp_recvmsg / udp_sendmsg / udp_recvmsg return values.
+ * All TCP/UDP socket operations (send, sendto, write, recv, read, etc.)
+ * funnel through these kernel functions. Return value > 0 = actual bytes.
+ *
+ * Uses __sync_fetch_and_add because multiple CPUs can update same proc_info
+ * concurrently (unlike sched_switch which runs for current task only).
+ */
+
+SEC("kretprobe/tcp_sendmsg")
+int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
+{
+	if (ret <= 0)
+		return 0;
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info)
+		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
+	return 0;
+}
+
+SEC("kretprobe/tcp_recvmsg")
+int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
+{
+	if (ret <= 0)
+		return 0;
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info)
+		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
+	return 0;
+}
+
+SEC("kretprobe/udp_sendmsg")
+int BPF_KRETPROBE(ret_udp_sendmsg, int ret)
+{
+	if (ret <= 0)
+		return 0;
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info)
+		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
+	return 0;
+}
+
+SEC("kretprobe/udp_recvmsg")
+int BPF_KRETPROBE(ret_udp_recvmsg, int ret)
+{
+	if (ret <= 0)
+		return 0;
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info)
+		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
 	return 0;
 }
 
