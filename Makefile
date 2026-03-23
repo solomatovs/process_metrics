@@ -23,8 +23,10 @@ BUILDDIR := build
 
 # Source files — new event-driven implementation
 BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
-USER_SRC   := $(SRCDIR)/process_metrics.c
+USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c
 COMMON_H   := $(SRCDIR)/process_metrics_common.h
+EF_H       := $(SRCDIR)/event_file.h
+HS_H       := $(SRCDIR)/http_server.h
 VMLINUX_H  := $(SRCDIR)/vmlinux.h
 
 # Build artifacts
@@ -49,16 +51,20 @@ CC      ?= gcc
 # Flags
 BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
-LDFLAGS    := -lbpf -lelf -lz
+LDFLAGS    := -lbpf -lelf -lz -lconfig -lpthread
 
 # Dependency packages
-APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm
-YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel llvm
+APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm libconfig-dev
+YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel llvm libconfig-devel
 
 # Minimum clang version for BPF CO-RE
 MIN_CLANG_VER := 10
 
-.PHONY: help all clean vmlinux deps deps-apt deps-yum bpftool check-clang
+# Test artifacts
+TEST_EF_SRC    := tests/test_event_file.c
+TEST_EF_BIN    := $(BUILDDIR)/test_event_file
+
+.PHONY: help all clean vmlinux deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse
 
 help:
 	@echo "process_metrics — event-driven BPF process metrics collector"
@@ -69,6 +75,7 @@ help:
 	@echo "  make bpftool    build bpftool from vendored sources"
 	@echo "  make all        build everything (bpftool + process_metrics)"
 	@echo "  make clean      remove build artifacts"
+	@echo "  make test       run unit tests"
 	@echo "  make vmlinux    regenerate vmlinux.h from running kernel BTF"
 	@echo ""
 	@echo "Detected clang: $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
@@ -159,15 +166,31 @@ $(SKEL_H): $(BPF_OBJ) $(BPFTOOL_BIN)
 	$(BPFTOOL) gen skeleton $< > $@
 
 # Step 3: compile userspace (includes skeleton with embedded ELF)
-$(BINARY): $(USER_SRC) $(COMMON_H) $(SKEL_H)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(BINARY): $(USER_SRCS) $(COMMON_H) $(EF_H) $(HS_H) $(SKEL_H)
+	$(CC) $(CFLAGS) -o $@ $(USER_SRCS) $(LDFLAGS)
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
 clean:
-	rm -f $(BPF_OBJ) $(SKEL_H) $(BINARY) $(BPFTOOL_BIN)
+	rm -f $(BPF_OBJ) $(SKEL_H) $(BINARY) $(BPFTOOL_BIN) $(TEST_EF_BIN)
 	rm -rf $(BUILDDIR)/bpftool-build
+
+# --- tests ---
+
+$(TEST_EF_BIN): $(TEST_EF_SRC) $(SRCDIR)/event_file.c $(EF_H) $(COMMON_H) | $(BUILDDIR)
+	$(CC) $(CFLAGS) -o $@ $(TEST_EF_SRC) $(SRCDIR)/event_file.c -lpthread
+
+test-unit: $(TEST_EF_BIN)
+	$(TEST_EF_BIN)
+
+test-http: $(BINARY)
+	tests/test_http_server.sh
+
+test-clickhouse: $(BINARY)
+	tests/test_clickhouse_integration.sh
+
+test: test-unit
 
 # Regenerate vmlinux.h from running kernel's BTF
 vmlinux:

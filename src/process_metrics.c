@@ -2,11 +2,11 @@
  * process_metrics — event-driven process metrics collector
  *
  * Loads BPF programs, listens to ring buffer events, matches exec'd
- * processes against config rules, and periodically writes .prom file
- * from BPF maps. No /proc polling — everything comes from the kernel.
+ * processes against config rules, and periodically writes metrics.
+ * Serves metrics via built-in HTTP server (CSV and Prometheus formats).
  *
  * Usage:
- *   ./process_metrics [-c config] [-o dir] [-f file] [-i interval] [-p prefix]
+ *   ./process_metrics -c config.conf
  *
  * Requires: root (CAP_BPF + CAP_PERFMON)
  */
@@ -24,11 +24,14 @@
 #include <getopt.h>
 #include <sys/stat.h>
 #include <regex.h>
+#include <libconfig.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 #include <linux/types.h>
 #include "process_metrics_common.h"
 #include "process_metrics.skel.h"
+#include "event_file.h"
+#include "http_server.h"
 
 /* ── configuration ────────────────────────────────────────────────── */
 
@@ -44,13 +47,21 @@ struct rule {
 static struct rule rules[MAX_RULES];
 static int         num_rules;
 
+/* Configuration values (loaded from libconfig) */
 static const char *cfg_config_file     = NULL;
-static const char *cfg_output_dir      = "/scripts/system_metrics";
-static const char *cfg_output_file     = "process_metrics.prom";
-static int         cfg_snapshot_interval = 30;
-static const char *cfg_metric_prefix   = "process_metrics";
-static int         cfg_cmdline_max_len = 200;
-static int         cfg_exec_rate_limit = 0;  /* 0 = unlimited */
+static char        cfg_hostname[256]               = "";
+static int         cfg_snapshot_interval           = 30;
+static char        cfg_metric_prefix[128]          = "process_metrics";
+static int         cfg_cmdline_max_len             = 500;
+static int         cfg_exec_rate_limit             = 0;  /* 0 = unlimited */
+static int         cfg_cgroup_metrics              = 1;  /* 1 = read cgroup files */
+static int         cfg_refresh_proc                = 1;  /* 1 = refresh cmdline/comm from /proc */
+static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=debug */
+
+/* HTTP server config */
+static struct http_config g_http_cfg;
+static char cfg_data_file[PATH_MAX_LEN]    = "";
+static char cfg_prom_path[PATH_MAX_LEN]    = "";  /* internal prom file for HTTP */
 
 /* ── globals ──────────────────────────────────────────────────────── */
 
@@ -222,7 +233,7 @@ static const char *resolve_cgroup(__u64 cgroup_id)
 	return "";
 }
 
-/* ── config parser ────────────────────────────────────────────────── */
+/* ── rules parser (from libconfig) ────────────────────────────────── */
 
 static void free_rules(void)
 {
@@ -231,87 +242,128 @@ static void free_rules(void)
 	num_rules = 0;
 }
 
-static int parse_config(const char *path)
+static int parse_rules_from_config(const char *path)
 {
-	FILE *f = fopen(path, "r");
-	if (!f) {
-		fprintf(stderr, "FATAL: cannot read config: %s\n", path);
+	config_t cfg;
+	config_init(&cfg);
+
+	if (!config_read_file(&cfg, path)) {
+		fprintf(stderr, "FATAL: %s:%d - %s\n",
+			config_error_file(&cfg) ? config_error_file(&cfg) : path,
+			config_error_line(&cfg),
+			config_error_text(&cfg));
+		config_destroy(&cfg);
+		return -1;
+	}
+
+	config_setting_t *rs = config_lookup(&cfg, "rules");
+	if (!rs || !config_setting_is_list(rs)) {
+		fprintf(stderr, "FATAL: 'rules' list not found in %s\n", path);
+		config_destroy(&cfg);
 		return -1;
 	}
 
 	free_rules();
 
-	char line[1024];
-	int lineno = 0;
-	while (fgets(line, sizeof(line), f)) {
-		lineno++;
-		/* strip trailing whitespace */
-		char *end = line + strlen(line) - 1;
-		while (end >= line && (*end == '\n' || *end == '\r' ||
-		       *end == ' '  || *end == '\t'))
-			*end-- = '\0';
-
-		/* skip leading whitespace */
-		char *p = line;
-		while (*p == ' ' || *p == '\t') p++;
-
-		/* skip empty / comments */
-		if (*p == '\0' || *p == '#' || *p == ';')
+	int count = config_setting_length(rs);
+	for (int i = 0; i < count && num_rules < MAX_RULES; i++) {
+		config_setting_t *entry = config_setting_get_elem(rs, i);
+		if (!entry)
 			continue;
 
-		/* parse: name = /pattern/ */
-		char name[64], pattern[512];
-		char *eq = strchr(p, '=');
-		if (!eq) {
-			fprintf(stderr, "WARN: config line %d: no '=' found\n", lineno);
+		const char *name = NULL, *regex = NULL;
+		if (!config_setting_lookup_string(entry, "name", &name) ||
+		    !config_setting_lookup_string(entry, "regex", &regex)) {
+			fprintf(stderr, "WARN: rules[%d]: missing 'name' or 'regex'\n", i);
 			continue;
 		}
 
-		/* name: everything before '=' trimmed */
-		int nlen = (int)(eq - p);
-		while (nlen > 0 && (p[nlen-1] == ' ' || p[nlen-1] == '\t'))
-			nlen--;
-		if (nlen <= 0 || nlen >= (int)sizeof(name)) {
-			fprintf(stderr, "WARN: config line %d: bad name\n", lineno);
-			continue;
-		}
-		memcpy(name, p, nlen);
-		name[nlen] = '\0';
-
-		/* pattern: everything after '=', trimmed, strip /.../ delimiters */
-		char *pat = eq + 1;
-		while (*pat == ' ' || *pat == '\t') pat++;
-
-		int plen = (int)strlen(pat);
-		if (plen >= 2 && pat[0] == '/' && pat[plen-1] == '/') {
-			pat++;
-			plen -= 2;
-		}
-		if (plen <= 0 || plen >= (int)sizeof(pattern)) {
-			fprintf(stderr, "WARN: config line %d: bad pattern\n", lineno);
-			continue;
-		}
-		memcpy(pattern, pat, plen);
-		pattern[plen] = '\0';
-
-		if (num_rules >= MAX_RULES) {
-			fprintf(stderr, "WARN: max rules (%d) reached\n", MAX_RULES);
-			break;
-		}
-
-		if (regcomp(&rules[num_rules].regex, pattern,
+		if (regcomp(&rules[num_rules].regex, regex,
 			    REG_EXTENDED | REG_NOSUB) != 0) {
-			fprintf(stderr, "WARN: config line %d: bad regex: %s\n",
-				lineno, pattern);
+			fprintf(stderr, "WARN: rules[%d]: bad regex: %s\n", i, regex);
 			continue;
 		}
 		snprintf(rules[num_rules].name, sizeof(rules[0].name), "%s", name);
 		num_rules++;
 	}
 
-	fclose(f);
+	config_destroy(&cfg);
 	fprintf(stderr, "INFO: loaded %d rules from %s\n", num_rules, path);
 	return num_rules;
+}
+
+/* ── libconfig configuration loader ───────────────────────────────── */
+
+static int load_config(const char *path)
+{
+	config_t cfg;
+	config_init(&cfg);
+
+	if (!config_read_file(&cfg, path)) {
+		fprintf(stderr, "FATAL: %s:%d - %s\n",
+			config_error_file(&cfg) ? config_error_file(&cfg) : path,
+			config_error_line(&cfg),
+			config_error_text(&cfg));
+		config_destroy(&cfg);
+		return -1;
+	}
+
+	const char *str_val;
+	int int_val;
+
+	/* General settings */
+	if (config_lookup_string(&cfg, "hostname", &str_val))
+		snprintf(cfg_hostname, sizeof(cfg_hostname), "%s", str_val);
+	if (!cfg_hostname[0])
+		gethostname(cfg_hostname, sizeof(cfg_hostname));
+	if (config_lookup_int(&cfg, "snapshot_interval", &int_val))
+		cfg_snapshot_interval = int_val;
+	if (config_lookup_string(&cfg, "metric_prefix", &str_val))
+		snprintf(cfg_metric_prefix, sizeof(cfg_metric_prefix), "%s", str_val);
+	if (config_lookup_int(&cfg, "cmdline_max_len", &int_val))
+		cfg_cmdline_max_len = int_val;
+	if (config_lookup_int(&cfg, "exec_rate_limit", &int_val))
+		cfg_exec_rate_limit = int_val;
+
+	int bool_val;
+	if (config_lookup_bool(&cfg, "cgroup_metrics", &bool_val))
+		cfg_cgroup_metrics = bool_val;
+	if (config_lookup_bool(&cfg, "refresh_proc", &bool_val))
+		cfg_refresh_proc = bool_val;
+	if (config_lookup_int(&cfg, "log_level", &int_val))
+		cfg_log_level = int_val;
+
+	/* HTTP server settings (enabled if section with port exists) */
+	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
+	g_http_cfg.port = 9091;
+	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "0.0.0.0");
+
+	config_setting_t *hs = config_lookup(&cfg, "http_server");
+	if (hs) {
+		if (config_setting_lookup_int(hs, "port", &int_val)) {
+			g_http_cfg.port = int_val;
+			g_http_cfg.enabled = 1;
+		}
+		if (config_setting_lookup_string(hs, "bind", &str_val))
+			snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind),
+				 "%s", str_val);
+		if (config_setting_lookup_string(hs, "data_file", &str_val))
+			snprintf(cfg_data_file, sizeof(cfg_data_file),
+				 "%s", str_val);
+	}
+
+	/* Default paths when http_server is enabled */
+	if (g_http_cfg.enabled) {
+		if (!cfg_data_file[0])
+			snprintf(cfg_data_file, sizeof(cfg_data_file),
+				 "/tmp/process_metrics_events.dat");
+		/* Prom snapshot file path: <data_file_base>.prom */
+		snprintf(cfg_prom_path, sizeof(cfg_prom_path),
+			 "/tmp/process_metrics.prom");
+	}
+
+	config_destroy(&cfg);
+	return 0;
 }
 
 /* ── helpers ──────────────────────────────────────────────────────── */
@@ -325,6 +377,57 @@ static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen)
 	while (n > 0 && out[n-1] == ' ')
 		n--;
 	out[n] = '\0';
+}
+
+/*
+ * Split raw cmdline (null-separated argv) into exec_path and args.
+ * exec_path = argv[0], args = argv[1..] joined with spaces.
+ */
+static void cmdline_split(const char *raw, __u16 len,
+			  char *exec_out, int exec_len,
+			  char *args_out, int args_len)
+{
+	exec_out[0] = '\0';
+	args_out[0] = '\0';
+
+	if (len == 0)
+		return;
+
+	/* argv[0]: up to first NUL */
+	int first_nul = -1;
+	for (int i = 0; i < len; i++) {
+		if (raw[i] == '\0') {
+			first_nul = i;
+			break;
+		}
+	}
+
+	if (first_nul < 0) {
+		/* No NUL found — entire cmdline is exec */
+		int n = len < exec_len - 1 ? len : exec_len - 1;
+		memcpy(exec_out, raw, n);
+		exec_out[n] = '\0';
+		return;
+	}
+
+	/* exec = raw[0..first_nul) */
+	int elen = first_nul < exec_len - 1 ? first_nul : exec_len - 1;
+	memcpy(exec_out, raw, elen);
+	exec_out[elen] = '\0';
+
+	/* args = raw[first_nul+1..len), NULs → spaces */
+	int start = first_nul + 1;
+	int alen = len - start;
+	if (alen <= 0)
+		return;
+	if (alen > args_len - 1)
+		alen = args_len - 1;
+	for (int i = 0; i < alen; i++)
+		args_out[i] = (raw[start + i] == '\0') ? ' ' : raw[start + i];
+	/* trim trailing spaces */
+	while (alen > 0 && args_out[alen - 1] == ' ')
+		alen--;
+	args_out[alen] = '\0';
 }
 
 static void escape_label(const char *src, char *dst, int dstlen)
@@ -343,17 +446,56 @@ static void escape_label(const char *src, char *dst, int dstlen)
 
 static void log_ts(const char *level, const char *fmt, ...)
 {
-	time_t now = time(NULL);
-	struct tm tm;
-	localtime_r(&now, &tm);
-	char ts[32];
-	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tm);
-	fprintf(stderr, "%s [%s] ", ts, level);
+	fprintf(stderr, "[%s] ", level);
 	va_list ap;
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
 	fprintf(stderr, "\n");
+}
+
+/* Debug log — only printed when log_level >= 2 */
+static void log_debug(const char *fmt, ...)
+{
+	if (cfg_log_level < 2)
+		return;
+	fprintf(stderr, "[DEBUG] ");
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fprintf(stderr, "\n");
+}
+
+/* ── event builder ────────────────────────────────────────────────── */
+
+/* Build a metric_event from a BPF ring buffer event */
+static void event_from_bpf(struct metric_event *out, const struct event *e,
+			    const char *event_type, const char *rule_name,
+			    const char *cgroup)
+{
+	memset(out, 0, sizeof(*out));
+	out->timestamp_ns = e->timestamp_ns;
+	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
+	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
+	out->root_pid = e->root_pid;
+	out->pid = e->tgid;
+	out->ppid = e->ppid;
+	memcpy(out->comm, e->comm, COMM_LEN);
+	cmdline_split(e->cmdline, e->cmdline_len,
+		      out->exec_path, sizeof(out->exec_path),
+		      out->args, sizeof(out->args));
+	if (cgroup)
+		snprintf(out->cgroup, sizeof(out->cgroup), "%s", cgroup);
+	/* exit-specific fields */
+	out->exit_code = e->exit_code;
+	out->cpu_ns = e->cpu_ns;
+	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
+	out->rss_min_bytes = e->rss_min_pages * (unsigned long)sysconf(_SC_PAGESIZE);
+	out->oom_killed = e->oom_killed;
+	out->net_tx_bytes = e->net_tx_bytes;
+	out->net_rx_bytes = e->net_rx_bytes;
+	out->start_time_ns = e->start_ns;
 }
 
 /* ── initial process scan (one-time /proc read at startup) ────────── */
@@ -389,9 +531,6 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	unsigned long utime, stime, starttime, vsize;
 	long rss;
 	int threads;
-	/* state ppid pgrp session tty_nr tpgid flags
-	   minflt cminflt majflt cmajflt utime stime cutime cstime
-	   priority nice num_threads itrealvalue starttime vsize rss */
 	if (sscanf(p,
 		   "%c %d %*d %*d %*d %*d %*d "
 		   "%lu %lu %lu %lu %lu %lu %*d %*d "
@@ -634,8 +773,8 @@ static void initial_scan(void)
 			/* Root match */
 			track_pid_from_proc(pid, r, pid, 1);
 			tracked++;
-			log_ts("INFO", "SCAN: pid=%u rule=%s cmdline=%.60s",
-			       pid, rules[r].name, cmdline_str);
+			log_debug("SCAN: pid=%u rule=%s cmdline=%.60s",
+				  pid, rules[r].name, cmdline_str);
 
 			/* Find all descendants */
 			add_descendants(entries, count, pid, r, pid, &tracked);
@@ -691,8 +830,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 			pi.cmdline_len = e->cmdline_len;
 			bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
 
-			log_ts("INFO", "TRACK: pid=%u rule=%s comm=%.16s",
-			       e->tgid, rules[i].name, e->comm);
+			log_debug("TRACK: pid=%u rule=%s comm=%.16s",
+				  e->tgid, rules[i].name, e->comm);
+
+			/* Send exec event to ClickHouse / event file */
+			if (g_http_cfg.enabled) {
+				const char *cg = resolve_cgroup(e->cgroup_id);
+				struct metric_event cev;
+				event_from_bpf(&cev, e, "exec", rules[i].name, cg);
+				cev.is_root = 1;
+				ef_append(&cev, cfg_hostname);
+			}
 			break;
 		}
 		break;
@@ -729,27 +877,42 @@ static int handle_event(void *ctx, void *data, size_t size)
 			child_pi.cmdline_len = parent_pi.cmdline_len;
 		}
 		bpf_map_update_elem(proc_map_fd, &e->tgid, &child_pi, BPF_ANY);
+
+		/* Send fork event to ClickHouse / event file */
+		if (g_http_cfg.enabled) {
+			const char *rname = (parent_ti.rule_id < num_rules)
+				? rules[parent_ti.rule_id].name : "unknown";
+			const char *cg = resolve_cgroup(e->cgroup_id);
+			struct metric_event cev;
+			event_from_bpf(&cev, e, "fork", rname, cg);
+			cev.root_pid = parent_ti.root_pid;
+			ef_append(&cev, cfg_hostname);
+		}
 		break;
 	}
 
 	case EVENT_EXIT: {
 		const char *rname = (e->rule_id < num_rules)
 			? rules[e->rule_id].name : "?";
-		/*
-		 * exit_code encodes: bits 0-7 = signal, bits 8-15 = status.
-		 * signal>0 means killed by signal; status = normal exit code.
-		 */
 		int sig = e->exit_code & 0x7f;
 		int status = (e->exit_code >> 8) & 0xff;
 
-		log_ts("INFO", "EXIT: pid=%u rule=%s exit_code=%d "
-		       "signal=%d cpu=%.2fs rss_max=%lluMB%s",
-		       e->tgid, rname, status, sig,
-		       (double)e->cpu_ns / 1e9,
-		       (unsigned long long)(e->rss_max_pages * 4 / 1024),
-		       e->oom_killed ? " [OOM]" : "");
+		log_debug("EXIT: pid=%u rule=%s exit_code=%d "
+			  "signal=%d cpu=%.2fs rss_max=%lluMB%s",
+			  e->tgid, rname, status, sig,
+			  (double)e->cpu_ns / 1e9,
+			  (unsigned long long)(e->rss_max_pages * 4 / 1024),
+			  e->oom_killed ? " [OOM]" : "");
 
 		record_exit(e);
+
+		/* Send exit event to ClickHouse / event file */
+		if (g_http_cfg.enabled) {
+			const char *cg = resolve_cgroup(e->cgroup_id);
+			struct metric_event cev;
+			event_from_bpf(&cev, e, "exit", rname, cg);
+			ef_append(&cev, cfg_hostname);
+		}
 		/* BPF already deleted from maps */
 		break;
 	}
@@ -764,6 +927,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 		       "rss=%lluMB",
 		       e->tgid, rname, e->comm,
 		       (unsigned long long)(e->rss_pages * 4 / 1024));
+
+		/* Send oom_kill event to ClickHouse / event file */
+		if (g_http_cfg.enabled) {
+			const char *cg = resolve_cgroup(e->cgroup_id);
+			struct metric_event cev;
+			event_from_bpf(&cev, e, "oom_kill", rname, cg);
+			ef_append(&cev, cfg_hostname);
+		}
 		break;
 	}
 	}
@@ -793,13 +964,14 @@ static long long read_cgroup_value(const char *cg_path, const char *file)
 static void write_snapshot(void)
 {
 	char tmp_path[PATH_MAX_LEN];
-	snprintf(tmp_path, sizeof(tmp_path), "%s/.%s.tmp.%d",
-		 cfg_output_dir, cfg_output_file, getpid());
+	FILE *f = NULL;
 
-	FILE *f = fopen(tmp_path, "w");
-	if (!f) {
-		log_ts("ERROR", "cannot create temp file: %s", tmp_path);
-		return;
+	if (g_http_cfg.enabled && cfg_prom_path[0]) {
+		snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d",
+			 cfg_prom_path, getpid());
+		f = fopen(tmp_path, "w");
+		if (!f)
+			log_ts("ERROR", "cannot create temp file: %s", tmp_path);
 	}
 
 	long page_size = sysconf(_SC_PAGESIZE);
@@ -822,7 +994,7 @@ static void write_snapshot(void)
 	const char *pfx = cfg_metric_prefix;
 
 	/* HELP/TYPE headers — always present */
-	fprintf(f,
+	if (f) fprintf(f,
 		"# HELP %s_info Process info (value always 1, metadata in labels)\n"
 		"# TYPE %s_info gauge\n"
 		"# HELP %s_start_time_seconds Process start time as unix epoch\n"
@@ -834,110 +1006,136 @@ static void write_snapshot(void)
 		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
 
 	/* HELP/TYPE headers — sched_switch metrics */
-	fprintf(f,
-			"# HELP %s_rss_bytes Process RSS memory in bytes\n"
-			"# TYPE %s_rss_bytes gauge\n"
-			"# HELP %s_rss_min_bytes Min observed RSS memory in bytes\n"
-			"# TYPE %s_rss_min_bytes gauge\n"
-			"# HELP %s_rss_max_bytes Max observed RSS memory in bytes\n"
-			"# TYPE %s_rss_max_bytes gauge\n"
-			"# HELP %s_shmem_bytes Shared memory in bytes\n"
-			"# TYPE %s_shmem_bytes gauge\n"
-			"# HELP %s_swap_bytes Swap usage in bytes\n"
-			"# TYPE %s_swap_bytes gauge\n"
-			"# HELP %s_oom_kill Process was killed by OOM killer (1=killed)\n"
-			"# TYPE %s_oom_kill gauge\n"
-			"# HELP %s_vsize_bytes Process virtual memory in bytes\n"
-			"# TYPE %s_vsize_bytes gauge\n"
-			"# HELP %s_cpu_seconds_total Total CPU time (user + system) in seconds\n"
-			"# TYPE %s_cpu_seconds_total counter\n"
-			"# HELP %s_cpu_usage_ratio CPU usage ratio over last snapshot interval (1.0 = 1 core)\n"
-			"# TYPE %s_cpu_usage_ratio gauge\n"
-			"# HELP %s_io_read_bytes_total Actual disk read bytes\n"
-			"# TYPE %s_io_read_bytes_total counter\n"
-			"# HELP %s_io_write_bytes_total Actual disk write bytes\n"
-			"# TYPE %s_io_write_bytes_total counter\n"
-			"# HELP %s_major_page_faults_total Major page faults (required disk IO)\n"
-			"# TYPE %s_major_page_faults_total counter\n"
-			"# HELP %s_minor_page_faults_total Minor page faults (no disk IO)\n"
-			"# TYPE %s_minor_page_faults_total counter\n"
-			"# HELP %s_voluntary_ctxsw_total Voluntary context switches (process yielded CPU)\n"
-			"# TYPE %s_voluntary_ctxsw_total counter\n"
-			"# HELP %s_involuntary_ctxsw_total Involuntary context switches (preempted by kernel)\n"
-			"# TYPE %s_involuntary_ctxsw_total counter\n"
-			"# HELP %s_threads Number of threads\n"
-			"# TYPE %s_threads gauge\n"
-			"# HELP %s_oom_score_adj Current OOM score adjustment\n"
-			"# TYPE %s_oom_score_adj gauge\n"
-			"# HELP %s_state Process state (R=running, S=sleeping, D=disk_sleep, T=stopped, Z=zombie)\n"
-			"# TYPE %s_state gauge\n",
-			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-			pfx, pfx, pfx, pfx, pfx, pfx);
+	if (f) fprintf(f,
+		"# HELP %s_rss_bytes Process RSS memory in bytes\n"
+		"# TYPE %s_rss_bytes gauge\n"
+		"# HELP %s_rss_min_bytes Min observed RSS memory in bytes\n"
+		"# TYPE %s_rss_min_bytes gauge\n"
+		"# HELP %s_rss_max_bytes Max observed RSS memory in bytes\n"
+		"# TYPE %s_rss_max_bytes gauge\n"
+		"# HELP %s_shmem_bytes Shared memory in bytes\n"
+		"# TYPE %s_shmem_bytes gauge\n"
+		"# HELP %s_swap_bytes Swap usage in bytes\n"
+		"# TYPE %s_swap_bytes gauge\n"
+		"# HELP %s_oom_kill Process was killed by OOM killer (1=killed)\n"
+		"# TYPE %s_oom_kill gauge\n"
+		"# HELP %s_vsize_bytes Process virtual memory in bytes\n"
+		"# TYPE %s_vsize_bytes gauge\n"
+		"# HELP %s_cpu_seconds_total Total CPU time (user + system) in seconds\n"
+		"# TYPE %s_cpu_seconds_total counter\n"
+		"# HELP %s_cpu_usage_ratio CPU usage ratio over last snapshot interval (1.0 = 1 core)\n"
+		"# TYPE %s_cpu_usage_ratio gauge\n"
+		"# HELP %s_io_read_bytes_total Actual disk read bytes\n"
+		"# TYPE %s_io_read_bytes_total counter\n"
+		"# HELP %s_io_write_bytes_total Actual disk write bytes\n"
+		"# TYPE %s_io_write_bytes_total counter\n"
+		"# HELP %s_major_page_faults_total Major page faults (required disk IO)\n"
+		"# TYPE %s_major_page_faults_total counter\n"
+		"# HELP %s_minor_page_faults_total Minor page faults (no disk IO)\n"
+		"# TYPE %s_minor_page_faults_total counter\n"
+		"# HELP %s_voluntary_ctxsw_total Voluntary context switches (process yielded CPU)\n"
+		"# TYPE %s_voluntary_ctxsw_total counter\n"
+		"# HELP %s_involuntary_ctxsw_total Involuntary context switches (preempted by kernel)\n"
+		"# TYPE %s_involuntary_ctxsw_total counter\n"
+		"# HELP %s_threads Number of threads\n"
+		"# TYPE %s_threads gauge\n"
+		"# HELP %s_oom_score_adj Current OOM score adjustment\n"
+		"# TYPE %s_oom_score_adj gauge\n"
+		"# HELP %s_state Process state (R=running, S=sleeping, D=disk_sleep, T=stopped, Z=zombie)\n"
+		"# TYPE %s_state gauge\n",
+		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
+		pfx, pfx, pfx, pfx, pfx, pfx);
 
 	/* HELP/TYPE headers — network kretprobe metrics */
-	fprintf(f,
-			"# HELP %s_net_tx_bytes_total TCP+UDP bytes sent\n"
-			"# TYPE %s_net_tx_bytes_total counter\n"
-			"# HELP %s_net_rx_bytes_total TCP+UDP bytes received\n"
-			"# TYPE %s_net_rx_bytes_total counter\n",
-			pfx, pfx, pfx, pfx);
+	if (f) fprintf(f,
+		"# HELP %s_net_tx_bytes_total TCP+UDP bytes sent\n"
+		"# TYPE %s_net_tx_bytes_total counter\n"
+		"# HELP %s_net_rx_bytes_total TCP+UDP bytes received\n"
+		"# TYPE %s_net_rx_bytes_total counter\n",
+		pfx, pfx, pfx, pfx);
 
 	/* Iterate proc_map */
-	__u32 key = 0, next_key;
+	__u32 key = 0;
 	struct proc_info pi;
 	int pid_count = 0;
 
-	/* Collect unique cgroups for cgroup metrics */
-	struct { char path[256]; char rule[64]; } seen_cg[MAX_CGROUPS];
+	/* Collect unique cgroups for cgroup metrics (with cached values) */
+	struct {
+		char path[256];
+		char rule[64];
+		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
+		int read;  /* 1 = values read from /sys/fs/cgroup */
+	} seen_cg[MAX_CGROUPS];
 	int seen_cg_count = 0;
 
 	/* Collect keys to delete (dead processes missed due to ringbuf overflow) */
 	__u32 dead_keys[256];
 	int dead_count = 0;
 
-	int err = bpf_map_get_next_key(proc_map_fd, NULL, &next_key);
-	while (err == 0) {
-		key = next_key;
+	/* Event file snapshot batch */
+	/* Single stack-based event for streaming to event file */
+	int snap_count = 0;
+
+	/* Collect all keys first to avoid iterator invalidation
+	 * from concurrent BPF map modifications (fork/exit events) */
+	__u32 *all_keys = NULL;
+	int all_keys_count = 0;
+	int all_keys_cap = 4096;
+	all_keys = malloc(all_keys_cap * sizeof(__u32));
+	if (all_keys) {
+		__u32 iter_key;
+		int err2 = bpf_map_get_next_key(proc_map_fd, NULL, &iter_key);
+		while (err2 == 0) {
+			if (all_keys_count >= all_keys_cap) {
+				all_keys_cap *= 2;
+				__u32 *tmp = realloc(all_keys,
+						     all_keys_cap * sizeof(__u32));
+				if (!tmp) break;
+				all_keys = tmp;
+			}
+			all_keys[all_keys_count++] = iter_key;
+			err2 = bpf_map_get_next_key(proc_map_fd, &iter_key,
+						     &iter_key);
+		}
+	}
+
+	for (int ki = 0; ki < all_keys_count; ki++) {
+		key = all_keys[ki];
 		if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) != 0)
-			goto next;
+			continue;
 
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
-			goto next;
+			continue;
 
-		/* Check if process is still alive (no /proc needed) */
+		/* Check if process is still alive */
 		if (kill((pid_t)key, 0) != 0 && errno == ESRCH) {
 			if (dead_count < 256)
 				dead_keys[dead_count++] = key;
-			goto next;
+			continue;
 		}
 
 		const char *rule_name = (ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : "unknown";
 
-		/* Refresh cmdline + comm from /proc (processes like postgres
-		 * rewrite argv after exec, e.g. "postgres: checkpointer") */
-		{
+		/* Refresh cmdline + comm from /proc */
+		if (cfg_refresh_proc) {
 			char fresh[CMDLINE_MAX];
 			int flen = read_proc_cmdline(key, fresh, sizeof(fresh));
 			if (flen > 0) {
 				memcpy(pi.cmdline, fresh, CMDLINE_MAX);
 				pi.cmdline_len = (__u16)flen;
-				/* Update BPF map so ring buffer events
-				 * (exit) carry the current cmdline */
 				bpf_map_update_elem(proc_map_fd, &key, &pi,
 						    BPF_EXIST);
 			}
-			/* Refresh comm from /proc/PID/comm */
 			char cpath[128];
 			snprintf(cpath, sizeof(cpath), "/proc/%u/comm", key);
 			FILE *cf = fopen(cpath, "r");
 			if (cf) {
 				char cbuf[COMM_LEN];
 				if (fgets(cbuf, sizeof(cbuf), cf)) {
-					/* strip trailing newline */
 					cbuf[strcspn(cbuf, "\n")] = '\0';
 					memcpy(pi.comm, cbuf, COMM_LEN);
 				}
@@ -945,34 +1143,50 @@ static void write_snapshot(void)
 			}
 		}
 
-		/* Convert cmdline */
-		char cmdline[CMDLINE_MAX + 4];
-		cmdline_to_str(pi.cmdline, pi.cmdline_len, cmdline, sizeof(cmdline));
-		/* Truncate */
-		if ((int)strlen(cmdline) > cfg_cmdline_max_len) {
-			cmdline[cfg_cmdline_max_len] = '\0';
-			strcat(cmdline, "...");
+		/* Split cmdline into exec + args */
+		char exec_path[CMDLINE_MAX], args[CMDLINE_MAX];
+		cmdline_split(pi.cmdline, pi.cmdline_len,
+			      exec_path, sizeof(exec_path),
+			      args, sizeof(args));
+		if ((int)strlen(args) > cfg_cmdline_max_len) {
+			args[cfg_cmdline_max_len] = '\0';
+			strcat(args, "...");
 		}
 
 		/* Resolve cgroup */
 		const char *cg_path = resolve_cgroup(pi.cgroup_id);
 
 		/* Escape labels */
-		char comm_esc[64], cmdline_esc[CMDLINE_MAX * 2], cg_esc[512];
+		char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
+		char args_esc[CMDLINE_MAX * 2], cg_esc[512], host_esc[512];
 		escape_label(pi.comm, comm_esc, sizeof(comm_esc));
-		escape_label(cmdline, cmdline_esc, sizeof(cmdline_esc));
+		escape_label(exec_path, exec_esc, sizeof(exec_esc));
+		escape_label(args, args_esc, sizeof(args_esc));
 		escape_label(cg_path, cg_esc, sizeof(cg_esc));
+		escape_label(cfg_hostname, host_esc, sizeof(host_esc));
 
 		/* Compute times */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
 		if (uptime_sec < 0) uptime_sec = 0;
 		time_t start_epoch = now_epoch - (time_t)uptime_sec;
 
-		/* Write metrics — always present */
-		fprintf(f, "%s_info{rule=\"%s\",root_pid=\"%u\",pid=\"%u\","
-			"comm=\"%s\",cmdline=\"%s\",cgroup=\"%s\"} 1\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			comm_esc, cmdline_esc, cg_esc);
+		/* CPU usage ratio */
+		double cpu_ratio = 0;
+		if (elapsed_ns > 0) {
+			__u64 prev_ns = cpu_prev_lookup(key);
+			double delta = (double)(pi.cpu_ns - prev_ns);
+			cpu_ratio = (prev_ns > 0 && delta >= 0)
+				? delta / elapsed_ns : 0;
+		}
+		cpu_prev_update(key, pi.cpu_ns);
+
+		/* Write Prometheus metrics */
+		if (f) {
+		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",root_pid=\"%u\","
+			"pid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
+			"cgroup=\"%s\"} 1\n",
+			pfx, host_esc, rule_name, ti.root_pid, pi.tgid,
+			comm_esc, exec_esc, args_esc, cg_esc);
 		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
 		fprintf(f, "%s_uptime_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
@@ -981,7 +1195,6 @@ static void write_snapshot(void)
 		fprintf(f, "%s_is_root{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, ti.is_root);
 
-		/* Metrics from sched_switch probe */
 		fprintf(f, "%s_rss_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(unsigned long long)(pi.rss_pages * page_size));
@@ -1006,17 +1219,11 @@ static void write_snapshot(void)
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(double)pi.cpu_ns / 1e9);
 
-		/* CPU usage ratio: delta_cpu / delta_time over last interval */
 		if (elapsed_ns > 0) {
-			__u64 prev_ns = cpu_prev_lookup(key);
-			double delta = (double)(pi.cpu_ns - prev_ns);
-			double ratio = (prev_ns > 0 && delta >= 0)
-				? delta / elapsed_ns : 0;
 			fprintf(f, "%s_cpu_usage_ratio{rule=\"%s\",root_pid=\"%u\","
 				"pid=\"%u\"} %.4f\n",
-				pfx, rule_name, ti.root_pid, pi.tgid, ratio);
+				pfx, rule_name, ti.root_pid, pi.tgid, cpu_ratio);
 		}
-		cpu_prev_update(key, pi.cpu_ns);
 
 		fprintf(f, "%s_io_read_bytes_total{rule=\"%s\",root_pid=\"%u\","
 			"pid=\"%u\"} %llu\n",
@@ -1051,7 +1258,6 @@ static void write_snapshot(void)
 			"state=\"%s\"} 1\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, state_str);
 
-		/* Metrics from network kretprobes */
 		fprintf(f, "%s_net_tx_bytes_total{rule=\"%s\",root_pid=\"%u\","
 			"pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
@@ -1060,28 +1266,98 @@ static void write_snapshot(void)
 			"pid=\"%u\"} %llu\n",
 			pfx, rule_name, ti.root_pid, pi.tgid,
 			(unsigned long long)pi.net_rx_bytes);
+		} /* if (f) */
 
-		/* Collect unique cgroup for cgroup-level metrics */
+		/* Collect unique cgroup for cgroup-level metrics + cache values */
+		int cg_idx = -1;
 		if (cg_path[0] && seen_cg_count < MAX_CGROUPS) {
-			int found = 0;
 			for (int i = 0; i < seen_cg_count; i++) {
 				if (strcmp(seen_cg[i].path, cg_path) == 0) {
-					found = 1;
+					cg_idx = i;
 					break;
 				}
 			}
-			if (!found) {
-				snprintf(seen_cg[seen_cg_count].path,
+			if (cg_idx < 0) {
+				cg_idx = seen_cg_count;
+				snprintf(seen_cg[cg_idx].path,
 					 sizeof(seen_cg[0].path), "%s", cg_path);
-				snprintf(seen_cg[seen_cg_count].rule,
+				snprintf(seen_cg[cg_idx].rule,
 					 sizeof(seen_cg[0].rule), "%s", rule_name);
+				seen_cg[cg_idx].read = 0;
+				if (cfg_cgroup_metrics) {
+					seen_cg[cg_idx].mem_max =
+						read_cgroup_value(cg_path, "memory.max");
+					seen_cg[cg_idx].mem_cur =
+						read_cgroup_value(cg_path, "memory.current");
+					seen_cg[cg_idx].swap_cur =
+						read_cgroup_value(cg_path, "memory.swap.current");
+					seen_cg[cg_idx].cpu_weight =
+						read_cgroup_value(cg_path, "cpu.weight");
+					seen_cg[cg_idx].pids_cur =
+						read_cgroup_value(cg_path, "pids.current");
+					seen_cg[cg_idx].read = 1;
+				}
 				seen_cg_count++;
 			}
 		}
+
+		/* Stream snapshot event directly to event file (no buffering) */
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
+			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
+			cev.root_pid = ti.root_pid;
+			cev.pid = pi.tgid;
+			cev.ppid = pi.ppid;
+			memcpy(cev.comm, pi.comm, COMM_LEN);
+			cmdline_split(pi.cmdline, pi.cmdline_len,
+				      cev.exec_path, sizeof(cev.exec_path),
+				      cev.args, sizeof(cev.args));
+			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
+			cev.is_root = ti.is_root;
+			cev.state = pi.state;
+			cev.cpu_ns = pi.cpu_ns;
+			cev.cpu_usage_ratio = cpu_ratio;
+			cev.rss_bytes = pi.rss_pages * page_size;
+			cev.rss_min_bytes = pi.rss_min_pages * page_size;
+			cev.rss_max_bytes = pi.rss_max_pages * page_size;
+			cev.shmem_bytes = pi.shmem_pages * page_size;
+			cev.swap_bytes = pi.swap_pages * page_size;
+			cev.vsize_bytes = pi.vsize_pages * page_size;
+			cev.io_read_bytes = pi.io_read_bytes;
+			cev.io_write_bytes = pi.io_write_bytes;
+			cev.maj_flt = pi.maj_flt;
+			cev.min_flt = pi.min_flt;
+			cev.nvcsw = pi.nvcsw;
+			cev.nivcsw = pi.nivcsw;
+			cev.threads = pi.threads;
+			cev.oom_score_adj = pi.oom_score_adj;
+			cev.oom_killed = pi.oom_killed;
+			cev.net_tx_bytes = pi.net_tx_bytes;
+			cev.net_rx_bytes = pi.net_rx_bytes;
+			cev.start_time_ns = pi.start_ns;
+			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
+
+			/* Fill cgroup metrics from cache */
+			if (cg_idx >= 0 && seen_cg[cg_idx].read) {
+				cev.cgroup_memory_max = seen_cg[cg_idx].mem_max;
+				cev.cgroup_memory_current = seen_cg[cg_idx].mem_cur;
+				cev.cgroup_swap_current = seen_cg[cg_idx].swap_cur;
+				cev.cgroup_cpu_weight = seen_cg[cg_idx].cpu_weight;
+				cev.cgroup_pids_current = seen_cg[cg_idx].pids_cur;
+			}
+
+			ef_append(&cev, cfg_hostname);
+			snap_count++;
+		}
 		pid_count++;
-next:
-		err = bpf_map_get_next_key(proc_map_fd, &key, &next_key);
 	}
+	free(all_keys);
 
 	/* Clean up dead processes */
 	for (int i = 0; i < dead_count; i++) {
@@ -1093,7 +1369,7 @@ next:
 		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
 
 	/* Recently exited processes */
-	if (exited_count > 0) {
+	if (f && exited_count > 0) {
 		fprintf(f,
 			"# HELP %s_exited_exit_code Exit code of recently exited process\n"
 			"# TYPE %s_exited_exit_code gauge\n"
@@ -1121,25 +1397,32 @@ next:
 			const char *rname = (ep->rule_id < num_rules)
 				? rules[ep->rule_id].name : "unknown";
 
-			char cmdline[CMDLINE_MAX + 4];
-			cmdline_to_str(ep->cmdline, ep->cmdline_len,
-				       cmdline, sizeof(cmdline));
-			if ((int)strlen(cmdline) > cfg_cmdline_max_len) {
-				cmdline[cfg_cmdline_max_len] = '\0';
-				strcat(cmdline, "...");
+			char ep_exec[CMDLINE_MAX], ep_args[CMDLINE_MAX + 4];
+			cmdline_split(ep->cmdline, ep->cmdline_len,
+				      ep_exec, sizeof(ep_exec),
+				      ep_args, sizeof(ep_args));
+			if ((int)strlen(ep_args) > cfg_cmdline_max_len) {
+				ep_args[cfg_cmdline_max_len] = '\0';
+				strcat(ep_args, "...");
 			}
 
-			char comm_esc[64], cmdline_esc[CMDLINE_MAX * 2];
+			char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
+			char args_esc[CMDLINE_MAX * 2], host_esc[512];
 			escape_label(ep->comm, comm_esc, sizeof(comm_esc));
-			escape_label(cmdline, cmdline_esc, sizeof(cmdline_esc));
+			escape_label(ep_exec, exec_esc, sizeof(exec_esc));
+			escape_label(ep_args, args_esc, sizeof(args_esc));
+			escape_label(cfg_hostname, host_esc, sizeof(host_esc));
 
 			int sig = ep->exit_code & 0x7f;
 			int status = (ep->exit_code >> 8) & 0xff;
 
-			fprintf(f, "%s_exited_exit_code{rule=\"%s\",root_pid=\"%u\","
-				"pid=\"%u\",comm=\"%s\",cmdline=\"%s\"} %d\n",
-				pfx, rname, ep->root_pid, ep->tgid,
-				comm_esc, cmdline_esc, status);
+			fprintf(f, "%s_exited_exit_code{hostname=\"%s\","
+				"rule=\"%s\",root_pid=\"%u\","
+				"pid=\"%u\",comm=\"%s\",exec=\"%s\","
+				"args=\"%s\"} %d\n",
+				pfx, host_esc, rname, ep->root_pid,
+				ep->tgid, comm_esc, exec_esc,
+				args_esc, status);
 			fprintf(f, "%s_exited_signal{rule=\"%s\",root_pid=\"%u\","
 				"pid=\"%u\"} %d\n",
 				pfx, rname, ep->root_pid, ep->tgid, sig);
@@ -1166,7 +1449,7 @@ next:
 	}
 
 	/* Cgroup v2 metrics from /sys/fs/cgroup */
-	if (seen_cg_count > 0) {
+	if (f && cfg_cgroup_metrics && seen_cg_count > 0) {
 		fprintf(f,
 			"# HELP %s_cgroup_memory_max_bytes Cgroup memory.max (0=unlimited)\n"
 			"# TYPE %s_cgroup_memory_max_bytes gauge\n"
@@ -1181,41 +1464,48 @@ next:
 			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
 
 		for (int i = 0; i < seen_cg_count; i++) {
+			if (!seen_cg[i].read)
+				continue;
 			char cg_esc[512];
 			escape_label(seen_cg[i].path, cg_esc, sizeof(cg_esc));
 
-			struct { const char *file; const char *metric; } kv[] = {
-				{ "memory.max",          "memory_max_bytes" },
-				{ "memory.current",      "memory_current_bytes" },
-				{ "memory.swap.current", "memory_swap_current_bytes" },
-				{ "cpu.weight",          "cpu_weight" },
-				{ "pids.current",        "pids_current" },
+			struct { const char *metric; long long val; } kv[] = {
+				{ "memory_max_bytes",          seen_cg[i].mem_max },
+				{ "memory_current_bytes",      seen_cg[i].mem_cur },
+				{ "memory_swap_current_bytes", seen_cg[i].swap_cur },
+				{ "cpu_weight",                seen_cg[i].cpu_weight },
+				{ "pids_current",              seen_cg[i].pids_cur },
 			};
 			for (int k = 0; k < 5; k++) {
-				long long v = read_cgroup_value(seen_cg[i].path,
-								kv[k].file);
-				if (v >= 0) {
+				if (kv[k].val >= 0) {
 					fprintf(f, "%s_cgroup_%s{rule=\"%s\","
 						"cgroup=\"%s\"} %lld\n",
 						pfx, kv[k].metric,
-						seen_cg[i].rule, cg_esc, v);
+						seen_cg[i].rule, cg_esc,
+						kv[k].val);
 				}
 			}
 		}
 	}
 
-	fclose(f);
+	if (f) {
+		fclose(f);
 
-	/* Atomic rename */
-	char dest[PATH_MAX_LEN];
-	snprintf(dest, sizeof(dest), "%s/%s", cfg_output_dir, cfg_output_file);
-	if (rename(tmp_path, dest) == 0)
-		chmod(dest, 0644);
-	else
-		log_ts("ERROR", "rename %s → %s: %s", tmp_path, dest, strerror(errno));
+		/* Atomic rename */
+		if (rename(tmp_path, cfg_prom_path) == 0)
+			chmod(cfg_prom_path, 0644);
+		else
+			log_ts("ERROR", "rename %s → %s: %s",
+			       tmp_path, cfg_prom_path, strerror(errno));
 
-	log_ts("INFO", "snapshot: %d PIDs, %d cgroups → %s",
-	       pid_count, seen_cg_count, dest);
+		log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events → %s",
+		       pid_count, seen_cg_count, snap_count, cfg_prom_path);
+	} else {
+		log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events",
+		       pid_count, seen_cg_count, snap_count);
+	}
+
+	/* snap_count events were streamed directly via ef_append above */
 }
 
 /* ── signals ──────────────────────────────────────────────────────── */
@@ -1238,44 +1528,19 @@ static int libbpf_print(enum libbpf_print_level level,
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s [options]\n"
-		"  -c <path>     config file     (env: config_file)\n"
-		"  -o <dir>      output dir      (env: output_dir,  default: /scripts/system_metrics)\n"
-		"  -f <file>     output file     (env: output_file, default: process_metrics.prom)\n"
-		"  -i <seconds>  snapshot interval (env: snapshot_interval, default: 30)\n"
-		"  -p <prefix>   metric prefix   (env: metric_prefix, default: process_metrics)\n"
-		"  -l <len>      cmdline max len (env: cmdline_max_len, default: 200)\n"
-		"  -r <N>        exec event rate limit per sec (env: exec_rate_limit, 0=unlimited)\n"
-		"  -h            show this help\n",
+		"Usage: %s -c <config_file>\n"
+		"  -c <path>   configuration file (libconfig format)\n"
+		"  -h          show this help\n",
 		prog);
 }
 
 int main(int argc, char *argv[])
 {
-	/* Defaults from environment */
-	const char *env;
-	if ((env = getenv("config_file")))     cfg_config_file = env;
-	if ((env = getenv("output_dir")))      cfg_output_dir = env;
-	if ((env = getenv("output_file")))     cfg_output_file = env;
-	if ((env = getenv("snapshot_interval"))) cfg_snapshot_interval = atoi(env);
-	if ((env = getenv("metric_prefix")))   cfg_metric_prefix = env;
-	if ((env = getenv("cmdline_max_len"))) cfg_cmdline_max_len = atoi(env);
-	if ((env = getenv("exec_rate_limit"))) cfg_exec_rate_limit = atoi(env);
-
-	/* Command-line overrides */
-	static struct option long_opts[] = {
-		{NULL, 0, NULL, 0}
-	};
+	/* Parse command line — only -c and -h */
 	int opt;
-	while ((opt = getopt_long(argc, argv, "c:o:f:i:p:l:r:h", long_opts, NULL)) != -1) {
+	while ((opt = getopt(argc, argv, "c:h")) != -1) {
 		switch (opt) {
 		case 'c': cfg_config_file = optarg; break;
-		case 'o': cfg_output_dir = optarg; break;
-		case 'f': cfg_output_file = optarg; break;
-		case 'i': cfg_snapshot_interval = atoi(optarg); break;
-		case 'p': cfg_metric_prefix = optarg; break;
-		case 'l': cfg_cmdline_max_len = atoi(optarg); break;
-		case 'r': cfg_exec_rate_limit = atoi(optarg); break;
 		case 'h': usage(argv[0]); return 0;
 		default:  usage(argv[0]); return 1;
 		}
@@ -1296,19 +1561,25 @@ int main(int argc, char *argv[])
 		cfg_config_file = cfgbuf;
 	}
 
-	/* Parse config */
-	if (parse_config(cfg_config_file) < 0)
+	/* Load configuration (libconfig) */
+	if (load_config(cfg_config_file) < 0)
+		return 1;
+
+	/* Load rules from config */
+	if (parse_rules_from_config(cfg_config_file) < 0)
 		return 1;
 	if (num_rules == 0) {
 		fprintf(stderr, "FATAL: no rules loaded\n");
 		return 1;
 	}
 
-	/* Check output dir */
-	struct stat st;
-	if (stat(cfg_output_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-		fprintf(stderr, "FATAL: output dir not found: %s\n", cfg_output_dir);
-		return 1;
+	/* Initialize event file if HTTP server is enabled */
+	if (g_http_cfg.enabled) {
+		if (ef_init(cfg_data_file) < 0) {
+			fprintf(stderr, "FATAL: event file init failed: %s\n",
+				cfg_data_file);
+			return 1;
+		}
 	}
 
 	/* Build cgroup cache */
@@ -1361,10 +1632,24 @@ int main(int argc, char *argv[])
 	/* One-time startup scan: find already-running processes */
 	initial_scan();
 
-	log_ts("INFO", "started: %d rules, snapshot every %ds, output=%s/%s, "
-	       "exec_rate_limit=%d/s",
-	       num_rules, cfg_snapshot_interval, cfg_output_dir, cfg_output_file,
-	       cfg_exec_rate_limit);
+	/* Start HTTP server if enabled */
+	if (g_http_cfg.enabled) {
+		if (http_server_start(&g_http_cfg, cfg_prom_path) < 0) {
+			fprintf(stderr, "FATAL: HTTP server start failed\n");
+			ring_buffer__free(rb);
+			process_metrics_bpf__destroy(skel);
+			return 1;
+		}
+	}
+
+	log_ts("INFO", "started: %d rules, snapshot every %ds, "
+	       "exec_rate_limit=%d/s, http_server=%s, "
+	       "cgroup_metrics=%s, refresh_proc=%s",
+	       num_rules, cfg_snapshot_interval,
+	       cfg_exec_rate_limit,
+	       g_http_cfg.enabled ? "on" : "off",
+	       cfg_cgroup_metrics ? "on" : "off",
+	       cfg_refresh_proc ? "on" : "off");
 
 	/* Main loop */
 	time_t last_snapshot = 0;
@@ -1381,7 +1666,7 @@ int main(int argc, char *argv[])
 		/* Config reload on SIGHUP */
 		if (g_reload) {
 			g_reload = 0;
-			log_ts("INFO", "SIGHUP: reloading config...");
+			log_ts("INFO", "SIGHUP: reloading rules...");
 
 			/* Clear all tracking — delete from beginning each time */
 			__u32 del_key;
@@ -1390,7 +1675,7 @@ int main(int argc, char *argv[])
 				bpf_map_delete_elem(proc_map_fd, &del_key);
 			}
 
-			parse_config(cfg_config_file);
+			parse_rules_from_config(cfg_config_file);
 			build_cgroup_cache();
 			exited_head = exited_count = 0;
 			cpu_prev_count = 0;
@@ -1405,6 +1690,12 @@ int main(int argc, char *argv[])
 			last_snapshot = now;
 		}
 	}
+
+	/* Stop HTTP server */
+	http_server_stop();
+
+	/* Clean up event file */
+	ef_cleanup();
 
 	ring_buffer__free(rb);
 	process_metrics_bpf__destroy(skel);

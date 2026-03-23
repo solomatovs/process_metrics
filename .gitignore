@@ -1,11 +1,11 @@
 # Build artifacts
-bpf/build/
+build/
 
 # Generated kernel headers (regenerate via: bpftool btf dump file /sys/kernel/btf/vmlinux format c)
-bpf/src/vmlinux.h
+src/vmlinux.h
 
 # Generated skeleton header
-bpf/src/*.skel.h
+src/*.skel.h
 
 # Object files
 *.o

@@ -42,10 +42,7 @@ SecureBits=no-setuid-fixup
 
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \
-    -c /etc/process_metrics/process_metrics.conf \
-    -o /var/lib/process_metrics \
-    -f process_metrics.prom \
-    -i 30
+    -c /etc/process_metrics/process_metrics.conf
 
 # --- Перезагрузка конфига по SIGHUP ---
 ExecReload=/bin/kill -HUP $MAINPID
@@ -71,7 +68,7 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 PrivateNetwork=no
 PrivateDevices=yes
