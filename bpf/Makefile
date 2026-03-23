@@ -1,0 +1,168 @@
+# process_metrics — event-driven BPF process metrics collector
+#
+# Structure:
+#   src/               — project source code
+#   src/bpftool/       — bpftool source (vendored, built locally)
+#   build/             — generated artifacts (.bpf.o, .skel.h, binary)
+#
+# Usage:
+#   make               — show this help
+#   make deps          — install build dependencies (auto-detects apt/yum)
+#   make all           — build bpftool (if needed) + process_metrics
+#   make bpftool       — build only bpftool from src/bpftool/
+#   make clean         — remove build artifacts
+#   make vmlinux       — regenerate vmlinux.h from running kernel
+#
+# Requirements:
+#   clang >= 10        — for BPF CO-RE (preserve_access_index)
+#   gcc                — for userspace loader
+#   libbpf-dev, libelf-dev, zlib1g-dev
+
+SRCDIR   := src
+BUILDDIR := build
+
+# Source files — new event-driven implementation
+BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
+USER_SRC   := $(SRCDIR)/process_metrics.c
+COMMON_H   := $(SRCDIR)/process_metrics_common.h
+VMLINUX_H  := $(SRCDIR)/vmlinux.h
+
+# Build artifacts
+BPF_OBJ    := $(BUILDDIR)/process_metrics.bpf.o
+SKEL_H     := $(BUILDDIR)/process_metrics.skel.h
+BINARY     := $(BUILDDIR)/process_metrics
+
+# bpftool from vendored sources
+BPFTOOL_SRCDIR := $(SRCDIR)/bpftool/src
+BPFTOOL_BIN    := $(BUILDDIR)/bpftool
+
+# Tools — auto-detect newest clang with BPF CO-RE support (>= 10)
+CLANG   ?= $(shell best=""; best_ver=0; \
+            for c in clang clang-10 clang-11 clang-12 clang-13 clang-14 clang-15 clang-16 clang-17 clang-18 clang-19 clang-20; do \
+              command -v $$c >/dev/null 2>&1 || continue; \
+              ver=$$($$c --version 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1); \
+              [ -n "$$ver" ] && [ "$$ver" -ge 10 ] 2>/dev/null && [ "$$ver" -gt "$$best_ver" ] && best=$$c && best_ver=$$ver; \
+            done; echo $$best)
+BPFTOOL ?= $(BPFTOOL_BIN)
+CC      ?= gcc
+
+# Flags
+BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR)
+CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
+LDFLAGS    := -lbpf -lelf -lz
+
+# Dependency packages
+APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev linux-headers-$(shell uname -r) llvm
+YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel kernel-devel-$(shell uname -r) llvm
+
+# Minimum clang version for BPF CO-RE
+MIN_CLANG_VER := 10
+
+.PHONY: help all clean vmlinux deps deps-apt deps-yum bpftool check-clang
+
+help:
+	@echo "process_metrics — event-driven BPF process metrics collector"
+	@echo ""
+	@echo "  make deps       install build dependencies (auto-detects apt/yum)"
+	@echo "  make deps-apt   install dependencies via apt (Astra Linux, Debian)"
+	@echo "  make deps-yum   install dependencies via yum/dnf (RHEL, CentOS)"
+	@echo "  make bpftool    build bpftool from vendored sources"
+	@echo "  make all        build everything (bpftool + process_metrics)"
+	@echo "  make clean      remove build artifacts"
+	@echo "  make vmlinux    regenerate vmlinux.h from running kernel BTF"
+	@echo ""
+	@echo "Detected clang: $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
+	@echo ""
+	@echo "Quick start:"
+	@echo "  make deps && make all"
+
+all: check-clang $(BINARY)
+
+# --- clang version check ---
+
+check-clang:
+	@if [ -z "$(CLANG)" ]; then \
+		echo "Error: no clang >= $(MIN_CLANG_VER) found."; \
+		echo "Install: apt install clang-11  OR  yum install clang"; \
+		echo "Or specify: make all CLANG=/path/to/clang-11"; \
+		exit 1; \
+	fi; \
+	ver=$$($(CLANG) --version 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1); \
+	if [ -z "$$ver" ] || [ "$$ver" -lt $(MIN_CLANG_VER) ]; then \
+		echo "Error: $(CLANG) version $$ver < $(MIN_CLANG_VER) (need >= $(MIN_CLANG_VER) for BPF CO-RE)"; \
+		echo "Install clang >= $(MIN_CLANG_VER) or specify: make all CLANG=clang-11"; \
+		exit 1; \
+	fi; \
+	echo "Using $(CLANG) (version $$ver)"
+
+# --- dependency installation ---
+
+deps:
+	@if command -v apt-get >/dev/null 2>&1; then \
+		$(MAKE) deps-apt; \
+	elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then \
+		$(MAKE) deps-yum; \
+	else \
+		echo "Error: neither apt-get nor yum/dnf found"; exit 1; \
+	fi
+
+deps-apt:
+	apt-get update
+	apt-get install -y $(APT_PKGS)
+	@# Install clang >= 10: try clang-10..clang-18, then generic clang
+	@found=0; \
+	for pkg in clang-10 clang-11 clang-12 clang-13 clang-14 clang-15 clang-16 clang-17 clang-18 clang; do \
+		if apt-cache show $$pkg >/dev/null 2>&1; then \
+			echo "Installing $$pkg..."; \
+			apt-get install -y $$pkg; \
+			found=1; \
+			break; \
+		fi; \
+	done; \
+	if [ "$$found" = "0" ]; then \
+		echo "Warning: no clang package found in apt repos"; \
+		echo "Install clang >= $(MIN_CLANG_VER) manually"; \
+	fi
+
+deps-yum:
+	yum install -y $(YUM_PKGS) clang
+
+# --- bpftool from vendored source ---
+
+bpftool: $(BPFTOOL_BIN)
+
+$(BPFTOOL_BIN): | $(BUILDDIR)
+	mkdir -p $(CURDIR)/$(BUILDDIR)/bpftool-build
+	$(MAKE) -C $(BPFTOOL_SRCDIR) -j$$(nproc) \
+		OUTPUT=$(CURDIR)/$(BUILDDIR)/bpftool-build/ \
+		EXTRA_CFLAGS="-Wno-error=discarded-qualifiers" \
+		LLVM_STRIP="$(shell command -v llvm-strip 2>/dev/null || echo true)"
+	cp $(CURDIR)/$(BUILDDIR)/bpftool-build/bpftool $@
+	rm -rf $(CURDIR)/$(BUILDDIR)/bpftool-build
+
+# --- build steps ---
+
+# Step 1: compile BPF C → BPF ELF object
+$(BPF_OBJ): $(BPF_SRC) $(COMMON_H) $(VMLINUX_H) | $(BUILDDIR)
+	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+# Step 2: generate skeleton header from BPF object (depends on bpftool)
+$(SKEL_H): $(BPF_OBJ) $(BPFTOOL_BIN)
+	chmod ugo+x $(BPFTOOL)
+	$(BPFTOOL) gen skeleton $< > $@
+
+# Step 3: compile userspace (includes skeleton with embedded ELF)
+$(BINARY): $(USER_SRC) $(COMMON_H) $(SKEL_H)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+$(BUILDDIR):
+	mkdir -p $(BUILDDIR)
+
+clean:
+	rm -f $(BPF_OBJ) $(SKEL_H) $(BINARY) $(BPFTOOL_BIN)
+	rm -rf $(BUILDDIR)/bpftool-build
+
+# Regenerate vmlinux.h from running kernel's BTF
+vmlinux:
+	chmod ugo+x $(BPFTOOL)
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)

@@ -1,0 +1,19 @@
+# Build artifacts
+bpf/build/
+
+# Generated kernel headers (regenerate via: bpftool btf dump file /sys/kernel/btf/vmlinux format c)
+bpf/src/vmlinux.h
+
+# Generated skeleton header
+bpf/src/*.skel.h
+
+# Object files
+*.o
+*.a
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

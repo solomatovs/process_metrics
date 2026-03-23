@@ -1,0 +1,373 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * process_metrics.bpf.c — event-driven process metrics via BPF
+ *
+ * Tracepoints:
+ *   sched_process_exec  → capture pid, cmdline, comm, cgroup
+ *   sched_process_fork  → inherit tracking from parent (raw_tp)
+ *   sched_switch        → update rss, cpu, vsize for tracked PIDs
+ *   sched_process_exit  → finalize metrics, send to userspace
+ *
+ * Maps:
+ *   proc_map    — per-process live metrics    (hash: tgid → proc_info)
+ *   tracked_map — tracking metadata           (hash: tgid → track_info)
+ *   events      — lifecycle events ring buffer
+ *
+ * Userspace manages tracking decisions (exec rule matching).
+ * BPF only collects data for tracked PIDs and sends lifecycle events.
+ */
+
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+#include "process_metrics_common.h"
+
+/* ── rodata (configurable from userspace before load) ─────────────── */
+
+/* Max exec events per second sent to ring buffer. 0 = unlimited. */
+volatile const __u32 max_exec_events_per_sec = 0;
+
+/* ── maps ─────────────────────────────────────────────────────────── */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, __u32);
+	__type(value, struct proc_info);
+} proc_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, __u32);
+	__type(value, struct track_info);
+} tracked_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_SIZE);
+} events SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct rate_state);
+} exec_rate SEC(".maps");
+
+/* ── rate limiter ─────────────────────────────────────────────────── */
+
+/*
+ * Per-second sliding window rate limiter for exec events.
+ * Returns 1 if event should be emitted, 0 if rate exceeded.
+ * Slightly racy on multi-CPU (counter may overshoot), acceptable.
+ */
+static __always_inline int exec_rate_check(void)
+{
+	__u32 key = 0;
+	struct rate_state *rs;
+
+	if (!max_exec_events_per_sec)
+		return 1;
+
+	rs = bpf_map_lookup_elem(&exec_rate, &key);
+	if (!rs)
+		return 1;
+
+	__u64 now = bpf_ktime_get_ns();
+
+	/* New 1-second window — reset counter */
+	if (now - rs->window_ns >= 1000000000ULL) {
+		rs->window_ns = now;
+		rs->count = 1;
+		return 1;
+	}
+
+	rs->count++;
+	return rs->count <= max_exec_events_per_sec;
+}
+
+/* ── helpers ──────────────────────────────────────────────────────── */
+
+static __always_inline __u64 read_rss_pages(struct task_struct *task)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	if (!mm)
+		return 0;
+
+	/* MM_FILEPAGES=0, MM_ANONPAGES=1, MM_SHMEMPAGES=3 */
+	long v0 = 0, v1 = 0, v3 = 0;
+	bpf_core_read(&v0, sizeof(v0), &mm->rss_stat.count[0].counter);
+	bpf_core_read(&v1, sizeof(v1), &mm->rss_stat.count[1].counter);
+	bpf_core_read(&v3, sizeof(v3), &mm->rss_stat.count[3].counter);
+
+	long total = v0 + v1 + v3;
+	return total > 0 ? (__u64)total : 0;
+}
+
+static __always_inline __u64 read_cpu_ns(struct task_struct *task)
+{
+	/*
+	 * signal->{utime,stime} accumulates CPU of dead threads.
+	 * Add group_leader's live CPU for an approximation.
+	 * Exact for single-threaded processes.
+	 */
+	__u64 u = BPF_CORE_READ(task, signal, utime);
+	__u64 s = BPF_CORE_READ(task, signal, stime);
+
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader) {
+		u += BPF_CORE_READ(leader, utime);
+		s += BPF_CORE_READ(leader, stime);
+	}
+	return u + s;
+}
+
+static __always_inline __u64 read_vsize_pages(struct task_struct *task)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	return mm ? (__u64)BPF_CORE_READ(mm, total_vm) : 0;
+}
+
+static __always_inline __u32 read_nr_threads(struct task_struct *task)
+{
+	return (__u32)BPF_CORE_READ(task, signal, nr_threads);
+}
+
+static __always_inline __s16 read_oom_score_adj(struct task_struct *task)
+{
+	return (__s16)BPF_CORE_READ(task, signal, oom_score_adj);
+}
+
+/*
+ * Convert numeric task state to ps-style character.
+ * prev_state from sched_switch or task->__state.
+ */
+static __always_inline __u8 state_to_char(long state)
+{
+	if (state == 0)    return 'R'; /* TASK_RUNNING (preempted) */
+	if (state & 0x01)  return 'S'; /* TASK_INTERRUPTIBLE */
+	if (state & 0x02)  return 'D'; /* TASK_UNINTERRUPTIBLE */
+	if (state & 0x04)  return 'T'; /* __TASK_STOPPED */
+	if (state & 0x08)  return 't'; /* __TASK_TRACED */
+	if (state & 0x20)  return 'Z'; /* EXIT_ZOMBIE */
+	if (state & 0x10)  return 'X'; /* EXIT_DEAD */
+	return '?';
+}
+
+/*
+ * Read cmdline from current process mm->arg_start..arg_end
+ * into dst[CMDLINE_MAX]. Returns length read.
+ */
+static __always_inline __u16 read_cmdline(struct task_struct *task,
+					  char *dst)
+{
+	struct mm_struct *mm = BPF_CORE_READ(task, mm);
+	if (!mm)
+		return 0;
+
+	unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
+	unsigned long arg_end   = BPF_CORE_READ(mm, arg_end);
+	if (arg_end <= arg_start)
+		return 0;
+
+	__u64 len = arg_end - arg_start;
+	if (len >= CMDLINE_MAX)
+		len = CMDLINE_MAX - 1;
+
+	/* Mask for verifier: CMDLINE_MAX is 256, so mask = 0xFF */
+	len &= (CMDLINE_MAX - 1);
+	bpf_probe_read_user(dst, len, (void *)arg_start);
+	return (__u16)len;
+}
+
+/* ── EXEC ─────────────────────────────────────────────────────────── */
+
+SEC("tracepoint/sched/sched_process_exec")
+int handle_exec(void *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Skip kernel tasks (PID 0) early */
+	if (tgid == 0)
+		return 0;
+
+	/* Rate limit exec events to avoid ring buffer flooding */
+	if (!exec_rate_check())
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* ppid */
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+	/* Send EXEC event — always, for rule matching in userspace */
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type         = EVENT_EXEC;
+	e->tgid         = tgid;
+	e->ppid         = ppid;
+	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	e->cgroup_id    = bpf_get_current_cgroup_id();
+	e->start_ns     = BPF_CORE_READ(task, start_time);
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	e->cmdline_len  = read_cmdline(task, e->cmdline);
+
+	bpf_ringbuf_submit(e, 0);
+
+	/* If already tracked (fork-inherited), refresh cmdline/comm */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info) {
+		bpf_get_current_comm(info->comm, sizeof(info->comm));
+		info->cgroup_id   = bpf_get_current_cgroup_id();
+		info->cmdline_len = read_cmdline(task, info->cmdline);
+	}
+
+	return 0;
+}
+
+/* ── FORK (raw tracepoint to access child task_struct) ────────────── */
+
+SEC("raw_tracepoint/sched_process_fork")
+int handle_fork(struct bpf_raw_tracepoint_args *ctx)
+{
+	struct task_struct *parent = (struct task_struct *)ctx->args[0];
+	struct task_struct *child  = (struct task_struct *)ctx->args[1];
+
+	__u32 child_pid  = BPF_CORE_READ(child, pid);
+	__u32 child_tgid = BPF_CORE_READ(child, tgid);
+
+	/* Only process forks, not thread clones */
+	if (child_pid != child_tgid)
+		return 0;
+
+	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
+
+	/* Only notify userspace if parent is tracked */
+	if (!bpf_map_lookup_elem(&tracked_map, &parent_tgid))
+		return 0;
+
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return 0;
+
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type         = EVENT_FORK;
+	e->tgid         = child_tgid;       /* new child process */
+	e->ppid         = parent_tgid;       /* parent process */
+	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	e->cgroup_id    = bpf_get_current_cgroup_id();
+	e->start_ns     = BPF_CORE_READ(child, start_time);
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	/* cmdline inherited, userspace copies from parent's proc_info */
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* ── SCHED_SWITCH — hot path, update metrics for tracked PIDs ─────── */
+
+SEC("tracepoint/sched/sched_switch")
+int handle_sched_switch(void *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Fast bail-out for non-tracked PIDs */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (!info)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* RSS (pages) */
+	__u64 rss = read_rss_pages(task);
+	info->rss_pages = rss;
+	if (rss > info->rss_max_pages)
+		info->rss_max_pages = rss;
+
+	/* CPU time (ns) — approximate for multi-threaded */
+	info->cpu_ns = read_cpu_ns(task);
+
+	/* Virtual memory (pages) */
+	info->vsize_pages = read_vsize_pages(task);
+
+	/* Thread count */
+	info->threads = read_nr_threads(task);
+
+	/* OOM score adjustment */
+	info->oom_score_adj = read_oom_score_adj(task);
+
+	/* Process state — task->__state (kernel 5.14+) */
+	unsigned int task_state = BPF_CORE_READ(task, __state);
+	info->state = state_to_char(task_state);
+
+	return 0;
+}
+
+/* ── EXIT ─────────────────────────────────────────────────────────── */
+
+SEC("tracepoint/sched/sched_process_exit")
+int handle_exit(void *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 pid  = (__u32)pid_tgid;
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Only handle thread group leader (process) exit */
+	if (pid != tgid)
+		return 0;
+
+	/* Only for tracked processes */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* Send EXIT event with final metrics */
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		goto cleanup;
+
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type         = EVENT_EXIT;
+	e->tgid         = tgid;
+	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(e->comm, sizeof(e->comm));
+
+	/* Final metrics snapshot */
+	e->cpu_ns        = read_cpu_ns(task);
+	e->rss_pages     = read_rss_pages(task);
+	e->vsize_pages   = read_vsize_pages(task);
+	e->threads       = read_nr_threads(task);
+	e->oom_score_adj = read_oom_score_adj(task);
+
+	/* Carry over rss_max and start_ns from proc_info */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info) {
+		e->rss_max_pages = info->rss_max_pages;
+		e->start_ns      = info->start_ns;
+		e->cgroup_id     = info->cgroup_id;
+		e->ppid          = info->ppid;
+		e->cmdline_len   = info->cmdline_len;
+		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
+	}
+
+	bpf_ringbuf_submit(e, 0);
+
+cleanup:
+	bpf_map_delete_elem(&tracked_map, &tgid);
+	bpf_map_delete_elem(&proc_map, &tgid);
+	return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
