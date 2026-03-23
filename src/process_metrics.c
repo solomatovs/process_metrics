@@ -63,6 +63,17 @@ static struct http_config g_http_cfg;
 static char cfg_data_file[PATH_MAX_LEN]    = "";
 static char cfg_prom_path[PATH_MAX_LEN]    = "";  /* internal prom file for HTTP */
 
+/* Feature toggles */
+static int cfg_net_metrics                  = 1;   /* 1 = attach TCP/UDP kretprobes */
+
+/* File tracking config */
+static int cfg_file_tracking_enabled        = 0;
+static int cfg_file_track_bytes             = 0;
+static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
+static int cfg_file_include_count           = 0;
+static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
+static int cfg_file_exclude_count           = 0;
+
 /* ── globals ──────────────────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_running   = 1;
@@ -352,6 +363,57 @@ static int load_config(const char *path)
 				 "%s", str_val);
 	}
 
+	/* net_metrics toggle */
+	if (config_lookup_bool(&cfg, "net_metrics", &bool_val))
+		cfg_net_metrics = bool_val;
+
+	/* File tracking settings */
+	config_setting_t *ft = config_lookup(&cfg, "file_tracking");
+	if (ft) {
+		if (config_setting_lookup_bool(ft, "enabled", &bool_val))
+			cfg_file_tracking_enabled = bool_val;
+		if (config_setting_lookup_bool(ft, "track_bytes", &bool_val))
+			cfg_file_track_bytes = bool_val;
+
+		/* Include prefixes */
+		config_setting_t *inc = config_setting_lookup(ft, "include");
+		if (inc && config_setting_is_list(inc)) {
+			int n = config_setting_length(inc);
+			if (n > FILE_MAX_PREFIXES) n = FILE_MAX_PREFIXES;
+			for (int i = 0; i < n; i++) {
+				const char *s = config_setting_get_string_elem(inc, i);
+				if (s) {
+					int slen = (int)strlen(s);
+					if (slen > FILE_PREFIX_LEN - 1)
+						slen = FILE_PREFIX_LEN - 1;
+					memcpy(cfg_file_include[i].prefix, s, slen);
+					cfg_file_include[i].prefix[slen] = '\0';
+					cfg_file_include[i].len = (__u8)slen;
+					cfg_file_include_count++;
+				}
+			}
+		}
+
+		/* Exclude prefixes */
+		config_setting_t *exc = config_setting_lookup(ft, "exclude");
+		if (exc && config_setting_is_list(exc)) {
+			int n = config_setting_length(exc);
+			if (n > FILE_MAX_PREFIXES) n = FILE_MAX_PREFIXES;
+			for (int i = 0; i < n; i++) {
+				const char *s = config_setting_get_string_elem(exc, i);
+				if (s) {
+					int slen = (int)strlen(s);
+					if (slen > FILE_PREFIX_LEN - 1)
+						slen = FILE_PREFIX_LEN - 1;
+					memcpy(cfg_file_exclude[i].prefix, s, slen);
+					cfg_file_exclude[i].prefix[slen] = '\0';
+					cfg_file_exclude[i].len = (__u8)slen;
+					cfg_file_exclude_count++;
+				}
+			}
+		}
+	}
+
 	/* Default paths when http_server is enabled */
 	if (g_http_cfg.enabled) {
 		if (!cfg_data_file[0])
@@ -475,7 +537,11 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 			    const char *cgroup)
 {
 	memset(out, 0, sizeof(*out));
-	out->timestamp_ns = e->timestamp_ns;
+	/* Use wall-clock time instead of boot-relative BPF timestamp */
+	struct timespec ts_now;
+	clock_gettime(CLOCK_REALTIME, &ts_now);
+	out->timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+			  + (__u64)ts_now.tv_nsec;
 	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
 	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
 	out->root_pid = e->root_pid;
@@ -791,6 +857,66 @@ static void initial_scan(void)
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	(void)ctx;
+
+	/* Both struct event and struct file_event have __u32 type at offset 0 */
+	if (size < sizeof(__u32))
+		return 0;
+	__u32 type = *(const __u32 *)data;
+
+	/* Handle file_close events separately */
+	if (type == EVENT_FILE_CLOSE) {
+		if (size < sizeof(struct file_event))
+			return 0;
+		const struct file_event *fe = data;
+
+		struct track_info ti;
+		const char *rname = "?";
+		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) == 0)
+			rname = (ti.rule_id < num_rules)
+				? rules[ti.rule_id].name : "?";
+
+		log_debug("FILE_CLOSE: pid=%u rule=%s path=%.60s "
+			  "read=%llu write=%llu opens=%u",
+			  fe->tgid, rname, fe->path,
+			  (unsigned long long)fe->read_bytes,
+			  (unsigned long long)fe->write_bytes,
+			  fe->open_count);
+
+		/* Send file_close event to event file */
+		if (g_http_cfg.enabled) {
+			const char *cg = resolve_cgroup(fe->cgroup_id);
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			/* Use wall-clock time (boot_ns → epoch conversion) */
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "file_close");
+			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&fe->tgid, &ti) == 0) {
+				cev.root_pid = ti.root_pid;
+				cev.is_root = ti.is_root;
+			}
+			cev.pid = fe->tgid;
+			cev.ppid = fe->ppid;
+			memcpy(cev.comm, fe->comm, COMM_LEN);
+			/* Store file path in args field */
+			snprintf(cev.args, sizeof(cev.args), "%s", fe->path);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+			cev.exit_code = (__u32)fe->flags;
+			cev.io_read_bytes = fe->read_bytes;
+			cev.io_write_bytes = fe->write_bytes;
+			cev.threads = fe->open_count;
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
 	const struct event *e = data;
 	if (size < sizeof(*e))
 		return 0;
@@ -937,9 +1063,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 		}
 		break;
 	}
+
+	default:
+		break;
 	}
 	return 0;
 }
+
 
 /* ── snapshot: write .prom file ───────────────────────────────────── */
 
@@ -1598,11 +1728,57 @@ int main(int argc, char *argv[])
 	/* Set rodata before loading */
 	skel->rodata->max_exec_events_per_sec = (__u32)cfg_exec_rate_limit;
 
+	/* Conditionally disable network kretprobes */
+	if (!cfg_net_metrics) {
+		bpf_program__set_autoattach(skel->progs.ret_tcp_sendmsg, false);
+		bpf_program__set_autoattach(skel->progs.ret_tcp_recvmsg, false);
+		bpf_program__set_autoattach(skel->progs.ret_udp_sendmsg, false);
+		bpf_program__set_autoattach(skel->progs.ret_udp_recvmsg, false);
+	}
+
+	/* Conditionally disable file tracking programs */
+	if (!cfg_file_tracking_enabled) {
+		bpf_program__set_autoattach(skel->progs.handle_openat_enter, false);
+		bpf_program__set_autoattach(skel->progs.handle_openat_exit, false);
+		bpf_program__set_autoattach(skel->progs.handle_close_enter, false);
+		bpf_program__set_autoattach(skel->progs.handle_read_enter, false);
+		bpf_program__set_autoattach(skel->progs.handle_read_exit, false);
+		bpf_program__set_autoattach(skel->progs.handle_write_enter, false);
+		bpf_program__set_autoattach(skel->progs.handle_write_exit, false);
+	}
+
 	/* Load BPF programs */
 	if (process_metrics_bpf__load(skel)) {
 		fprintf(stderr, "FATAL: failed to load BPF programs\n");
 		process_metrics_bpf__destroy(skel);
 		return 1;
+	}
+
+	/* Push file tracking config to BPF maps */
+	if (cfg_file_tracking_enabled) {
+		int file_cfg_fd = bpf_map__fd(skel->maps.file_cfg);
+		__u32 key0 = 0;
+		struct file_config fc = {
+			.enabled = 1,
+			.track_bytes = (__u8)cfg_file_track_bytes,
+		};
+		bpf_map_update_elem(file_cfg_fd, &key0, &fc, BPF_ANY);
+
+		int inc_fd = bpf_map__fd(skel->maps.file_include_prefixes);
+		for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
+			__u32 idx = (__u32)i;
+			if (i < cfg_file_include_count)
+				bpf_map_update_elem(inc_fd, &idx,
+					&cfg_file_include[i], BPF_ANY);
+		}
+
+		int exc_fd = bpf_map__fd(skel->maps.file_exclude_prefixes);
+		for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
+			__u32 idx = (__u32)i;
+			if (i < cfg_file_exclude_count)
+				bpf_map_update_elem(exc_fd, &idx,
+					&cfg_file_exclude[i], BPF_ANY);
+		}
 	}
 
 	if (process_metrics_bpf__attach(skel)) {
@@ -1644,12 +1820,16 @@ int main(int argc, char *argv[])
 
 	log_ts("INFO", "started: %d rules, snapshot every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
-	       "cgroup_metrics=%s, refresh_proc=%s",
+	       "cgroup_metrics=%s, refresh_proc=%s, "
+	       "net_metrics=%s, file_tracking=%s%s",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
 	       cfg_cgroup_metrics ? "on" : "off",
-	       cfg_refresh_proc ? "on" : "off");
+	       cfg_refresh_proc ? "on" : "off",
+	       cfg_net_metrics ? "on" : "off",
+	       cfg_file_tracking_enabled ? "on" : "off",
+	       cfg_file_track_bytes ? "+bytes" : "");
 
 	/* Main loop */
 	time_t last_snapshot = 0;

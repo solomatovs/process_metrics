@@ -511,6 +511,337 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
+/* ── File tracking: openat/close/read/write ───────────────────────── */
+
+/*
+ * Configuration and prefix lists — populated by userspace before attach.
+ * file_cfg: single-element array with enabled/track_bytes flags.
+ * file_include_prefixes / file_exclude_prefixes: up to FILE_MAX_PREFIXES
+ * path prefixes for filtering in BPF.
+ */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct file_config);
+} file_cfg SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, FILE_MAX_PREFIXES);
+	__type(key, __u32);
+	__type(value, struct file_prefix);
+} file_include_prefixes SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, FILE_MAX_PREFIXES);
+	__type(key, __u32);
+	__type(value, struct file_prefix);
+} file_exclude_prefixes SEC(".maps");
+
+/* Temporary args storage between syscall enter and exit */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);    /* pid_tgid */
+	__type(value, struct openat_args);
+} openat_args_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);    /* pid_tgid */
+	__type(value, struct rw_args);
+} rw_args_map SEC(".maps");
+
+/* Per-fd tracking: accumulate read/write bytes until close */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 65536);
+	__type(key, struct fd_key);
+	__type(value, struct fd_info);
+} fd_map SEC(".maps");
+
+/*
+ * Check if path matches any prefix in include list.
+ * If no include prefixes are configured (all len=0), allows everything.
+ * Returns 1 if path should be included.
+ */
+/*
+ * Compare up to 'len' bytes of two strings.
+ * Returns 1 if first 'len' bytes match.
+ * Uses a fixed iteration count for BPF verifier compatibility.
+ */
+#define PREFIX_CMP_MAX 32   /* max compared bytes (covers most real path prefixes) */
+
+static __always_inline int prefix_match(const char *path,
+					const char *prefix, int len)
+{
+	if (len <= 0 || len > PREFIX_CMP_MAX)
+		len = PREFIX_CMP_MAX;
+
+	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
+		if (j >= len)
+			return 1;
+		if (path[j] != prefix[j])
+			return 0;
+	}
+	return 1;
+}
+
+static __always_inline int path_matches_include(const char *path)
+{
+	int has_any = 0;
+
+	#pragma unroll
+	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
+		__u32 idx = i;
+		struct file_prefix *fp = bpf_map_lookup_elem(
+			&file_include_prefixes, &idx);
+		if (!fp || fp->len == 0)
+			continue;
+		has_any = 1;
+
+		if (prefix_match(path, fp->prefix, fp->len))
+			return 1;
+	}
+
+	/* If no include prefixes defined, include everything */
+	return !has_any;
+}
+
+/*
+ * Check if path matches any prefix in exclude list.
+ * Returns 1 if path should be excluded.
+ */
+static __always_inline int path_matches_exclude(const char *path)
+{
+	#pragma unroll
+	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
+		__u32 idx = i;
+		struct file_prefix *fp = bpf_map_lookup_elem(
+			&file_exclude_prefixes, &idx);
+		if (!fp || fp->len == 0)
+			continue;
+
+		if (prefix_match(path, fp->prefix, fp->len))
+			return 1;
+	}
+	return 0;
+}
+
+/*
+ * sys_enter_openat: save path and flags for the exit handler.
+ * Only for tracked processes. Path filtering happens here.
+ */
+SEC("tracepoint/syscalls/sys_enter_openat")
+int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Only tracked processes */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	/* Read path from userspace */
+	struct openat_args oa = {0};
+	const char *pathname = (const char *)ctx->args[1];
+	bpf_probe_read_user_str(oa.path, sizeof(oa.path), pathname);
+	oa.flags = (int)ctx->args[2];
+
+	/* Filter by path prefix */
+	if (!path_matches_include(oa.path))
+		return 0;
+	if (path_matches_exclude(oa.path))
+		return 0;
+
+	bpf_map_update_elem(&openat_args_map, &pid_tgid, &oa, BPF_ANY);
+	return 0;
+}
+
+/*
+ * sys_exit_openat: if open succeeded, create fd_info entry.
+ */
+SEC("tracepoint/syscalls/sys_exit_openat")
+int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct openat_args *oa = bpf_map_lookup_elem(
+		&openat_args_map, &pid_tgid);
+	if (!oa)
+		return 0;
+
+	long ret = ctx->ret;
+	if (ret < 0) {
+		bpf_map_delete_elem(&openat_args_map, &pid_tgid);
+		return 0;
+	}
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	struct fd_key fk = { .tgid = tgid, .fd = (__s32)ret };
+
+	struct fd_info fi = {0};
+	__builtin_memcpy(fi.path, oa->path, FILE_PATH_MAX);
+	fi.flags = oa->flags;
+	fi.open_count = 1;
+
+	bpf_map_update_elem(&fd_map, &fk, &fi, BPF_ANY);
+	bpf_map_delete_elem(&openat_args_map, &pid_tgid);
+	return 0;
+}
+
+/*
+ * sys_enter_close: emit file_close event with accumulated stats.
+ */
+SEC("tracepoint/syscalls/sys_enter_close")
+int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	int fd = (int)ctx->args[0];
+
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (!fi)
+		return 0;
+
+	/* Emit file close event via ring buffer */
+	struct file_event *fe = bpf_ringbuf_reserve(&events, sizeof(*fe), 0);
+	if (fe) {
+		__builtin_memset(fe, 0, sizeof(*fe));
+		fe->type = EVENT_FILE_CLOSE;
+		fe->tgid = tgid;
+		fe->timestamp_ns = bpf_ktime_get_boot_ns();
+		fe->cgroup_id = bpf_get_current_cgroup_id();
+		bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+		__builtin_memcpy(fe->path, fi->path, FILE_PATH_MAX);
+		fe->flags = fi->flags;
+		fe->read_bytes = fi->read_bytes;
+		fe->write_bytes = fi->write_bytes;
+		fe->open_count = fi->open_count;
+
+		/* Get ppid */
+		struct task_struct *task =
+			(struct task_struct *)bpf_get_current_task();
+		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+		fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+		bpf_ringbuf_submit(fe, 0);
+	}
+
+	bpf_map_delete_elem(&fd_map, &fk);
+	return 0;
+}
+
+/*
+ * sys_enter_read: save fd for the exit handler.
+ */
+SEC("tracepoint/syscalls/sys_enter_read")
+int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 key0 = 0;
+	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
+	if (!fc || !fc->track_bytes)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Quick check: is this fd tracked? */
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	if (!bpf_map_lookup_elem(&fd_map, &fk))
+		return 0;
+
+	struct rw_args ra = { .fd = fd };
+	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
+	return 0;
+}
+
+/*
+ * sys_exit_read: accumulate bytes read.
+ */
+SEC("tracepoint/syscalls/sys_exit_read")
+int handle_read_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct rw_args *ra = bpf_map_lookup_elem(&rw_args_map, &pid_tgid);
+	if (!ra)
+		return 0;
+
+	long ret = ctx->ret;
+	int fd = ra->fd;
+	bpf_map_delete_elem(&rw_args_map, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->read_bytes, (__u64)ret);
+
+	return 0;
+}
+
+/*
+ * sys_enter_write: save fd for the exit handler.
+ */
+SEC("tracepoint/syscalls/sys_enter_write")
+int handle_write_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 key0 = 0;
+	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
+	if (!fc || !fc->track_bytes)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	if (!bpf_map_lookup_elem(&fd_map, &fk))
+		return 0;
+
+	struct rw_args ra = { .fd = fd };
+	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
+	return 0;
+}
+
+/*
+ * sys_exit_write: accumulate bytes written.
+ */
+SEC("tracepoint/syscalls/sys_exit_write")
+int handle_write_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct rw_args *ra = bpf_map_lookup_elem(&rw_args_map, &pid_tgid);
+	if (!ra)
+		return 0;
+
+	long ret = ctx->ret;
+	int fd = ra->fd;
+	bpf_map_delete_elem(&rw_args_map, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
+
+	return 0;
+}
+
 /* ── Network: TCP/UDP send/receive (kretprobe for actual byte count) ── */
 
 /*

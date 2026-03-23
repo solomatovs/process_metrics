@@ -25,10 +25,87 @@ struct rate_state {
 };
 
 enum event_type {
-	EVENT_FORK     = 1,
-	EVENT_EXEC     = 2,
-	EVENT_EXIT     = 3,
-	EVENT_OOM_KILL = 4,
+	EVENT_FORK       = 1,
+	EVENT_EXEC       = 2,
+	EVENT_EXIT       = 3,
+	EVENT_OOM_KILL   = 4,
+	EVENT_FILE_CLOSE = 5,
+};
+
+/* ── file tracking constants ──────────────────────────────────────── */
+
+#define FILE_PATH_MAX    256
+#define FILE_MAX_PREFIXES 16
+#define FILE_PREFIX_LEN  128
+
+/*
+ * Configuration pushed from userspace to BPF via maps.
+ */
+struct file_config {
+	__u8  enabled;       /* 1 = track open/close */
+	__u8  track_bytes;   /* 1 = also track read/write bytes per fd */
+};
+
+/*
+ * Prefix entry for include/exclude lists.
+ * Stored in BPF array maps, matched with unrolled loops.
+ */
+struct file_prefix {
+	char  prefix[FILE_PREFIX_LEN];
+	__u8  len;           /* actual length (0 = unused slot) */
+};
+
+/*
+ * Temporary storage for openat() args between enter and exit.
+ * Key: pid_tgid (__u64)
+ */
+struct openat_args {
+	char  path[FILE_PATH_MAX];
+	int   flags;
+};
+
+/*
+ * Temporary storage for read/write args between enter and exit.
+ * Key: pid_tgid (__u64)
+ */
+struct rw_args {
+	int   fd;
+};
+
+/*
+ * Per-fd tracking state in fd_map.
+ * Key: struct fd_key { __u32 tgid; int fd; }
+ */
+struct fd_key {
+	__u32 tgid;
+	__s32 fd;
+};
+
+struct fd_info {
+	char  path[FILE_PATH_MAX];
+	int   flags;
+	__u64 read_bytes;
+	__u64 write_bytes;
+	__u32 open_count;    /* how many times this fd was opened */
+};
+
+/*
+ * File close event — sent from BPF to userspace via ring buffer.
+ * First field is __u32 type (= EVENT_FILE_CLOSE), same offset as struct event,
+ * so the ring buffer callback can dispatch on type.
+ */
+struct file_event {
+	__u32 type;           /* EVENT_FILE_CLOSE */
+	__u32 tgid;
+	__u32 ppid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  comm[COMM_LEN];
+	char  path[FILE_PATH_MAX];
+	int   flags;
+	__u64 read_bytes;
+	__u64 write_bytes;
+	__u32 open_count;
 };
 
 /*
