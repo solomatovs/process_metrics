@@ -1,0 +1,775 @@
+{
+  "annotations": { "list": [] },
+  "description": "eBPF-based process monitoring: CPU, memory, cgroups, I/O, network, files",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "definition": "SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY ORDER BY hostname",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Server",
+        "multi": true,
+        "name": "hostname",
+        "options": [],
+        "query": "SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY ORDER BY hostname",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "definition": "SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND hostname IN (${hostname:sqlstring}) ORDER BY rule",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Rule",
+        "multi": true,
+        "name": "rule",
+        "options": [],
+        "query": "SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND hostname IN (${hostname:sqlstring}) ORDER BY rule",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "selected": false, "text": "", "value": "" },
+        "hide": 0,
+        "label": "Process search",
+        "name": "process_search",
+        "options": [],
+        "query": "",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "title": "Overview",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 2000 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "id": 1,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT count(DISTINCT pid) AS processes FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= now() - INTERVAL 2 MINUTE AND hostname IN (${hostname:sqlstring}) AND rule IN (${rule:sqlstring})",
+        "refId": "A"
+      }],
+      "title": "Active Processes",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "decbytes",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1073741824 }, { "color": "red", "value": 8589934592 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "id": 2,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT sum(rss_bytes) AS total_rss FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= now() - INTERVAL 2 MINUTE AND hostname IN (${hostname:sqlstring}) AND rule IN (${rule:sqlstring}) AND timestamp >= (SELECT max(timestamp) - INTERVAL 1 SECOND FROM default.process_metrics WHERE event_type='snapshot' AND hostname IN (${hostname:sqlstring}))",
+        "refId": "A"
+      }],
+      "title": "Total RSS",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "decimals": 2,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 2 }, { "color": "red", "value": 8 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "id": 3,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT sum(cpu_usage_ratio) AS total_cpu FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= now() - INTERVAL 2 MINUTE AND hostname IN (${hostname:sqlstring}) AND rule IN (${rule:sqlstring}) AND timestamp >= (SELECT max(timestamp) - INTERVAL 1 SECOND FROM default.process_metrics WHERE event_type='snapshot' AND hostname IN (${hostname:sqlstring}))",
+        "refId": "A"
+      }],
+      "title": "Total CPU (cores)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 20 }, { "color": "red", "value": 100 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "id": 4,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT count(DISTINCT cgroup) AS cgroups FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= now() - INTERVAL 2 MINUTE AND hostname IN (${hostname:sqlstring}) AND cgroup_memory_current > 0",
+        "refId": "A"
+      }],
+      "title": "Active Cgroups",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 10 }, { "color": "red", "value": 50 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "id": 5,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT count() AS events FROM default.process_metrics WHERE event_type IN ('fork','exec','exit','oom_kill') AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+        "refId": "A"
+      }],
+      "title": "Events (period)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "id": 6,
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT count() AS oom_kills FROM default.process_metrics WHERE event_type='oom_kill' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+        "refId": "A"
+      }],
+      "title": "OOM Kills",
+      "type": "stat"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 200,
+      "title": "CPU & Memory (Top-5 Processes)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 30, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "decimals": 2,
+          "unit": "short"
+        },
+        "overrides": [{
+          "matcher": { "id": "byName", "options": "other" },
+          "properties": [{ "id": "color", "value": { "fixedColor": "#cccccc", "mode": "fixed" } }]
+        }]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 10,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "sortBy": "Max", "sortDesc": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n  GROUP BY comm\n  ORDER BY avg(cpu_usage_ratio) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(cpu_usage_ratio) AS cpu_cores\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "CPU Usage by Process (top-5 + other)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 30, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "unit": "decbytes"
+        },
+        "overrides": [{
+          "matcher": { "id": "byName", "options": "other" },
+          "properties": [{ "id": "color", "value": { "fixedColor": "#cccccc", "mode": "fixed" } }]
+        }]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 11,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "sortBy": "Max", "sortDesc": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n  GROUP BY comm\n  ORDER BY avg(rss_bytes) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(rss_bytes) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "RSS Memory by Process (top-5 + other)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true },
+          "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 2 }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "cpu_cores" }, "properties": [{ "id": "unit", "value": "short" }, { "id": "decimals", "value": 3 }, { "id": "custom.cellOptions", "value": { "type": "color-background" } }, { "id": "thresholds", "value": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 2 }] } }] },
+          { "matcher": { "id": "byName", "options": "rss" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "pids" }, "properties": [{ "id": "custom.width", "value": 60 }] }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 14 },
+      "id": 12,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "cpu_cores" }], "footer": { "enablePagination": true } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  comm,\n  any(exec) AS exec_path,\n  any(args) AS cmdline,\n  any(uid) AS uid,\n  any(rule) AS match_rule,\n  length(groupUniqArray(pid)) AS pids,\n  sum(cpu_usage_ratio) AS cpu_cores,\n  sum(rss_bytes) AS rss,\n  sum(io_read_bytes) AS io_read,\n  sum(io_write_bytes) AS io_write\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND timestamp >= (SELECT max(timestamp) - INTERVAL 1 SECOND FROM default.process_metrics WHERE event_type='snapshot' AND hostname IN (${hostname:sqlstring}))\nGROUP BY comm\nORDER BY cpu_cores DESC\nLIMIT 30",
+        "refId": "A"
+      }],
+      "title": "Process Details (latest snapshot)",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 },
+      "id": 300,
+      "title": "Cgroup Memory",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 30, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "none" } },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "id": 20,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) AS mem_current\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nHAVING max(cgroup_memory_current) > 10485760\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "Cgroup Memory Usage (current)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 30, "lineWidth": 2, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "none" }, "thresholdsStyle": { "mode": "line" } },
+          "unit": "percentunit",
+          "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 }] }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "id": 21,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) / max(cgroup_memory_max) AS usage_pct\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_max > 0\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "Cgroup Memory % (current / max)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 }] },
+          "custom": { "align": "auto", "displayMode": "auto" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "mem_current" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "mem_max" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "swap" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "usage_pct" }, "properties": [{ "id": "unit", "value": "percentunit" }, { "id": "custom.displayMode", "value": "gradient-gauge" }, { "id": "max", "value": 1 }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 23 },
+      "id": 22,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "usage_pct" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  cgroup,\n  any(rule) AS rule,\n  max(cgroup_memory_current) AS mem_current,\n  max(cgroup_memory_max) AS mem_max,\n  if(max(cgroup_memory_max) > 0, max(cgroup_memory_current) / max(cgroup_memory_max), 0) AS usage_pct,\n  max(cgroup_swap_current) AS swap,\n  max(cgroup_cpu_weight) AS cpu_weight,\n  max(cgroup_pids_current) AS pids\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_current > 0\nGROUP BY cgroup\nORDER BY usage_pct DESC",
+        "refId": "A"
+      }],
+      "title": "Cgroup Details (latest)",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
+      "id": 400,
+      "title": "Per-Process Metrics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "none" } },
+          "decimals": 3,
+          "unit": "short"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "id": 30,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(cpu_usage_ratio) AS cpu\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND cpu_usage_ratio > 0.001\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "CPU by Process",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "none" } },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "id": 31,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(rss_bytes) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND rss_bytes > 1048576\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "RSS Memory by Process",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "id": 32,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_read_bytes) AS io_read\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_read_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "I/O Read by Process",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "id": 33,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_write_bytes) AS io_write\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_write_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "I/O Write by Process",
+      "type": "timeseries"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "id": 500,
+      "title": "Process List & Events",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "rss" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "vsize" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "cpu" }, "properties": [{ "id": "decimals", "value": 3 }] },
+          { "matcher": { "id": "byName", "options": "io_r" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "io_w" }, "properties": [{ "id": "unit", "value": "decbytes" }] }
+        ]
+      },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 49 },
+      "id": 40,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "rss" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  pid,\n  any(comm) AS process_name,\n  any(exec) AS exec_path,\n  any(rule) AS match_rule,\n  any(cgroup) AS cgroup_path,\n  max(cpu_usage_ratio) AS cpu,\n  max(rss_bytes) AS rss,\n  max(vsize_bytes) AS vsize,\n  max(io_read_bytes) AS io_r,\n  max(io_write_bytes) AS io_w,\n  max(threads) AS threads,\n  max(uptime_seconds) AS uptime_s\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY pid\nORDER BY rss DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Process List (Top 100 by RSS)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } }
+        }
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 59 },
+      "id": 41,
+      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  event_type,\n  count() AS cnt\nFROM default.process_metrics\nWHERE event_type IN ('fork','exec','exit','oom_kill')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "Events Histogram",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        }
+      },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 59 },
+      "id": 42,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "timestamp" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  timestamp,\n  event_type,\n  pid,\n  comm,\n  exec,\n  rule,\n  exit_code\nFROM default.process_metrics\nWHERE event_type IN ('exec','exit','oom_kill')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 50",
+        "refId": "A"
+      }],
+      "title": "Recent Events",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
+      "id": 600,
+      "title": "Network Connections",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 66 },
+      "id": 60,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  comm,\n  count() AS connections\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, comm\nHAVING connections > 1\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "Connections per Minute by Process",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "unit": "Bps"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 66 },
+      "id": 61,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' TX') AS series,\n  sum(net_conn_tx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_tx_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "refId": "TX"
+        },
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' RX') AS series,\n  sum(net_conn_rx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_rx_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "refId": "RX"
+        }
+      ],
+      "title": "Network Throughput by Process (TX/RX)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_tx" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "total_rx" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "avg_duration_ms" }, "properties": [{ "id": "unit", "value": "ms" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 74 },
+      "id": 62,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "total_tx" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  comm,\n  net_remote_addr,\n  net_remote_port,\n  count() AS connections,\n  sum(net_conn_tx_bytes) AS total_tx,\n  sum(net_conn_rx_bytes) AS total_rx,\n  avg(net_duration_ms) AS avg_duration_ms\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR comm ILIKE '%${process_search}%')\nGROUP BY comm, net_remote_addr, net_remote_port\nORDER BY total_tx + total_rx DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Top Connections by Traffic (period)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "tx_bytes" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "rx_bytes" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "duration_ms" }, "properties": [{ "id": "unit", "value": "ms" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 82 },
+      "id": 63,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "timestamp" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  net_local_addr,\n  net_local_port,\n  net_remote_addr,\n  net_remote_port,\n  net_conn_tx_bytes AS tx_bytes,\n  net_conn_rx_bytes AS rx_bytes,\n  net_duration_ms AS duration_ms\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR comm ILIKE '%${process_search}%')\nORDER BY timestamp DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Recent Connections (net_close events)",
+      "type": "table"
+    },
+
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 90 },
+      "id": 700,
+      "title": "File Operations",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "bars", "fillOpacity": 50, "lineWidth": 0, "stacking": { "mode": "normal" } }
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 91 },
+      "id": 70,
+      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 0,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  comm,\n  count() AS file_ops\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, comm\nHAVING file_ops > 1\nORDER BY time",
+        "refId": "A"
+      }],
+      "title": "File Operations per Minute by Process",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 1, "pointSize": 3, "spanNulls": true, "stacking": { "mode": "normal" } },
+          "unit": "Bps"
+        }
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 91 },
+      "id": 71,
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' write') AS series,\n  sum(file_write_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_write_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "refId": "W"
+        },
+        {
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' read') AS series,\n  sum(file_read_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_read_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "refId": "R"
+        }
+      ],
+      "title": "File I/O Throughput by Process (read/write)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "total_read" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "total_write" }, "properties": [{ "id": "unit", "value": "decbytes" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 99 },
+      "id": 72,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "open_count" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  file_path,\n  count() AS open_count,\n  groupUniqArray(comm) AS processes,\n  sum(file_read_bytes) AS total_read,\n  sum(file_write_bytes) AS total_write\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nGROUP BY file_path\nORDER BY open_count DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Top Files by Open Count (period)",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "read_bytes" }, "properties": [{ "id": "unit", "value": "decbytes" }] },
+          { "matcher": { "id": "byName", "options": "write_bytes" }, "properties": [{ "id": "unit", "value": "decbytes" }] }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 107 },
+      "id": 73,
+      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "timestamp" }] },
+      "targets": [{
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "P7E099F39B84EA795" },
+        "format": 1,
+        "queryType": "sql",
+        "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  file_path,\n  file_read_bytes AS read_bytes,\n  file_write_bytes AS write_bytes,\n  file_open_count\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 100",
+        "refId": "A"
+      }],
+      "title": "Recent File Operations (file_close events)",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["process-metrics", "ebpf", "monitoring"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Process Metrics (eBPF)",
+  "uid": "process-metrics-ebpf",
+  "version": 1
+}
