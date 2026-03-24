@@ -50,10 +50,16 @@ struct file_config {
 /*
  * Prefix entry for include/exclude lists.
  * Stored in BPF array maps, matched with unrolled loops.
+ * Layout: len first, then prefix — keeps struct size a power-of-2 (128+1→
+ * padded poorly). With len at offset 0, struct size = 1 + FILE_PREFIX_LEN = 129
+ * but the verifier on 5.15 needs the value_size to be friendly.
+ * So we shrink prefix by 1 to get exactly 128 bytes total.
  */
+#define FILE_PREFIX_CAP  (FILE_PREFIX_LEN - 1)  /* 127: usable prefix bytes */
+
 struct file_prefix {
-	char  prefix[FILE_PREFIX_LEN];
 	__u8  len;           /* actual length (0 = unused slot) */
+	char  prefix[FILE_PREFIX_CAP];
 };
 
 /*

@@ -393,8 +393,8 @@ static int load_config(const char *path)
 				const char *s = config_setting_get_string_elem(inc, i);
 				if (s) {
 					int slen = (int)strlen(s);
-					if (slen > FILE_PREFIX_LEN - 1)
-						slen = FILE_PREFIX_LEN - 1;
+					if (slen > FILE_PREFIX_CAP - 1)
+						slen = FILE_PREFIX_CAP - 1;
 					memcpy(cfg_file_include[i].prefix, s, slen);
 					cfg_file_include[i].prefix[slen] = '\0';
 					cfg_file_include[i].len = (__u8)slen;
@@ -412,8 +412,8 @@ static int load_config(const char *path)
 				const char *s = config_setting_get_string_elem(exc, i);
 				if (s) {
 					int slen = (int)strlen(s);
-					if (slen > FILE_PREFIX_LEN - 1)
-						slen = FILE_PREFIX_LEN - 1;
+					if (slen > FILE_PREFIX_CAP - 1)
+						slen = FILE_PREFIX_CAP - 1;
 					memcpy(cfg_file_exclude[i].prefix, s, slen);
 					cfg_file_exclude[i].prefix[slen] = '\0';
 					cfg_file_exclude[i].len = (__u8)slen;

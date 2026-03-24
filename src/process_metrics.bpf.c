@@ -593,7 +593,9 @@ static __always_inline int prefix_match(const char *path,
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
 		if (j >= len)
 			return 1;
-		if (path[j] != prefix[j])
+		/* Mask index so 5.15 verifier can prove bounds statically */
+		int idx = j & (FILE_PREFIX_CAP - 1);
+		if (path[idx] != prefix[idx])
 			return 0;
 	}
 	return 1;
