@@ -21,18 +21,22 @@
 /* ── metric event (shared by event_file, http_server, main) ──────── */
 
 struct metric_event {
+	/* ── common fields ─────────────────────────────────────────── */
 	__u64 timestamp_ns;
-	char  event_type[12];         /* "fork","exec","exit","oom_kill","snapshot" */
+	char  event_type[12];         /* "fork","exec","exit","oom_kill","snapshot","file_close" */
 	char  rule[64];
 	__u32 root_pid;
 	__u32 pid;
 	__u32 ppid;
+	__u32 uid;                    /* real UID of the process */
 	char  comm[COMM_LEN];
 	char  exec_path[CMDLINE_MAX]; /* executable path (argv[0]) */
 	char  args[CMDLINE_MAX];      /* arguments (argv[1..]) */
 	char  cgroup[256];
 	__u8  is_root;
 	__u8  state;
+
+	/* ── process metrics ───────────────────────────────────────── */
 	__u32 exit_code;
 	__u64 cpu_ns;
 	double cpu_usage_ratio;
@@ -55,12 +59,29 @@ struct metric_event {
 	__u64 net_rx_bytes;
 	__u64 start_time_ns;
 	__u64 uptime_seconds;
-	/* cgroup v2 metrics (-1 = not available) */
+
+	/* ── cgroup v2 metrics (-1 = not available) ────────────────── */
 	__s64 cgroup_memory_max;
 	__s64 cgroup_memory_current;
 	__s64 cgroup_swap_current;
 	__s64 cgroup_cpu_weight;
 	__s64 cgroup_pids_current;
+
+	/* ── file tracking metrics (EVENT_FILE_CLOSE only) ─────────── */
+	char  file_path[FILE_PATH_MAX];
+	__u32 file_flags;
+	__u64 file_read_bytes;
+	__u64 file_write_bytes;
+	__u32 file_open_count;
+
+	/* ── network tracking metrics (EVENT_NET_CLOSE only) ───────── */
+	char  net_local_addr[46];   /* formatted IP string */
+	char  net_remote_addr[46];  /* formatted IP string */
+	__u16 net_local_port;
+	__u16 net_remote_port;
+	__u64 net_conn_tx_bytes;    /* bytes sent on this connection */
+	__u64 net_conn_rx_bytes;    /* bytes received on this connection */
+	__u64 net_duration_ms;      /* connection duration in milliseconds */
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */
@@ -113,10 +134,33 @@ int ef_swap(struct ef_record **out, int *count);
 int ef_swap_fd(void);
 
 /*
+ * Return an open fd for reading the current event file WITHOUT clearing it.
+ *
+ * Makes a hard-link snapshot of the current file, opens it for reading,
+ * then unlinks the snapshot (fd remains valid on Linux).
+ * The original event file is NOT modified — new events keep appending.
+ *
+ * Returns open fd (>= 0) on success, -1 if no data.
+ * Caller must close(fd) when done.
+ */
+int ef_snapshot_fd(void);
+
+/*
  * Confirm successful delivery — delete the .pending file.
  * Call this only after the data from ef_swap() has been fully sent.
  */
 void ef_commit(void);
+
+/*
+ * Batch lock: prevents ef_swap_fd()/ef_snapshot_fd() from splitting
+ * a batch of ef_append() calls across two deliveries.
+ *
+ * Usage: call ef_batch_lock() before a series of ef_append() calls
+ * (e.g. the snapshot loop) and ef_batch_unlock() after.
+ * ef_swap_fd()/ef_snapshot_fd() will block until the batch completes.
+ */
+void ef_batch_lock(void);
+void ef_batch_unlock(void);
 
 /*
  * Clean up: close file, destroy mutex.

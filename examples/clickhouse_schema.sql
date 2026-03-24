@@ -1,6 +1,6 @@
 -- process_metrics — ClickHouse table schema (optimized)
 --
--- One table for all event types: snapshot, fork, exec, exit, oom_kill.
+-- One table for all event types: snapshot, fork, exec, exit, oom_kill, file_close.
 -- Run this once on your ClickHouse server.
 --
 -- Design decisions:
@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     root_pid               UInt32                      CODEC(T64, ZSTD(1)),
     pid                    UInt32                      CODEC(T64, ZSTD(1)),
     ppid                   UInt32                      CODEC(T64, ZSTD(1)),
+    uid                    UInt32                      CODEC(T64, ZSTD(1)),
 
     -- ── process metadata ────────────────────────────────────────────
     comm                   LowCardinality(String)      CODEC(ZSTD(1)),
@@ -97,6 +98,22 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     cgroup_cpu_weight      Int64                       CODEC(T64, ZSTD(1)),
     cgroup_pids_current    Int64                       CODEC(T64, ZSTD(1)),
 
+    -- ── file tracking (file_close events only, zero for others) ─────
+    file_path              String                      CODEC(ZSTD(1)),
+    file_flags             UInt32                      CODEC(T64, ZSTD(1)),
+    file_read_bytes        UInt64                      CODEC(Delta, ZSTD(1)),
+    file_write_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
+    file_open_count        UInt32                      CODEC(T64, ZSTD(1)),
+
+    -- ── network tracking (net_close events only, empty for others) ──
+    net_local_addr         String                      CODEC(ZSTD(1)),
+    net_remote_addr        String                      CODEC(ZSTD(1)),
+    net_local_port         UInt16                      CODEC(T64, ZSTD(1)),
+    net_remote_port        UInt16                      CODEC(T64, ZSTD(1)),
+    net_conn_tx_bytes      UInt64                      CODEC(Delta, ZSTD(1)),
+    net_conn_rx_bytes      UInt64                      CODEC(Delta, ZSTD(1)),
+    net_duration_ms        UInt64                      CODEC(T64, ZSTD(1)),
+
     -- ── skip indices ────────────────────────────────────────────────
     INDEX idx_pid pid TYPE bloom_filter(0.01) GRANULARITY 4
 )
@@ -125,24 +142,30 @@ SETTINGS
 --   2. Create one view per target server (adjust URL)
 --   3. ClickHouse will auto-pull metrics; the target clears data after delivery
 --
--- IMPORTANT: explicit column structure is required in url() to prevent
--- ClickHouse from making a probe GET request that would drain the CSV buffer.
--- With explicit structure, ClickHouse makes only one GET request.
+-- IMPORTANT: use APPEND keyword so data accumulates across refreshes.
+-- Without APPEND, each refresh REPLACES all data in the target table.
+--
+-- Use &clear=1 parameter so the buffer is cleared after delivery.
+-- Without &clear=1, data is returned but NOT cleared (read-only mode).
+--
+-- Explicit column structure is required in url() to prevent ClickHouse
+-- from making a probe GET request. With explicit structure, ClickHouse
+-- makes only one GET request.
 --
 -- Timestamp is in ISO 8601 format (YYYY-MM-DD HH:MM:SS.mmm, UTC).
 -- ══════════════════════════════════════════════════════════════════════
 
 -- Example: pull from server1 every 30 seconds
 -- CREATE MATERIALIZED VIEW process_metrics_pull_server1
--- REFRESH EVERY 30 SECOND
+-- REFRESH EVERY 30 SECOND APPEND
 -- TO process_metrics
 -- AS
 -- SELECT *
 -- FROM url(
---     'http://server1:9091/metrics?format=csv',
+--     'http://server1:9091/metrics?format=csv&clear=1',
 --     'CSVWithNames',
 --     'timestamp DateTime64(3), hostname String, event_type String, rule String,
---      root_pid UInt32, pid UInt32, ppid UInt32,
+--      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
 --      comm String, exec String, args String, cgroup String,
 --      is_root UInt8, state String, exit_code UInt32,
 --      cpu_ns UInt64, cpu_usage_ratio Float64,
@@ -152,7 +175,11 @@ SETTINGS
 --      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
 --      net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
 --      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
---      cgroup_cpu_weight Int64, cgroup_pids_current Int64'
+--      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
+--      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
+--      file_open_count UInt32,
+--      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
+--      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
 -- );
 
 -- ══════════════════════════════════════════════════════════════════════
@@ -162,10 +189,10 @@ SETTINGS
 
 -- INSERT INTO process_metrics
 -- SELECT * FROM url(
---     'http://server1:9091/metrics?format=csv',
+--     'http://server1:9091/metrics?format=csv&clear=1',
 --     'CSVWithNames',
 --     'timestamp DateTime64(3), hostname String, event_type String, rule String,
---      root_pid UInt32, pid UInt32, ppid UInt32,
+--      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
 --      comm String, exec String, args String, cgroup String,
 --      is_root UInt8, state String, exit_code UInt32,
 --      cpu_ns UInt64, cpu_usage_ratio Float64,
@@ -175,5 +202,9 @@ SETTINGS
 --      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
 --      net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
 --      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
---      cgroup_cpu_weight Int64, cgroup_pids_current Int64'
+--      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
+--      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
+--      file_open_count UInt32,
+--      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
+--      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
 -- );

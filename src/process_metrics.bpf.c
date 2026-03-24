@@ -22,6 +22,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include "process_metrics_common.h"
 
 /* ── rodata (configurable from userspace before load) ─────────────── */
@@ -277,6 +278,7 @@ int handle_exec(void *ctx)
 	e->type         = EVENT_EXEC;
 	e->tgid         = tgid;
 	e->ppid         = ppid;
+	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id    = bpf_get_current_cgroup_id();
 	e->start_ns     = BPF_CORE_READ(task, start_time);
@@ -325,6 +327,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	e->type         = EVENT_FORK;
 	e->tgid         = child_tgid;       /* new child process */
 	e->ppid         = parent_tgid;       /* parent process */
+	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id    = bpf_get_current_cgroup_id();
 	e->start_ns     = BPF_CORE_READ(child, start_time);
@@ -392,6 +395,9 @@ int handle_sched_switch(void *ctx)
 	unsigned int task_state = BPF_CORE_READ(task, __state);
 	info->state = state_to_char(task_state);
 
+	/* UID — refresh on each sched_switch (may change via setuid) */
+	info->uid = (__u32)bpf_get_current_uid_gid();
+
 	return 0;
 }
 
@@ -423,6 +429,7 @@ int handle_exit(void *ctx)
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_EXIT;
 	e->tgid         = tgid;
+	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
@@ -491,6 +498,7 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_OOM_KILL;
 	e->tgid         = tgid;
+	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm),
 				  BPF_CORE_READ(task, comm));
@@ -729,6 +737,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 			(struct task_struct *)bpf_get_current_task();
 		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 		fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+		fe->uid  = (__u32)bpf_get_current_uid_gid();
 
 		bpf_ringbuf_submit(fe, 0);
 	}
@@ -844,24 +853,262 @@ int handle_write_exit(struct trace_event_raw_sys_exit *ctx)
 
 /* ── Network: TCP/UDP send/receive (kretprobe for actual byte count) ── */
 
+/* ── Network tracking: TCP connection lifecycle + byte counting ───── */
+
 /*
- * Hook tcp_sendmsg / tcp_recvmsg / udp_sendmsg / udp_recvmsg return values.
- * All TCP/UDP socket operations (send, sendto, write, recv, read, etc.)
- * funnel through these kernel functions. Return value > 0 = actual bytes.
- *
- * Uses __sync_fetch_and_add because multiple CPUs can update same proc_info
- * concurrently (unlike sched_switch which runs for current task only).
+ * net_cfg: single-element array with enabled/track_bytes flags.
+ * sock_map: per-socket state keyed by sock pointer.
+ * connect_args_map: temp storage between kprobe/kretprobe of tcp_v4_connect.
+ * sendmsg_args_map: temp storage between kprobe/kretprobe of tcp_sendmsg.
  */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct net_config);
+} net_cfg SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, NET_MAX_SOCKETS);
+	__type(key, __u64);           /* sock pointer as u64 */
+	__type(value, struct sock_info);
+} sock_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);           /* pid_tgid */
+	__type(value, struct connect_args);
+} connect_args_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);           /* pid_tgid */
+	__type(value, struct sendmsg_args);
+} sendmsg_args_map SEC(".maps");
+
+/*
+ * Read socket addresses into sock_info.
+ * Handles both AF_INET and AF_INET6.
+ */
+static __always_inline void read_sock_addrs(struct sock *sk,
+					    struct sock_info *si)
+{
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	si->af = (__u8)family;
+	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+	si->remote_port = __bpf_ntohs(dport);
+	si->local_port  = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+	if (family == 2) { /* AF_INET */
+		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__builtin_memcpy(si->remote_addr, &daddr, 4);
+		__builtin_memcpy(si->local_addr, &saddr, 4);
+	} else if (family == 10) { /* AF_INET6 */
+		BPF_CORE_READ_INTO(si->remote_addr, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(si->local_addr, sk,
+				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+	}
+}
+
+/*
+ * Emit NET_CLOSE event from sock_info.
+ */
+static __always_inline void emit_net_close(struct sock_info *si,
+					   __u64 now_ns)
+{
+	struct net_event *ne = bpf_ringbuf_reserve(&events, sizeof(*ne), 0);
+	if (!ne)
+		return;
+
+	__builtin_memset(ne, 0, sizeof(*ne));
+	ne->type         = EVENT_NET_CLOSE;
+	ne->tgid         = si->tgid;
+	ne->uid          = si->uid;
+	ne->timestamp_ns = now_ns;
+	ne->cgroup_id    = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(ne->comm, sizeof(ne->comm));
+
+	/* Get ppid */
+	struct task_struct *task =
+		(struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	ne->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+	ne->af = si->af;
+	__builtin_memcpy(ne->local_addr, si->local_addr, 16);
+	__builtin_memcpy(ne->remote_addr, si->remote_addr, 16);
+	ne->local_port  = si->local_port;
+	ne->remote_port = si->remote_port;
+	ne->tx_bytes    = si->tx_bytes;
+	ne->rx_bytes    = si->rx_bytes;
+	ne->duration_ns = (now_ns > si->start_ns) ? now_ns - si->start_ns : 0;
+
+	bpf_ringbuf_submit(ne, 0);
+}
+
+/* ── tcp_v4_connect: track outbound IPv4 connections ─────────────── */
+
+SEC("kprobe/tcp_v4_connect")
+int BPF_KPROBE(kp_tcp_v4_connect, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct connect_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&connect_args_map, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_v4_connect")
+int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map,
+							&pid_tgid);
+	if (!args) return 0;
+
+	__u64 sk_ptr = args->sock_ptr;
+	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
+
+	if (ret != 0)
+		return 0;
+
+	struct sock *sk = (struct sock *)sk_ptr;
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	struct sock_info si = {};
+	si.tgid = tgid;
+	si.uid = (__u32)bpf_get_current_uid_gid();
+	si.start_ns = bpf_ktime_get_boot_ns();
+	read_sock_addrs(sk, &si);
+
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	return 0;
+}
+
+/* ── tcp_v6_connect: track outbound IPv6 connections ─────────────── */
+
+SEC("kprobe/tcp_v6_connect")
+int BPF_KPROBE(kp_tcp_v6_connect, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct connect_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&connect_args_map, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_v6_connect")
+int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map,
+							&pid_tgid);
+	if (!args) return 0;
+
+	__u64 sk_ptr = args->sock_ptr;
+	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
+
+	if (ret != 0)
+		return 0;
+
+	struct sock *sk = (struct sock *)sk_ptr;
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	struct sock_info si = {};
+	si.tgid = tgid;
+	si.uid = (__u32)bpf_get_current_uid_gid();
+	si.start_ns = bpf_ktime_get_boot_ns();
+	read_sock_addrs(sk, &si);
+
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	return 0;
+}
+
+/* ── inet_csk_accept: track inbound TCP connections ──────────────── */
+
+SEC("kretprobe/inet_csk_accept")
+int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
+{
+	if (!sk)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	__u64 sk_ptr = (__u64)sk;
+
+	struct sock_info si = {};
+	si.tgid = tgid;
+	si.uid = (__u32)bpf_get_current_uid_gid();
+	si.start_ns = bpf_ktime_get_boot_ns();
+	read_sock_addrs(sk, &si);
+
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	return 0;
+}
+
+/* ── tcp_close: emit NET_CLOSE event ─────────────────────────────── */
+
+SEC("kprobe/tcp_close")
+int BPF_KPROBE(kp_tcp_close, struct sock *sk)
+{
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
+	emit_net_close(si, bpf_ktime_get_boot_ns());
+	bpf_map_delete_elem(&sock_map, &sk_ptr);
+	return 0;
+}
+
+/* ── tcp_sendmsg / tcp_recvmsg: per-connection + per-process bytes ── */
+
+SEC("kprobe/tcp_sendmsg")
+int BPF_KPROBE(kp_tcp_sendmsg, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
 
 SEC("kretprobe/tcp_sendmsg")
 int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
 {
 	if (ret <= 0)
 		return 0;
-	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
+							&pid_tgid);
+	__u64 sk_ptr = args ? args->sock_ptr : 0;
+	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
+
+	/* Per-process aggregate (always, if tracked) */
+	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
+
+	/* Per-connection (if socket is in sock_map) */
+	if (sk_ptr) {
+		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+		if (si)
+			__sync_fetch_and_add(&si->tx_bytes, (__u64)ret);
+	}
+	return 0;
+}
+
+SEC("kprobe/tcp_recvmsg")
+int BPF_KPROBE(kp_tcp_recvmsg, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
 
@@ -870,12 +1117,29 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 {
 	if (ret <= 0)
 		return 0;
-	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
+							&pid_tgid);
+	__u64 sk_ptr = args ? args->sock_ptr : 0;
+	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
+
+	/* Per-process aggregate (always, if tracked) */
+	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
+
+	/* Per-connection (if socket is in sock_map) */
+	if (sk_ptr) {
+		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+		if (si)
+			__sync_fetch_and_add(&si->rx_bytes, (__u64)ret);
+	}
 	return 0;
 }
+
+/* ── UDP: per-process aggregate bytes only (no connection lifecycle) ── */
 
 SEC("kretprobe/udp_sendmsg")
 int BPF_KRETPROBE(ret_udp_sendmsg, int ret)

@@ -23,6 +23,7 @@
 #include <dirent.h>
 #include <getopt.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include <regex.h>
 #include <libconfig.h>
 #include <bpf/libbpf.h>
@@ -63,8 +64,9 @@ static struct http_config g_http_cfg;
 static char cfg_data_file[PATH_MAX_LEN]    = "";
 static char cfg_prom_path[PATH_MAX_LEN]    = "";  /* internal prom file for HTTP */
 
-/* Feature toggles */
-static int cfg_net_metrics                  = 1;   /* 1 = attach TCP/UDP kretprobes */
+/* Network tracking config */
+static int cfg_net_tracking_enabled         = 0;
+static int cfg_net_track_bytes              = 0;
 
 /* File tracking config */
 static int cfg_file_tracking_enabled        = 0;
@@ -88,6 +90,7 @@ static int tracked_map_fd, proc_map_fd;
 struct exited_proc {
 	__u32 tgid;
 	__u32 ppid;
+	__u32 uid;
 	__u32 exit_code;
 	__u16 rule_id;
 	__u32 root_pid;
@@ -112,6 +115,7 @@ static void record_exit(const struct event *e)
 	struct exited_proc *ep = &exited_ring[exited_head % MAX_EXITED];
 	ep->tgid         = e->tgid;
 	ep->ppid         = e->ppid;
+	ep->uid          = e->uid;
 	ep->exit_code    = e->exit_code;
 	ep->rule_id      = e->rule_id;
 	ep->root_pid     = e->root_pid;
@@ -363,9 +367,14 @@ static int load_config(const char *path)
 				 "%s", str_val);
 	}
 
-	/* net_metrics toggle */
-	if (config_lookup_bool(&cfg, "net_metrics", &bool_val))
-		cfg_net_metrics = bool_val;
+	/* net_tracking settings */
+	config_setting_t *nt = config_lookup(&cfg, "net_tracking");
+	if (nt) {
+		if (config_setting_lookup_bool(nt, "enabled", &bool_val))
+			cfg_net_tracking_enabled = bool_val;
+		if (config_setting_lookup_bool(nt, "track_bytes", &bool_val))
+			cfg_net_track_bytes = bool_val;
+	}
 
 	/* File tracking settings */
 	config_setting_t *ft = config_lookup(&cfg, "file_tracking");
@@ -547,6 +556,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->root_pid = e->root_pid;
 	out->pid = e->tgid;
 	out->ppid = e->ppid;
+	out->uid = e->uid;
 	memcpy(out->comm, e->comm, COMM_LEN);
 	cmdline_split(e->cmdline, e->cmdline_len,
 		      out->exec_path, sizeof(out->exec_path),
@@ -633,7 +643,10 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 		char sline[256];
 		while (fgets(sline, sizeof(sline), sf)) {
 			unsigned long val;
-			if (sscanf(sline, "RssShmem: %lu kB", &val) == 1)
+			unsigned int uid_val;
+			if (sscanf(sline, "Uid:\t%u", &uid_val) == 1)
+				pi->uid = (__u32)uid_val;
+			else if (sscanf(sline, "RssShmem: %lu kB", &val) == 1)
 				pi->shmem_pages = (__u64)(val * 1024 / page_size);
 			else if (sscanf(sline, "VmSwap: %lu kB", &val) == 1)
 				pi->swap_pages = (__u64)(val * 1024 / page_size);
@@ -902,16 +915,90 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			cev.pid = fe->tgid;
 			cev.ppid = fe->ppid;
+			cev.uid = fe->uid;
 			memcpy(cev.comm, fe->comm, COMM_LEN);
-			/* Store file path in args field */
-			snprintf(cev.args, sizeof(cev.args), "%s", fe->path);
 			if (cg)
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
 					 "%s", cg);
-			cev.exit_code = (__u32)fe->flags;
-			cev.io_read_bytes = fe->read_bytes;
-			cev.io_write_bytes = fe->write_bytes;
-			cev.threads = fe->open_count;
+			/* Dedicated file tracking fields */
+			snprintf(cev.file_path, sizeof(cev.file_path),
+				 "%s", fe->path);
+			cev.file_flags = (__u32)fe->flags;
+			cev.file_read_bytes = fe->read_bytes;
+			cev.file_write_bytes = fe->write_bytes;
+			cev.file_open_count = fe->open_count;
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
+	/* Handle net_close events separately */
+	if (type == EVENT_NET_CLOSE) {
+		if (size < sizeof(struct net_event))
+			return 0;
+		const struct net_event *ne = data;
+
+		struct track_info ti;
+		const char *rname = "?";
+		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) == 0)
+			rname = (ti.rule_id < num_rules)
+				? rules[ti.rule_id].name : "?";
+
+		log_debug("NET_CLOSE: pid=%u rule=%s port=%u→%u "
+			  "tx=%llu rx=%llu dur=%llums",
+			  ne->tgid, rname, ne->local_port, ne->remote_port,
+			  (unsigned long long)ne->tx_bytes,
+			  (unsigned long long)ne->rx_bytes,
+			  (unsigned long long)(ne->duration_ns / 1000000));
+
+		if (g_http_cfg.enabled) {
+			const char *cg = resolve_cgroup(ne->cgroup_id);
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "net_close");
+			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&ne->tgid, &ti) == 0) {
+				cev.root_pid = ti.root_pid;
+				cev.is_root = ti.is_root;
+			}
+			cev.pid = ne->tgid;
+			cev.ppid = ne->ppid;
+			cev.uid = ne->uid;
+			memcpy(cev.comm, ne->comm, COMM_LEN);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+			/* Format IP addresses */
+			if (ne->af == 2) { /* AF_INET */
+				snprintf(cev.net_local_addr,
+					 sizeof(cev.net_local_addr),
+					 "%u.%u.%u.%u",
+					 ne->local_addr[0], ne->local_addr[1],
+					 ne->local_addr[2], ne->local_addr[3]);
+				snprintf(cev.net_remote_addr,
+					 sizeof(cev.net_remote_addr),
+					 "%u.%u.%u.%u",
+					 ne->remote_addr[0], ne->remote_addr[1],
+					 ne->remote_addr[2], ne->remote_addr[3]);
+			} else if (ne->af == 10) { /* AF_INET6 */
+				inet_ntop(AF_INET6, ne->local_addr,
+					  cev.net_local_addr,
+					  sizeof(cev.net_local_addr));
+				inet_ntop(AF_INET6, ne->remote_addr,
+					  cev.net_remote_addr,
+					  sizeof(cev.net_remote_addr));
+			}
+			cev.net_local_port = ne->local_port;
+			cev.net_remote_port = ne->remote_port;
+			cev.net_conn_tx_bytes = ne->tx_bytes;
+			cev.net_conn_rx_bytes = ne->rx_bytes;
+			cev.net_duration_ms = ne->duration_ns / 1000000;
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -1208,6 +1295,16 @@ static void write_snapshot(void)
 	/* Single stack-based event for streaming to event file */
 	int snap_count = 0;
 
+	/* Single timestamp for all snapshot events in this cycle */
+	struct timespec snap_ts;
+	clock_gettime(CLOCK_REALTIME, &snap_ts);
+	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
+				+ (__u64)snap_ts.tv_nsec;
+
+	/* Lock batch to prevent ef_swap_fd/ef_snapshot_fd from
+	 * splitting this snapshot across two deliveries */
+	ef_batch_lock();
+
 	/* Collect all keys first to avoid iterator invalidation
 	 * from concurrent BPF map modifications (fork/exit events) */
 	__u32 *all_keys = NULL;
@@ -1313,10 +1410,10 @@ static void write_snapshot(void)
 		/* Write Prometheus metrics */
 		if (f) {
 		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
+			"pid=\"%u\",uid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
 			"cgroup=\"%s\"} 1\n",
 			pfx, host_esc, rule_name, ti.root_pid, pi.tgid,
-			comm_esc, exec_esc, args_esc, cg_esc);
+			pi.uid, comm_esc, exec_esc, args_esc, cg_esc);
 		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
 		fprintf(f, "%s_uptime_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
@@ -1435,15 +1532,13 @@ static void write_snapshot(void)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
-					 + (__u64)ts_now.tv_nsec;
+			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
 			cev.root_pid = ti.root_pid;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
+			cev.uid = pi.uid;
 			memcpy(cev.comm, pi.comm, COMM_LEN);
 			cmdline_split(pi.cmdline, pi.cmdline_len,
 				      cev.exec_path, sizeof(cev.exec_path),
@@ -1488,6 +1583,9 @@ static void write_snapshot(void)
 		pid_count++;
 	}
 	free(all_keys);
+
+	/* Unlock batch — snapshot is complete, safe for swap/snapshot_fd */
+	ef_batch_unlock();
 
 	/* Clean up dead processes */
 	for (int i = 0; i < dead_count; i++) {
@@ -1728,8 +1826,23 @@ int main(int argc, char *argv[])
 	/* Set rodata before loading */
 	skel->rodata->max_exec_events_per_sec = (__u32)cfg_exec_rate_limit;
 
-	/* Conditionally disable network kretprobes */
-	if (!cfg_net_metrics) {
+	/* Conditionally disable network tracking programs */
+	if (!cfg_net_tracking_enabled) {
+		/* Connection lifecycle: connect/accept/close */
+		bpf_program__set_autoattach(skel->progs.kp_tcp_v4_connect, false);
+		bpf_program__set_autoattach(skel->progs.krp_tcp_v4_connect, false);
+		bpf_program__set_autoattach(skel->progs.kp_tcp_v6_connect, false);
+		bpf_program__set_autoattach(skel->progs.krp_tcp_v6_connect, false);
+		bpf_program__set_autoattach(skel->progs.krp_inet_csk_accept, false);
+		bpf_program__set_autoattach(skel->progs.kp_tcp_close, false);
+	}
+	if (!cfg_net_tracking_enabled || !cfg_net_track_bytes) {
+		/* Per-connection byte counting (kprobe enter + kretprobe) */
+		bpf_program__set_autoattach(skel->progs.kp_tcp_sendmsg, false);
+		bpf_program__set_autoattach(skel->progs.kp_tcp_recvmsg, false);
+	}
+	if (!cfg_net_tracking_enabled) {
+		/* Per-process aggregate byte counting (TCP + UDP kretprobes) */
 		bpf_program__set_autoattach(skel->progs.ret_tcp_sendmsg, false);
 		bpf_program__set_autoattach(skel->progs.ret_tcp_recvmsg, false);
 		bpf_program__set_autoattach(skel->progs.ret_udp_sendmsg, false);
@@ -1781,6 +1894,17 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* Push net tracking config to BPF maps */
+	if (cfg_net_tracking_enabled) {
+		int net_cfg_fd = bpf_map__fd(skel->maps.net_cfg);
+		__u32 key0 = 0;
+		struct net_config nc = {
+			.enabled = 1,
+			.track_bytes = (__u8)cfg_net_track_bytes,
+		};
+		bpf_map_update_elem(net_cfg_fd, &key0, &nc, BPF_ANY);
+	}
+
 	if (process_metrics_bpf__attach(skel)) {
 		fprintf(stderr, "FATAL: failed to attach BPF programs\n");
 		process_metrics_bpf__destroy(skel);
@@ -1821,13 +1945,14 @@ int main(int argc, char *argv[])
 	log_ts("INFO", "started: %d rules, snapshot every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
-	       "net_metrics=%s, file_tracking=%s%s",
+	       "net_tracking=%s%s, file_tracking=%s%s",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
 	       cfg_cgroup_metrics ? "on" : "off",
 	       cfg_refresh_proc ? "on" : "off",
-	       cfg_net_metrics ? "on" : "off",
+	       cfg_net_tracking_enabled ? "on" : "off",
+	       cfg_net_track_bytes ? "+bytes" : "",
 	       cfg_file_tracking_enabled ? "on" : "off",
 	       cfg_file_track_bytes ? "+bytes" : "");
 

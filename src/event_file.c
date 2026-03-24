@@ -26,6 +26,7 @@ static char          g_tmp_path[520];      /* .tmp — used during swap */
 static char          g_pending_path[520];  /* .pending — awaiting commit */
 static int           g_fd = -1;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int           g_initialized;
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -267,6 +268,9 @@ int ef_swap_fd(void)
 	if (!g_initialized)
 		return -1;
 
+	/* Wait for any in-progress batch (e.g. snapshot loop) to finish */
+	pthread_mutex_lock(&g_batch_mutex);
+
 	/* Step 1: Atomically swap the current event file */
 	pthread_mutex_lock(&g_mutex);
 
@@ -281,6 +285,7 @@ int ef_swap_fd(void)
 	open_append();
 
 	pthread_mutex_unlock(&g_mutex);
+	pthread_mutex_unlock(&g_batch_mutex);
 
 	/* Step 2: Merge .tmp into .pending */
 	struct stat st;
@@ -310,6 +315,66 @@ int ef_swap_fd(void)
 	}
 
 	return fd;
+}
+
+int ef_snapshot_fd(void)
+{
+	if (!g_initialized)
+		return -1;
+
+	static char snap_path[520];
+	snprintf(snap_path, sizeof(snap_path), "%s.snap", g_path);
+
+	/* Wait for any in-progress batch (e.g. snapshot loop) to finish */
+	pthread_mutex_lock(&g_batch_mutex);
+	pthread_mutex_lock(&g_mutex);
+
+	/* Close fd to flush all pending writes */
+	if (g_fd >= 0) {
+		close(g_fd);
+		g_fd = -1;
+	}
+
+	/* Hard-link: instant copy, no data transfer */
+	unlink(snap_path);
+	int has_data = (link(g_path, snap_path) == 0);
+
+	/* Reopen for future appends */
+	open_append();
+
+	pthread_mutex_unlock(&g_mutex);
+	pthread_mutex_unlock(&g_batch_mutex);
+
+	if (!has_data)
+		return -1;
+
+	int fd = open(snap_path, O_RDONLY);
+	if (fd < 0) {
+		unlink(snap_path);
+		return -1;
+	}
+
+	struct stat st;
+	if (fstat(fd, &st) != 0 || st.st_size == 0) {
+		close(fd);
+		unlink(snap_path);
+		return -1;
+	}
+
+	/* Unlink snapshot — fd stays valid until close() */
+	unlink(snap_path);
+
+	return fd;
+}
+
+void ef_batch_lock(void)
+{
+	pthread_mutex_lock(&g_batch_mutex);
+}
+
+void ef_batch_unlock(void)
+{
+	pthread_mutex_unlock(&g_batch_mutex);
 }
 
 void ef_commit(void)

@@ -1,14 +1,18 @@
 /*
  * http_server.c — embedded HTTP server for process_metrics
  *
- * Minimal HTTP/1.1 server with two endpoints:
+ * Minimal HTTP/1.1 server with these endpoints:
  *
- *   GET /metrics?format=prom — returns the current .prom snapshot file as-is.
- *                              File is NOT cleared (overwritten by write_snapshot).
+ *   GET /metrics?format=prom       — returns the current .prom snapshot file as-is.
+ *                                    File is NOT cleared (overwritten each snapshot).
  *
- *   GET /metrics?format=csv  — swaps the event file, formats accumulated events
- *   GET /metrics             — as CSV, and clears the buffer only after successful
- *                              delivery. If delivery fails, events are preserved.
+ *   GET /metrics?format=csv        — returns accumulated events as CSV (read-only).
+ *   GET /metrics                     Data is NOT cleared — safe for any consumer.
+ *
+ *   GET /metrics?format=csv&clear=1 — returns accumulated events as CSV AND clears
+ *                                     the buffer after successful delivery.
+ *                                     Intended for ClickHouse materialized views.
+ *                                     If delivery fails, events are preserved.
  */
 
 #define _GNU_SOURCE
@@ -40,7 +44,7 @@ static char          g_prom_path[512];
 /* ── CSV formatting ──────────────────────────────────────────────── */
 
 static const char *CSV_HEADER =
-	"timestamp,hostname,event_type,rule,root_pid,pid,ppid,"
+	"timestamp,hostname,event_type,rule,root_pid,pid,ppid,uid,"
 	"comm,exec,args,cgroup,is_root,state,exit_code,"
 	"cpu_ns,cpu_usage_ratio,rss_bytes,rss_min_bytes,rss_max_bytes,"
 	"shmem_bytes,swap_bytes,vsize_bytes,"
@@ -48,7 +52,11 @@ static const char *CSV_HEADER =
 	"nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
 	"net_tx_bytes,net_rx_bytes,start_time_ns,uptime_seconds,"
 	"cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
-	"cgroup_cpu_weight,cgroup_pids_current\n";
+	"cgroup_cpu_weight,cgroup_pids_current,"
+	"file_path,file_flags,file_read_bytes,file_write_bytes,"
+	"file_open_count,"
+	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
+	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms\n";
 
 static int csv_escape_field(const char *src, char *dst, int dstlen)
 {
@@ -58,6 +66,8 @@ static int csv_escape_field(const char *src, char *dst, int dstlen)
 		if (src[i] == '"') {
 			dst[j++] = '"';
 			dst[j++] = '"';
+		} else if (src[i] == '\n' || src[i] == '\r') {
+			dst[j++] = ' ';
 		} else {
 			dst[j++] = src[i];
 		}
@@ -70,14 +80,22 @@ static int csv_escape_field(const char *src, char *dst, int dstlen)
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
 	const struct metric_event *ev = &rec->event;
-	char hostname_esc[600], comm_esc[200], exec_esc[600];
-	char args_esc[600], cgroup_esc[600];
+	char hostname_esc[600], event_type_esc[32], rule_esc[150];
+	char comm_esc[200], exec_esc[600];
+	char args_esc[600], cgroup_esc[600], state_esc[8];
+	char file_path_esc[600];
+	char net_local_esc[100], net_remote_esc[100];
 
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
+	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));
+	csv_escape_field(ev->rule, rule_esc, sizeof(rule_esc));
 	csv_escape_field(ev->comm, comm_esc, sizeof(comm_esc));
 	csv_escape_field(ev->exec_path, exec_esc, sizeof(exec_esc));
 	csv_escape_field(ev->args, args_esc, sizeof(args_esc));
 	csv_escape_field(ev->cgroup, cgroup_esc, sizeof(cgroup_esc));
+	csv_escape_field(ev->file_path, file_path_esc, sizeof(file_path_esc));
+	csv_escape_field(ev->net_local_addr, net_local_esc, sizeof(net_local_esc));
+	csv_escape_field(ev->net_remote_addr, net_remote_esc, sizeof(net_remote_esc));
 
 	/* Format timestamp as ISO 8601: YYYY-MM-DD HH:MM:SS.mmm
 	 * This format is natively parsed by ClickHouse DateTime64(3) */
@@ -93,30 +111,34 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 			 tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
 	}
 
-	char state_str[2] = { (char)(ev->state ? ev->state : '?'), '\0' };
+	char state_raw[2] = { (char)(ev->state ? ev->state : '?'), '\0' };
+	csv_escape_field(state_raw, state_esc, sizeof(state_esc));
 
 	int n = snprintf(buf, buflen,
-		"%s,%s,%s,%s,%u,%u,%u,"
+		"%s,%s,%s,%s,%u,%u,%u,%u,"
 		"%s,%s,%s,%s,%u,%s,%u,"
 		"%llu,%.4f,%llu,%llu,%llu,"
 		"%llu,%llu,%llu,"
 		"%llu,%llu,%llu,%llu,"
 		"%llu,%llu,%u,%d,%u,"
 		"%llu,%llu,%llu,%llu,"
-		"%lld,%lld,%lld,%lld,%lld\n",
+		"%lld,%lld,%lld,%lld,%lld,"
+		"%s,%u,%llu,%llu,%u,"
+		"%s,%s,%u,%u,%llu,%llu,%llu\n",
 		ts_str,
 		hostname_esc,
-		ev->event_type,
-		ev->rule,
+		event_type_esc,
+		rule_esc,
 		ev->root_pid,
 		ev->pid,
 		ev->ppid,
+		ev->uid,
 		comm_esc,
 		exec_esc,
 		args_esc,
 		cgroup_esc,
 		(unsigned)ev->is_root,
-		state_str,
+		state_esc,
 		ev->exit_code,
 		(unsigned long long)ev->cpu_ns,
 		ev->cpu_usage_ratio,
@@ -143,7 +165,19 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		(long long)ev->cgroup_memory_current,
 		(long long)ev->cgroup_swap_current,
 		(long long)ev->cgroup_cpu_weight,
-		(long long)ev->cgroup_pids_current);
+		(long long)ev->cgroup_pids_current,
+		file_path_esc,
+		ev->file_flags,
+		(unsigned long long)ev->file_read_bytes,
+		(unsigned long long)ev->file_write_bytes,
+		ev->file_open_count,
+		net_local_esc,
+		net_remote_esc,
+		(unsigned)ev->net_local_port,
+		(unsigned)ev->net_remote_port,
+		(unsigned long long)ev->net_conn_tx_bytes,
+		(unsigned long long)ev->net_conn_rx_bytes,
+		(unsigned long long)ev->net_duration_ms);
 
 	return n < buflen ? n : -1;
 }
@@ -215,11 +249,37 @@ static int send_all(int fd, const char *buf, int len)
 }
 
 /*
- * Stream CSV response: read records one at a time from data_fd,
- * format each as CSV, and send directly to the socket.
- * No large memory allocations — uses only stack buffers.
+ * Stream records from data_fd as CSV to client_fd.
+ * Returns 1 if all records sent successfully, 0 on send error.
  */
-static void handle_csv_stream(int client_fd)
+static int stream_csv_records(int client_fd, int data_fd)
+{
+	struct ef_record rec;
+	char row_buf[8192];
+
+	while (1) {
+		ssize_t r = read(data_fd, &rec, sizeof(rec));
+		if (r == 0)
+			break;  /* EOF */
+		if (r != (ssize_t)sizeof(rec))
+			break;  /* partial record */
+
+		int n = format_csv_row(row_buf, sizeof(row_buf), &rec);
+		if (n <= 0)
+			continue;
+
+		if (send_all(client_fd, row_buf, n) < 0)
+			return 0;
+	}
+	return 1;
+}
+
+/*
+ * Stream CSV response WITH clearing (for ClickHouse: ?format=csv&clear=1).
+ * Swaps the event file, streams records, then commits (deletes .pending).
+ * If delivery fails, .pending is preserved for the next request.
+ */
+static void handle_csv_clear(int client_fd)
 {
 	int data_fd = ef_swap_fd();
 
@@ -243,33 +303,44 @@ static void handle_csv_stream(int client_fd)
 		return;
 	}
 
-	/* Stream records one at a time */
-	struct ef_record rec;
-	char row_buf[4096];
-	int ok = 1;
-
-	while (ok) {
-		ssize_t r = read(data_fd, &rec, sizeof(rec));
-		if (r == 0)
-			break;  /* EOF */
-		if (r != (ssize_t)sizeof(rec))
-			break;  /* partial record */
-
-		int n = format_csv_row(row_buf, sizeof(row_buf), &rec);
-		if (n <= 0)
-			continue;
-
-		if (send_all(client_fd, row_buf, n) < 0) {
-			ok = 0;
-			break;
-		}
-	}
-
+	int ok = stream_csv_records(client_fd, data_fd);
 	close(data_fd);
 
 	if (ok)
 		ef_commit();
 	/* else: .pending preserved for next request */
+}
+
+/*
+ * Stream CSV response WITHOUT clearing (read-only: ?format=csv).
+ * Takes a snapshot of the event file and streams it.
+ * The original data is NOT modified.
+ */
+static void handle_csv_readonly(int client_fd)
+{
+	int data_fd = ef_snapshot_fd();
+
+	if (data_fd < 0) {
+		/* No events — return header only */
+		send_response(client_fd, 200, "text/csv; charset=utf-8",
+			      CSV_HEADER, (int)strlen(CSV_HEADER));
+		return;
+	}
+
+	/* Send HTTP header (no Content-Length — stream until close) */
+	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
+		close(data_fd);
+		return;
+	}
+
+	/* Send CSV column header */
+	if (send_all(client_fd, CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
+		close(data_fd);
+		return;
+	}
+
+	stream_csv_records(client_fd, data_fd);
+	close(data_fd);
 }
 
 /* ── Prom: read .prom file ───────────────────────────────────────── */
@@ -320,6 +391,11 @@ static enum format_type parse_format(const char *request)
 	if (strstr(request, "format=prom"))
 		return FMT_PROM;
 	return FMT_CSV;
+}
+
+static int parse_clear(const char *request)
+{
+	return strstr(request, "clear=1") != NULL;
 }
 
 /* ── request handler ─────────────────────────────────────────────── */
@@ -377,10 +453,18 @@ static void handle_request(int client_fd,
 		}
 		free(body);
 	} else {
-		/* CSV: stream from event file directly to socket */
-		fprintf(stderr, "[INFO] http: GET /metrics?format=csv "
-			"from %s\n", peer_ip);
-		handle_csv_stream(client_fd);
+		int do_clear = parse_clear(buf);
+		if (do_clear) {
+			/* CSV + clear: swap + stream + commit (for ClickHouse) */
+			fprintf(stderr, "[INFO] http: GET /metrics?format=csv&clear=1 "
+				"from %s\n", peer_ip);
+			handle_csv_clear(client_fd);
+		} else {
+			/* CSV read-only: snapshot without clearing */
+			fprintf(stderr, "[INFO] http: GET /metrics?format=csv "
+				"from %s (read-only)\n", peer_ip);
+			handle_csv_readonly(client_fd);
+		}
 	}
 }
 

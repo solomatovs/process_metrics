@@ -30,6 +30,7 @@ enum event_type {
 	EVENT_EXIT       = 3,
 	EVENT_OOM_KILL   = 4,
 	EVENT_FILE_CLOSE = 5,
+	EVENT_NET_CLOSE  = 6,
 };
 
 /* ── file tracking constants ──────────────────────────────────────── */
@@ -98,6 +99,7 @@ struct file_event {
 	__u32 type;           /* EVENT_FILE_CLOSE */
 	__u32 tgid;
 	__u32 ppid;
+	__u32 uid;            /* real UID of the process */
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
@@ -115,6 +117,7 @@ struct file_event {
 struct proc_info {
 	__u32 tgid;
 	__u32 ppid;
+	__u32 uid;               /* real UID of the process */
 	__u64 start_ns;          /* task->start_time (CLOCK_MONOTONIC ns) */
 	__u64 cpu_ns;            /* signal->{utime+stime} + leader->{utime+stime} */
 	__u64 rss_pages;         /* current RSS in pages */
@@ -159,6 +162,7 @@ struct event {
 	__u32 type;              /* enum event_type */
 	__u32 tgid;
 	__u32 ppid;
+	__u32 uid;               /* real UID of the process */
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
@@ -180,6 +184,73 @@ struct event {
 	__u8  oom_killed;
 	__u64 net_tx_bytes;
 	__u64 net_rx_bytes;
+};
+
+/* ── network tracking constants ──────────────────────────────────── */
+
+#define NET_MAX_SOCKETS  65536
+
+/*
+ * Configuration pushed from userspace to BPF via maps.
+ */
+struct net_config {
+	__u8  enabled;       /* 1 = track connect/accept/close */
+	__u8  track_bytes;   /* 1 = also track send/recv bytes per socket */
+};
+
+/*
+ * Temporary storage for tcp_v4_connect / tcp_v6_connect args.
+ * Key: pid_tgid (__u64)
+ */
+struct connect_args {
+	__u64 sock_ptr;      /* struct sock * */
+};
+
+/*
+ * Temporary storage for tcp_sendmsg / tcp_recvmsg args.
+ * Key: pid_tgid (__u64)
+ */
+struct sendmsg_args {
+	__u64 sock_ptr;      /* struct sock * */
+};
+
+/*
+ * Per-socket tracking state in sock_map.
+ * Key: sock pointer (__u64)
+ */
+struct sock_info {
+	__u32 tgid;
+	__u32 uid;
+	__u8  af;             /* AF_INET=2, AF_INET6=10 */
+	__u8  local_addr[16]; /* IPv4 in first 4 bytes, or full IPv6 */
+	__u8  remote_addr[16];
+	__u16 local_port;     /* host byte order */
+	__u16 remote_port;    /* host byte order */
+	__u64 tx_bytes;
+	__u64 rx_bytes;
+	__u64 start_ns;       /* connection start time (boot ns) */
+};
+
+/*
+ * Network close event — sent from BPF to userspace via ring buffer.
+ * First field is __u32 type (= EVENT_NET_CLOSE), same dispatch as others.
+ */
+struct net_event {
+	__u32 type;           /* EVENT_NET_CLOSE */
+	__u32 tgid;
+	__u32 ppid;
+	__u32 uid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  comm[COMM_LEN];
+	__u8  af;             /* AF_INET=2, AF_INET6=10 */
+	__u8  local_addr[16];
+	__u8  remote_addr[16];
+	__u16 local_port;
+	__u16 remote_port;
+	__u64 tx_bytes;
+	__u64 rx_bytes;
+	__u64 duration_ns;    /* how long the connection was open */
 };
 
 #endif /* PROCESS_METRICS_COMMON_H */

@@ -4,7 +4,15 @@
 # Не требует root — только точечные caps для BPF и чтения /proc.
 #
 # Установка:
+#   sudo useradd -r -s /usr/sbin/nologin process_metrics
+#   sudo mkdir -p /var/lib/process_metrics
+#   sudo chown process_metrics:process_metrics /var/lib/process_metrics
+#   sudo cp build/process_metrics /usr/local/bin/
+#   sudo mkdir -p /etc/process_metrics
+#   sudo cp examples/process_metrics.conf /etc/process_metrics/
 #   sudo cp ci/process_metrics.service /etc/systemd/system/
+#   sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
+#   sudo sysctl --system
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now process_metrics
 #
@@ -52,12 +60,14 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-MemoryMax=64M
-CPUQuota=10%
+# BPF maps + event buffer + working set ≈ 100-120 MB with all collectors enabled.
+# Set conservatively above observed peak to avoid OOM kills.
+MemoryMax=200M
+CPUQuota=15%
 
 # --- Hardening ---
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelModules=yes
 ProtectControlGroups=no
@@ -75,7 +85,7 @@ PrivateDevices=yes
 
 # Доступ к файловой системе
 ReadOnlyPaths=/proc /sys/fs/cgroup /sys/kernel/btf
-ReadWritePaths=/var/lib/process_metrics
+ReadWritePaths=/var/lib/process_metrics /etc/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
 ReadOnlyPaths=/sys/fs/bpf
