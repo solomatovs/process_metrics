@@ -1,29 +1,29 @@
-# process_metrics — event-driven BPF process metrics collector
+# process_metrics — событийный BPF-коллектор метрик процессов
 #
-# Structure:
-#   src/               — project source code
-#   src/bpftool/       — bpftool source (vendored, built locally)
-#   build/             — generated artifacts (.bpf.o, .skel.h, binary)
+# Структура:
+#   src/               — исходный код проекта
+#   src/bpftool/       — исходники bpftool (вендорная копия, собирается локально)
+#   build/             — сгенерированные артефакты (.bpf.o, .skel.h, бинарник)
 #
-# Usage:
-#   make               — show this help
-#   make deps          — install build dependencies (auto-detects apt/yum)
-#   make all           — full build: vmlinux.h + bpftool + BPF + binary
-#   make bpftool       — build only bpftool from src/bpftool/
-#   make vmlinux       — regenerate vmlinux.h from running kernel BTF
-#   make bpf           — compile BPF object + generate skeleton
-#   make binary        — compile userspace binary (requires skeleton)
-#   make clean         — remove build artifacts
+# Использование:
+#   make               — показать эту справку
+#   make deps          — установить зависимости сборки (автоопределение apt/yum)
+#   make all           — полная сборка: vmlinux.h + bpftool + BPF + бинарник
+#   make bpftool       — собрать только bpftool из src/bpftool/
+#   make vmlinux       — пересоздать vmlinux.h из BTF текущего ядра
+#   make bpf           — скомпилировать BPF-объект + сгенерировать скелетон
+#   make binary        — скомпилировать userspace-бинарник (требует скелетон)
+#   make clean         — удалить артефакты сборки
 #
-# Requirements:
-#   clang >= 10        — for BPF CO-RE and userspace
-#   gcc                — for vendored bpftool
+# Требования:
+#   clang >= 10        — для BPF CO-RE и userspace-кода
+#   gcc                — для вендорного bpftool
 #   libbpf-dev, libelf-dev, zlib1g-dev
 
 SRCDIR   := src
 BUILDDIR := build
 
-# Source files
+# Исходные файлы
 BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
 USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c
 COMMON_H   := $(SRCDIR)/process_metrics_common.h
@@ -31,16 +31,16 @@ EF_H       := $(SRCDIR)/event_file.h
 HS_H       := $(SRCDIR)/http_server.h
 VMLINUX_H  := $(SRCDIR)/vmlinux.h
 
-# Build artifacts
+# Артефакты сборки
 BPF_OBJ    := $(BUILDDIR)/process_metrics.bpf.o
 SKEL_H     := $(BUILDDIR)/process_metrics.skel.h
 BINARY     := $(BUILDDIR)/process_metrics
 
-# bpftool from vendored sources
+# bpftool из вендорных исходников
 BPFTOOL_SRCDIR := $(SRCDIR)/bpftool/src
 BPFTOOL_BIN    := $(BUILDDIR)/bpftool
 
-# Tools — auto-detect newest clang with BPF CO-RE support (>= 10)
+# Инструменты — автоопределение самого нового clang с поддержкой BPF CO-RE (>= 10)
 CLANG   ?= $(shell best=""; best_ver=0; \
             for c in clang clang-10 clang-11 clang-12 clang-13 clang-14 clang-15 clang-16 clang-17 clang-18 clang-19 clang-20; do \
               command -v $$c >/dev/null 2>&1 || continue; \
@@ -50,68 +50,68 @@ CLANG   ?= $(shell best=""; best_ver=0; \
 BPFTOOL ?= $(BPFTOOL_BIN)
 CC      := $(CLANG)
 
-# Flags
+# Флаги компиляции
 BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 
-# Dependency packages
+# Пакеты зависимостей
 APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm libconfig-dev
 YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel llvm libconfig-devel
 
-# Minimum clang version for BPF CO-RE
+# Минимальная версия clang для BPF CO-RE
 MIN_CLANG_VER := 10
 
-# Test artifacts
+# Артефакты тестов
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
 .PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse
 
 help:
-	@echo "process_metrics — event-driven BPF process metrics collector"
+	@echo "process_metrics — событийный BPF-коллектор метрик процессов"
 	@echo ""
-	@echo "  make deps       install build dependencies (auto-detects apt/yum)"
-	@echo "  make all        full build: vmlinux + bpftool + bpf + binary"
-	@echo "  make vmlinux    regenerate vmlinux.h from running kernel BTF"
-	@echo "  make bpftool    build bpftool from vendored sources"
-	@echo "  make bpf        compile BPF object + generate skeleton"
-	@echo "  make binary     compile userspace binary"
-	@echo "  make clean      remove build artifacts"
-	@echo "  make test       run unit tests"
+	@echo "  make deps       установить зависимости сборки (автоопределение apt/yum)"
+	@echo "  make all        полная сборка: vmlinux + bpftool + bpf + бинарник"
+	@echo "  make vmlinux    пересоздать vmlinux.h из BTF текущего ядра"
+	@echo "  make bpftool    собрать bpftool из вендорных исходников"
+	@echo "  make bpf        скомпилировать BPF-объект + сгенерировать скелетон"
+	@echo "  make binary     скомпилировать userspace-бинарник"
+	@echo "  make clean      удалить артефакты сборки"
+	@echo "  make test       запустить юнит-тесты"
 	@echo ""
-	@echo "Detected clang:   $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
-	@echo "Kernel version:   $(shell uname -r)"
+	@echo "Обнаруженный clang: $(or $(CLANG),НЕ НАЙДЕН — установите clang >= $(MIN_CLANG_VER))"
+	@echo "Версия ядра:        $(shell uname -r)"
 	@echo ""
-	@echo "Quick start:"
+	@echo "Быстрый старт:"
 	@echo "  make deps && make all"
 
-# --- main targets ---
+# --- основные цели ---
 
 all: check-clang vmlinux bpftool bpf binary
 	@echo ""
-	@echo "Build complete: $(BINARY)"
-	@echo "  kernel: $(shell uname -r)"
+	@echo "Сборка завершена: $(BINARY)"
+	@echo "  ядро: $(shell uname -r)"
 	@file $(BINARY) | sed 's/^/  /'
 
-# --- clang version check ---
+# --- проверка версии clang ---
 
 check-clang:
 	@if [ -z "$(CLANG)" ]; then \
-		echo "Error: no clang >= $(MIN_CLANG_VER) found."; \
-		echo "Install: apt install clang-11  OR  yum install clang"; \
-		echo "Or specify: make all CLANG=/path/to/clang-11"; \
+		echo "Ошибка: не найден clang >= $(MIN_CLANG_VER)."; \
+		echo "Установите: apt install clang-11  ИЛИ  yum install clang"; \
+		echo "Или укажите: make all CLANG=/path/to/clang-11"; \
 		exit 1; \
 	fi; \
 	ver=$$($(CLANG) --version 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1); \
 	if [ -z "$$ver" ] || [ "$$ver" -lt $(MIN_CLANG_VER) ]; then \
-		echo "Error: $(CLANG) version $$ver < $(MIN_CLANG_VER) (need >= $(MIN_CLANG_VER) for BPF CO-RE)"; \
-		echo "Install clang >= $(MIN_CLANG_VER) or specify: make all CLANG=clang-11"; \
+		echo "Ошибка: $(CLANG) версия $$ver < $(MIN_CLANG_VER) (нужен >= $(MIN_CLANG_VER) для BPF CO-RE)"; \
+		echo "Установите clang >= $(MIN_CLANG_VER) или укажите: make all CLANG=clang-11"; \
 		exit 1; \
 	fi; \
-	echo "Using $(CLANG) (version $$ver), kernel $(shell uname -r)"
+	echo "Используется $(CLANG) (версия $$ver), ядро $(shell uname -r)"
 
-# --- dependency installation ---
+# --- установка зависимостей ---
 
 deps:
 	@if command -v apt-get >/dev/null 2>&1; then \
@@ -119,44 +119,44 @@ deps:
 	elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then \
 		$(MAKE) deps-yum; \
 	else \
-		echo "Error: neither apt-get nor yum/dnf found"; exit 1; \
+		echo "Ошибка: не найден ни apt-get, ни yum/dnf"; exit 1; \
 	fi
 
 deps-apt:
 	apt-get update
 	apt-get install -y $(APT_PKGS)
-	@# kernel headers — optional, may not exist in containers
+	@# заголовки ядра — опционально, могут отсутствовать в контейнерах
 	apt-get install -y linux-headers-$(shell uname -r) 2>/dev/null || \
-		echo "Note: linux-headers not found (OK for containers, needed only for vmlinux.h regeneration)"
-	@# Install clang >= 10: try clang-10..clang-18, then generic clang
+		echo "Примечание: linux-headers не найдены (ОК для контейнеров, нужны только для пересоздания vmlinux.h)"
+	@# Установка clang >= 10: пробуем clang-10..clang-18, затем обычный clang
 	@found=0; \
 	for pkg in clang-10 clang-11 clang-12 clang-13 clang-14 clang-15 clang-16 clang-17 clang-18 clang; do \
 		if apt-cache show $$pkg >/dev/null 2>&1; then \
-			echo "Installing $$pkg..."; \
+			echo "Устанавливается $$pkg..."; \
 			apt-get install -y $$pkg; \
 			found=1; \
 			break; \
 		fi; \
 	done; \
 	if [ "$$found" = "0" ]; then \
-		echo "Warning: no clang package found in apt repos"; \
-		echo "Install clang >= $(MIN_CLANG_VER) manually"; \
+		echo "Предупреждение: пакет clang не найден в apt-репозиториях"; \
+		echo "Установите clang >= $(MIN_CLANG_VER) вручную"; \
 	fi
 
 deps-yum:
 	yum install -y $(YUM_PKGS) clang
-	@# kernel headers — optional, may not exist in containers
+	@# заголовки ядра — опционально, могут отсутствовать в контейнерах
 	yum install -y kernel-devel-$(shell uname -r) 2>/dev/null || \
-		echo "Note: kernel-devel not found (OK for containers, needed only for vmlinux.h regeneration)"
+		echo "Примечание: kernel-devel не найден (ОК для контейнеров, нужен только для пересоздания vmlinux.h)"
 
-# --- vmlinux.h from running kernel BTF ---
+# --- vmlinux.h из BTF текущего ядра ---
 
 vmlinux: $(BPFTOOL_BIN)
 	chmod ugo+x $(BPFTOOL)
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)
-	@echo "vmlinux.h regenerated from $(shell uname -r)"
+	@echo "vmlinux.h пересоздан из $(shell uname -r)"
 
-# --- bpftool from vendored source ---
+# --- bpftool из вендорных исходников ---
 
 bpftool: $(BPFTOOL_BIN)
 
@@ -170,7 +170,7 @@ $(BPFTOOL_BIN): | $(BUILDDIR)
 	cp $(CURDIR)/$(BUILDDIR)/bpftool-build/bpftool $@
 	rm -rf $(CURDIR)/$(BUILDDIR)/bpftool-build
 
-# --- BPF compilation ---
+# --- компиляция BPF ---
 
 bpf: $(SKEL_H)
 
@@ -181,7 +181,7 @@ $(SKEL_H): $(BPF_OBJ) $(BPFTOOL_BIN)
 	chmod ugo+x $(BPFTOOL)
 	$(BPFTOOL) gen skeleton $< > $@
 
-# --- userspace binary ---
+# --- userspace-бинарник ---
 
 binary: $(BINARY)
 
@@ -195,7 +195,7 @@ clean:
 	rm -f $(BPF_OBJ) $(SKEL_H) $(BINARY) $(BPFTOOL_BIN) $(TEST_EF_BIN)
 	rm -rf $(BUILDDIR)/bpftool-build
 
-# --- tests ---
+# --- тесты ---
 
 $(TEST_EF_BIN): $(TEST_EF_SRC) $(SRCDIR)/event_file.c $(EF_H) $(COMMON_H) | $(BUILDDIR)
 	$(CC) $(CFLAGS) -o $@ $(TEST_EF_SRC) $(SRCDIR)/event_file.c -lpthread

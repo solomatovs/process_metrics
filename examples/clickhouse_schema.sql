@@ -1,43 +1,44 @@
--- process_metrics — ClickHouse table schema (optimized)
+-- process_metrics — схема таблицы ClickHouse (оптимизированная)
 --
--- One table for all event types: snapshot, fork, exec, exit, oom_kill, file_close.
--- Run this once on your ClickHouse server.
+-- Одна таблица для всех типов событий: snapshot, fork, exec, exit, oom_kill, file_close.
+-- Выполнить один раз на сервере ClickHouse.
 --
--- Design decisions:
+-- Проектные решения:
 --
 --   ORDER BY (hostname, event_type, rule, pid, timestamp)
---     Almost every query filters by event_type, so it goes early in the key.
---     hostname first — enables efficient multi-tenant queries.
---     pid before timestamp — per-process history lookups read contiguous blocks.
---     timestamp last — range scans within a pid are sequential.
+--     Почти каждый запрос фильтрует по event_type, поэтому он идёт рано в ключе.
+--     hostname первым — эффективные запросы в мультитенантных средах.
+--     pid перед timestamp — выборка истории процесса читает смежные блоки.
+--     timestamp последним — диапазонные выборки внутри pid идут последовательно.
 --
---   Codecs:
---     Delta    — for monotonically increasing counters (cpu_ns, io_*, faults, ctxsw).
---                Delta stores differences between consecutive values; for slowly
---                growing counters the deltas are small → ZSTD compresses them to bits.
---     Gorilla  — IEEE 754 XOR compression for floats (cpu_usage_ratio).
---                Adjacent snapshot values are close → most XOR bits are zero.
---     T64      — block packing for integers that never use the full 64-bit range
---                (PIDs, threads, exit_code, oom flags, cgroup limits).
---     ZSTD(1)  — final general-purpose compression on every column.
---                Level 1 gives ~95% of max ratio at ~10x faster compression.
+--   Кодеки:
+--     Delta    — для монотонно возрастающих счётчиков (cpu_ns, io_*, faults, ctxsw).
+--                Delta хранит разности между последовательными значениями; для медленно
+--                растущих счётчиков разности малы → ZSTD сжимает их до битов.
+--     Gorilla  — IEEE 754 XOR-сжатие для чисел с плавающей точкой (cpu_usage_ratio).
+--                Соседние значения snapshot'ов близки → большинство XOR-битов нулевые.
+--     T64      — блочная упаковка для целых чисел, не использующих весь 64-битный диапазон
+--                (PID'ы, потоки, exit_code, OOM-флаги, лимиты cgroup).
+--     ZSTD(1)  — финальное универсальное сжатие на каждой колонке.
+--                Уровень 1 даёт ~95% максимальной степени сжатия при ~10x быстрее.
 --
---   LowCardinality — dictionary encoding for hostname, event_type, rule, cgroup, comm.
---     Replaces repeated strings with integer indices; huge win when cardinality < 10K.
+--   LowCardinality — словарное кодирование для hostname, event_type, rule, cgroup, comm.
+--     Заменяет повторяющиеся строки целочисленными индексами; огромный выигрыш
+--     при кардинальности < 10K.
 --
---   Partitioning by month (toYYYYMM) instead of day:
---     With 30-day TTL and daily partitions you get 30 partitions to merge/drop.
---     Monthly = 1-2 active partitions, less merge overhead, same TTL granularity
---     (ClickHouse drops partitions where ALL rows are expired).
+--   Партиционирование по месяцам (toYYYYMM) вместо дней:
+--     При TTL 30 дней и дневных партициях получаем 30 партиций для слияния/удаления.
+--     Помесячно = 1-2 активные партиции, меньше накладных расходов на слияние,
+--     та же гранулярность TTL (ClickHouse удаляет партиции, где ВСЕ строки истекли).
 --
---   Skip indices:
---     bloom_filter on pid  — fast point lookups ("show me PID 12345 history")
---       without scanning entire partitions. Works because pid is not the first
---       key column, so without the index ClickHouse would scan all granules
---       within a (hostname, event_type, rule) prefix.
+--   Skip-индексы:
+--     bloom_filter на pid — быстрые точечные запросы ("покажи историю PID 12345")
+--       без сканирования всех партиций. Работает потому что pid не является первой
+--       колонкой ключа, и без индекса ClickHouse сканировал бы все гранулы
+--       в пределах префикса (hostname, event_type, rule).
 
 CREATE TABLE IF NOT EXISTS process_metrics (
-    -- ── identification ──────────────────────────────────────────────
+    -- ── идентификация ─────────────────────────────────────────────
     timestamp              DateTime64(3)               CODEC(Delta, ZSTD(1)),
     hostname               LowCardinality(String)      CODEC(ZSTD(1)),
     event_type             LowCardinality(String)      CODEC(ZSTD(1)),
@@ -47,7 +48,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     ppid                   UInt32                      CODEC(T64, ZSTD(1)),
     uid                    UInt32                      CODEC(T64, ZSTD(1)),
 
-    -- ── process metadata ────────────────────────────────────────────
+    -- ── метаданные процесса ───────────────────────────────────────
     comm                   LowCardinality(String)      CODEC(ZSTD(1)),
     exec                   String                      CODEC(ZSTD(1)),
     args                   String                      CODEC(ZSTD(1)),
@@ -56,11 +57,11 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     state                  LowCardinality(String)      CODEC(ZSTD(1)),
     exit_code              UInt32                      CODEC(T64, ZSTD(1)),
 
-    -- ── CPU ─────────────────────────────────────────────────────────
+    -- ── CPU ───────────────────────────────────────────────────────
     cpu_ns                 UInt64                      CODEC(Delta, ZSTD(1)),
     cpu_usage_ratio        Float64                     CODEC(Gorilla, ZSTD(1)),
 
-    -- ── memory ──────────────────────────────────────────────────────
+    -- ── память ────────────────────────────────────────────────────
     rss_bytes              UInt64                      CODEC(Delta, ZSTD(1)),
     rss_min_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
     rss_max_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
@@ -68,44 +69,44 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     swap_bytes             UInt64                      CODEC(Delta, ZSTD(1)),
     vsize_bytes            UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── disk I/O (monotonic counters) ───────────────────────────────
+    -- ── дисковый ввод-вывод (монотонные счётчики) ─────────────────
     io_read_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
     io_write_bytes         UInt64                      CODEC(Delta, ZSTD(1)),
     maj_flt                UInt64                      CODEC(Delta, ZSTD(1)),
     min_flt                UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── scheduler (monotonic counters) ──────────────────────────────
+    -- ── планировщик (монотонные счётчики) ─────────────────────────
     nvcsw                  UInt64                      CODEC(Delta, ZSTD(1)),
     nivcsw                 UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── misc ────────────────────────────────────────────────────────
+    -- ── прочее ────────────────────────────────────────────────────
     threads                UInt32                      CODEC(T64, ZSTD(1)),
     oom_score_adj          Int16                       CODEC(T64, ZSTD(1)),
     oom_killed             UInt8                       CODEC(T64, ZSTD(1)),
 
-    -- ── network (monotonic counters) ────────────────────────────────
+    -- ── сеть (монотонные счётчики) ────────────────────────────────
     net_tx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
     net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── timing ──────────────────────────────────────────────────────
+    -- ── временны́е метки ───────────────────────────────────────────
     start_time_ns          UInt64                      CODEC(Delta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
 
-    -- ── cgroup v2 metrics (filled on snapshot, -1 = not available) ──
+    -- ── метрики cgroup v2 (заполняются в snapshot, -1 = недоступно) ─
     cgroup_memory_max      Int64                       CODEC(T64, ZSTD(1)),
     cgroup_memory_current  Int64                       CODEC(Delta, ZSTD(1)),
     cgroup_swap_current    Int64                       CODEC(Delta, ZSTD(1)),
     cgroup_cpu_weight      Int64                       CODEC(T64, ZSTD(1)),
     cgroup_pids_current    Int64                       CODEC(T64, ZSTD(1)),
 
-    -- ── file tracking (file_close events only, zero for others) ─────
+    -- ── файловый трекинг (только события file_close, для остальных — нули) ─
     file_path              String                      CODEC(ZSTD(1)),
     file_flags             UInt32                      CODEC(T64, ZSTD(1)),
     file_read_bytes        UInt64                      CODEC(Delta, ZSTD(1)),
     file_write_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
     file_open_count        UInt32                      CODEC(T64, ZSTD(1)),
 
-    -- ── network tracking (net_close events only, empty for others) ──
+    -- ── сетевой трекинг (только события net_close, для остальных — пусто) ─
     net_local_addr         String                      CODEC(ZSTD(1)),
     net_remote_addr        String                      CODEC(ZSTD(1)),
     net_local_port         UInt16                      CODEC(T64, ZSTD(1)),
@@ -114,7 +115,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     net_conn_rx_bytes      UInt64                      CODEC(Delta, ZSTD(1)),
     net_duration_ms        UInt64                      CODEC(T64, ZSTD(1)),
 
-    -- ── skip indices ────────────────────────────────────────────────
+    -- ── skip-индексы ──────────────────────────────────────────────
     INDEX idx_pid pid TYPE bloom_filter(0.01) GRANULARITY 4
 )
 ENGINE = MergeTree()
@@ -123,39 +124,42 @@ ORDER BY (hostname, event_type, rule, pid, timestamp)
 TTL timestamp + INTERVAL 30 DAY
 SETTINGS
     index_granularity = 8192,
-    min_bytes_for_wide_part = 10485760,      -- 10 MB: small parts stay compact
-    merge_with_ttl_timeout = 86400;          -- check TTL once per day
+    min_bytes_for_wide_part = 10485760,      -- 10 МБ: маленькие части остаются компактными
+    merge_with_ttl_timeout = 86400;          -- проверка TTL раз в сутки
 
 
 -- ══════════════════════════════════════════════════════════════════════
--- Refreshable Materialized View — auto-pull from process_metrics HTTP
+-- Обновляемое материализованное представление — автоматический pull
+-- из HTTP-сервера process_metrics
 --
--- ClickHouse periodically (every 30 seconds) fetches CSV from the
--- process_metrics HTTP server and inserts rows into process_metrics table.
+-- ClickHouse периодически (каждые 30 секунд) забирает CSV с HTTP-сервера
+-- process_metrics и вставляет строки в таблицу process_metrics.
 --
--- Requirements:
---   - ClickHouse >= 23.12 (REFRESH EVERY support)
---   - process_metrics running with http_server.port on the target host
+-- Требования:
+--   - ClickHouse >= 23.12 (поддержка REFRESH EVERY)
+--   - process_metrics запущен с http_server.port на целевом хосте
 --
--- Usage:
---   1. Create the process_metrics table above
---   2. Create one view per target server (adjust URL)
---   3. ClickHouse will auto-pull metrics; the target clears data after delivery
+-- Использование:
+--   1. Создать таблицу process_metrics (см. выше)
+--   2. Создать по одному view на каждый целевой сервер (изменить URL)
+--   3. ClickHouse будет автоматически забирать метрики; целевой сервер
+--      очищает данные после отдачи
 --
--- IMPORTANT: use APPEND keyword so data accumulates across refreshes.
--- Without APPEND, each refresh REPLACES all data in the target table.
+-- ВАЖНО: используйте ключевое слово APPEND, чтобы данные накапливались
+-- между обновлениями. Без APPEND каждое обновление ЗАМЕНЯЕТ все данные
+-- в целевой таблице.
 --
--- Use &clear=1 parameter so the buffer is cleared after delivery.
--- Without &clear=1, data is returned but NOT cleared (read-only mode).
+-- Используйте параметр &clear=1, чтобы буфер очищался после отдачи.
+-- Без &clear=1 данные возвращаются, но НЕ очищаются (режим только чтения).
 --
--- Explicit column structure is required in url() to prevent ClickHouse
--- from making a probe GET request. With explicit structure, ClickHouse
--- makes only one GET request.
+-- Явная структура колонок обязательна в url(), чтобы ClickHouse не делал
+-- пробный GET-запрос. С явной структурой ClickHouse делает только один
+-- GET-запрос.
 --
--- Timestamp is in ISO 8601 format (YYYY-MM-DD HH:MM:SS.mmm, UTC).
+-- Временна́я метка в формате ISO 8601 (YYYY-MM-DD HH:MM:SS.mmm, UTC).
 -- ══════════════════════════════════════════════════════════════════════
 
--- Example: pull from server1 every 30 seconds
+-- Пример: забирать данные с server1 каждые 30 секунд
 -- CREATE MATERIALIZED VIEW process_metrics_pull_server1
 -- REFRESH EVERY 30 SECOND APPEND
 -- TO process_metrics
@@ -183,8 +187,8 @@ SETTINGS
 -- );
 
 -- ══════════════════════════════════════════════════════════════════════
--- Alternative: one-shot import (no materialized view)
--- IMPORTANT: must include explicit structure to avoid double GET
+-- Альтернатива: разовый импорт (без материализованного представления)
+-- ВАЖНО: необходимо указать явную структуру, чтобы избежать двойного GET
 -- ══════════════════════════════════════════════════════════════════════
 
 -- INSERT INTO process_metrics
