@@ -605,15 +605,15 @@ static __always_inline int prefix_match(const char *path,
 	if (len <= 0 || len > PREFIX_CMP_MAX)
 		len = PREFIX_CMP_MAX;
 
+	/* Copy prefix to stack so the 5.15 verifier only checks
+	 * stack accesses in the loop (no map value pointer tracking). */
+	char pfx[PREFIX_CMP_MAX];
+	__builtin_memcpy(pfx, prefix, PREFIX_CMP_MAX);
+
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
 		if (j >= len)
 			return 1;
-		/* Mask idx to 0..31 so the verifier proves access is in-bounds
-		 * (offset <= 1+31 = 32, well within value_size=128).
-		 * asm volatile prevents clang from optimizing the mask away. */
-		int idx = j & 31;
-		asm volatile("" : "+r"(idx));
-		if (path[idx] != prefix[idx])
+		if (path[j] != pfx[j])
 			return 0;
 	}
 	return 1;
