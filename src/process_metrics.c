@@ -28,11 +28,26 @@
 #include <libconfig.h>
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <bpf/libbpf_version.h>
 #include <linux/types.h>
 #include "process_metrics_common.h"
 #include "process_metrics.skel.h"
 #include "event_file.h"
 #include "http_server.h"
+
+/*
+ * bpf_program__set_autoload  — libbpf >= 0.6 (skips load + attach)
+ * bpf_program__set_autoattach — libbpf >= 0.8 (loads but skips attach)
+ *
+ * For disabling optional programs we need set_autoload (don't even
+ * send to verifier).  Astra Linux ships libbpf 0.7 which has
+ * set_autoload but not set_autoattach.
+ */
+#if LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 8
+#define BPF_PROG_DISABLE(prog) bpf_program__set_autoattach((prog), false)
+#else
+#define BPF_PROG_DISABLE(prog) bpf_program__set_autoload((prog), false)
+#endif
 
 /* ── configuration ────────────────────────────────────────────────── */
 
@@ -1829,35 +1844,35 @@ int main(int argc, char *argv[])
 	/* Conditionally disable network tracking programs */
 	if (!cfg_net_tracking_enabled) {
 		/* Connection lifecycle: connect/accept/close */
-		bpf_program__set_autoattach(skel->progs.kp_tcp_v4_connect, false);
-		bpf_program__set_autoattach(skel->progs.krp_tcp_v4_connect, false);
-		bpf_program__set_autoattach(skel->progs.kp_tcp_v6_connect, false);
-		bpf_program__set_autoattach(skel->progs.krp_tcp_v6_connect, false);
-		bpf_program__set_autoattach(skel->progs.krp_inet_csk_accept, false);
-		bpf_program__set_autoattach(skel->progs.kp_tcp_close, false);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
+		BPF_PROG_DISABLE(skel->progs.krp_tcp_v4_connect);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_v6_connect);
+		BPF_PROG_DISABLE(skel->progs.krp_tcp_v6_connect);
+		BPF_PROG_DISABLE(skel->progs.krp_inet_csk_accept);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
 	}
 	if (!cfg_net_tracking_enabled || !cfg_net_track_bytes) {
 		/* Per-connection byte counting (kprobe enter + kretprobe) */
-		bpf_program__set_autoattach(skel->progs.kp_tcp_sendmsg, false);
-		bpf_program__set_autoattach(skel->progs.kp_tcp_recvmsg, false);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_sendmsg);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_recvmsg);
 	}
 	if (!cfg_net_tracking_enabled) {
 		/* Per-process aggregate byte counting (TCP + UDP kretprobes) */
-		bpf_program__set_autoattach(skel->progs.ret_tcp_sendmsg, false);
-		bpf_program__set_autoattach(skel->progs.ret_tcp_recvmsg, false);
-		bpf_program__set_autoattach(skel->progs.ret_udp_sendmsg, false);
-		bpf_program__set_autoattach(skel->progs.ret_udp_recvmsg, false);
+		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg);
 	}
 
 	/* Conditionally disable file tracking programs */
 	if (!cfg_file_tracking_enabled) {
-		bpf_program__set_autoattach(skel->progs.handle_openat_enter, false);
-		bpf_program__set_autoattach(skel->progs.handle_openat_exit, false);
-		bpf_program__set_autoattach(skel->progs.handle_close_enter, false);
-		bpf_program__set_autoattach(skel->progs.handle_read_enter, false);
-		bpf_program__set_autoattach(skel->progs.handle_read_exit, false);
-		bpf_program__set_autoattach(skel->progs.handle_write_enter, false);
-		bpf_program__set_autoattach(skel->progs.handle_write_exit, false);
+		BPF_PROG_DISABLE(skel->progs.handle_openat_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_openat_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_close_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_read_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_read_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_write_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_write_exit);
 	}
 
 	/* Load BPF programs */
