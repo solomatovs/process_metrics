@@ -166,7 +166,7 @@ TO process_metrics
 AS
 SELECT *
 FROM url(
-    'http://server1:9091/metrics?format=csv&clear=1',
+    'http://server1:10003/metrics?format=csv&clear=1',
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
@@ -193,7 +193,7 @@ FROM url(
 
 INSERT INTO process_metrics
 SELECT * FROM url(
-    'http://server1:9091/metrics?format=csv&clear=1',
+    'http://server1:10003/metrics?format=csv&clear=1',
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
