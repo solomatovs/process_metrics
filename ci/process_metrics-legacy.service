@@ -16,7 +16,7 @@
 # Установка:
 #   sudo useradd -r -s /usr/sbin/nologin process_metrics
 #   sudo mkdir -p /app/process_metrics
-#   sudo chown process_metrics:process_metrics /app/process_metrics
+#   sudo chown nginx:nginx /app/process_metrics
 #   sudo cp build/process_metrics /app/process_metrics/
 #   sudo mkdir -p /app/process_metrics
 #   sudo cp examples/process_metrics.conf /app/process_metrics/
@@ -33,7 +33,7 @@
 #   CAP_DAC_READ_SEARCH — чтение /sys/fs/cgroup/*, /proc/*/cgroup, tracefs
 
 [Unit]
-Description=Process Metrics Collector (eBPF)
+Description=Process Metrics Collector
 Documentation=file:/app/process_metrics/process_metrics.conf
 After=network.target
 StartLimitIntervalSec=60
@@ -43,8 +43,8 @@ StartLimitBurst=5
 Type=simple
 
 # --- Непривилегированный пользователь ---
-User=process_metrics
-Group=process_metrics
+User=nginx
+Group=nginx
 
 # --- Capabilities ---
 # CAP_SYS_ADMIN — необходим для bpf() и perf_event_open() на ядрах, где
@@ -85,7 +85,8 @@ ExecStart=/app/process_metrics/process_metrics -c /app/process_metrics/process_m
 # --- Перезагрузка конфига по SIGHUP ---
 ExecReload=/bin/kill -HUP $MAINPID
 
-# --- Рестарт при падении ---
+# --- Остановка и рестарт ---
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=5
 
