@@ -1,39 +1,106 @@
-# process_metrics — event-driven BPF process metrics collector
+# process_metrics
 
-Мониторит жизненный цикл процессов (exec/fork/exit) через eBPF tracepoints и экспортирует метрики через встроенный HTTP-сервер в формате Prometheus и/или CSV. Отслеживает только процессы, подходящие под пользовательские regex-правила, а также всех их потомков.
+Мониторинг процессов через eBPF. Отслеживает жизненный цикл (exec/fork/exit), сетевые соединения (TCP connect/accept/close), файловые операции (open/close/read/write) и экспортирует метрики через встроенный HTTP-сервер в формате Prometheus и CSV.
 
-**Архитектура pull:** process_metrics накапливает события в файл и отдаёт их по HTTP. Внешний коллектор (ClickHouse, Vector, curl, Prometheus) периодически забирает данные.
+Работает по pull-модели: накапливает события в файл, отдаёт по HTTP. Внешний коллектор (ClickHouse, Prometheus, Vector) периодически забирает данные.
+
+## Требования
+
+- Ядро Linux >= 5.15 с `CONFIG_DEBUG_INFO_BTF=y`
+- clang >= 10 (BPF CO-RE + компиляция userspace)
+- gcc (только для сборки vendored bpftool)
+- libbpf-dev, libelf-dev, zlib1g-dev, libconfig-dev
+
+Проверено на:
+- Astra Linux CE 2.12 (ядро 5.15, clang-10, libbpf 0.7)
+- Debian 12 (ядро 6.1, clang-16, libbpf 1.1)
 
 ## Сборка
 
 ```bash
-# 1. Установка зависимостей
-make deps          # автоопределение apt/yum
-make deps-apt      # Astra Linux / Debian / Ubuntu
-make deps-yum      # RHEL / CentOS / Rocky
+# Установка зависимостей (автоопределение apt/yum)
+make deps
 
-# 2. Сборка (bpftool из vendored-исходников + process_metrics)
+# Полная сборка: vmlinux.h + bpftool + BPF + статический бинарник
 make all
-make all CLANG=clang-15   # если clang установлен с суффиксом версии
+
+# Или с явным указанием clang
+make all CLANG=clang-15
 ```
 
-Требуется: clang >= 10 (BPF CO-RE), libconfig.
+### Цели сборки
+
+| Цель | Описание |
+|------|----------|
+| `make all` | Полная сборка (vmlinux + bpftool + bpf + binary) |
+| `make vmlinux` | Регенерация vmlinux.h из BTF текущего ядра |
+| `make bpftool` | Сборка bpftool из vendored-исходников |
+| `make bpf` | Компиляция BPF-объекта + генерация skeleton |
+| `make binary` | Компиляция userspace-бинарника (требует skeleton) |
+| `make clean` | Удаление артефактов сборки |
+| `make deps` | Установка зависимостей (автоопределение apt/yum) |
+| `make test` | Запуск unit-тестов |
+
+### Компиляторы
+
+| Что | Компилятор | Почему |
+|-----|-----------|--------|
+| BPF-код (`*.bpf.c`) | clang (`-target bpf`) | Единственный компилятор с backend для BPF-байткода |
+| Userspace (`*.c`) | clang (`-static`) | Статический бинарник, переносимый между дистрибутивами |
+| bpftool (vendored) | gcc | Внутренний Makefile bpftool требует gcc |
+
+### Цепочка сборки
+
+```
+vmlinux.h ← bpftool btf dump /sys/kernel/btf/vmlinux
+    ↓
+process_metrics.bpf.c → clang -target bpf → .bpf.o
+    ↓
+bpftool gen skeleton → .skel.h (встроенный ELF ~500KB)
+    ↓
+process_metrics.c → clang -static → build/process_metrics
+```
+
+## Установка
+
+```bash
+# Бинарник
+sudo cp build/process_metrics /usr/local/bin/
+
+# Конфиг
+sudo mkdir -p /etc/process_metrics
+sudo cp examples/process_metrics.conf /etc/process_metrics/
+
+# sysctl для BPF
+sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
+sudo sysctl --system
+
+# systemd
+sudo cp ci/process_metrics.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now process_metrics
+```
 
 ## Запуск
 
 ```bash
-./build/process_metrics -c process_metrics.conf
-```
+# Через systemd (рекомендуется)
+sudo systemctl start process_metrics
+sudo systemctl status process_metrics
+journalctl -u process_metrics -f
 
-Единственный аргумент — путь к конфигурационному файлу. Все остальные параметры задаются в конфиге.
+# Вручную (для отладки)
+sudo ./build/process_metrics -c process_metrics.conf
+
+# Перезагрузка правил без перезапуска
+sudo systemctl reload process_metrics   # или kill -HUP <pid>
+```
 
 ## Конфигурация
 
-Вся конфигурация — в одном файле формата libconfig. Полный пример: [examples/process_metrics.conf](examples/process_metrics.conf).
+Один файл формата libconfig. Полный пример: [examples/process_metrics.conf](examples/process_metrics.conf).
 
 ```conf
-# process_metrics.conf — минимальный пример
-
 snapshot_interval = 3;
 metric_prefix = "process_metrics";
 
@@ -72,7 +139,7 @@ http_server = {
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
-| `hostname` | `gethostname()` | Идентификатор сервера (используется в prom-лейблах и CSV) |
+| `hostname` | `gethostname()` | Идентификатор сервера |
 | `snapshot_interval` | `30` | Интервал записи метрик (секунды) |
 | `metric_prefix` | `process_metrics` | Префикс метрик |
 | `cmdline_max_len` | `500` | Макс. длина args в выводе |
@@ -84,70 +151,47 @@ http_server = {
 
 Список объектов `{ name, regex }`. Regex применяется к полной командной строке процесса. При совпадении процесс и все его потомки отслеживаются. Первое совпадение побеждает.
 
-Перезагрузка правил без перезапуска:
-
-```bash
-kill -HUP <pid>
-# или
-systemctl reload process_metrics
-```
-
 ### Коллекторы
 
-| Коллектор | Описание | Overhead |
-|-----------|----------|----------|
-| `cgroup_metrics` | memory.max, memory.current, cpu.weight, pids.current из cgroup v2 | Минимальный |
-| `net_tracking` | TCP connect/accept/close через kprobes. Генерирует `net_close` события с IP/портами | Низкий |
-| `file_tracking` | open/close/read/write через eBPF tracepoints. Генерирует `file_close` события | ~3-4% CPU |
+| Коллектор | Описание |
+|-----------|----------|
+| `cgroup_metrics` | memory.max, memory.current, cpu.weight, pids.current из cgroup v2 |
+| `net_tracking` | TCP connect/accept/close через kprobes. События `net_close` с IP/портами |
+| `file_tracking` | open/close/read/write через tracepoints. События `file_close` с путями |
 
-`net_tracking` и `file_tracking` — объекты с полями `enabled` и `track_bytes`. `track_bytes = true` добавляет учёт байт на каждый сокет/файл (повышает overhead).
+`net_tracking` и `file_tracking` — объекты с полями `enabled` и `track_bytes`. `track_bytes = true` добавляет учёт байт (повышает нагрузку).
 
-`file_tracking` дополнительно поддерживает `include` и `exclude` — списки префиксов путей для фильтрации. Без `include` отслеживаются все пути (кроме `exclude`).
+`file_tracking` поддерживает `include` и `exclude` — списки префиксов путей. Без `include` отслеживаются все пути (кроме `exclude`).
 
-### HTTP-сервер (секция `http_server`)
+## HTTP-сервер
 
-Если секция `http_server` определена с `port` — запускается встроенный HTTP-сервер в отдельном потоке.
+Если определена секция `http_server` с `port`, запускается встроенный HTTP-сервер.
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
-| `port` | `9091` | Порт HTTP-сервера |
+| `port` | `9091` | Порт |
 | `bind` | `0.0.0.0` | Адрес привязки |
 | `data_file` | `/tmp/process_metrics_events.dat` | Файл накопления событий |
 
-#### Эндпоинты
+### Эндпоинты
 
-**`GET /metrics?format=csv`** (или `GET /metrics`)
-- Возвращает все накопленные события в формате CSV с заголовком
-- Буфер **не очищается** — read-only снапшот текущих данных
-- Подходит для отладки и ручного анализа
+| URL | Описание |
+|-----|----------|
+| `GET /metrics?format=csv` | CSV-снапшот (буфер НЕ очищается) |
+| `GET /metrics?format=csv&clear=1` | CSV + очистка буфера (для ClickHouse) |
+| `GET /metrics?format=prom` | Prometheus text exposition |
 
-**`GET /metrics?format=csv&clear=1`**
-- Возвращает все накопленные события в формате CSV с заголовком
-- После успешной отдачи буфер **очищается**
-- Двухфазная доставка: `swap → send → commit`
-- При ошибке доставки (разрыв соединения) данные сохраняются в `.pending` файле и будут отданы при следующем запросе
-- **Используйте этот URL для ClickHouse Materialized View**
-
-**`GET /metrics?format=prom`**
-- Возвращает текущий снапшот Prometheus-метрик
-- Данные **не очищаются** — файл перезаписывается каждые `snapshot_interval` секунд
-- Формат: Prometheus text exposition (совместим с Prometheus, VictoriaMetrics)
-
-#### Согласованность данных
-
-Запись снапшота (десятки `ef_append()` вызовов) защищена batch-мьютексом: `ef_batch_lock()` блокирует `ef_swap_fd()`/`ef_snapshot_fd()` до завершения всей серии записей. Это гарантирует, что HTTP-запрос с `clear=1` не разрежет снапшот пополам.
+Запрос с `clear=1` использует двухфазную доставку: `swap → send → commit`. При разрыве соединения данные сохраняются в `.pending` файле.
 
 ## Интеграция с ClickHouse
 
-ClickHouse может самостоятельно забирать данные с целевых серверов через Refreshable Materialized View:
+ClickHouse забирает данные через Refreshable Materialized View:
 
 ```sql
 -- 1. Создать таблицу
 clickhouse-client < examples/clickhouse_schema.sql
 
--- 2. Создать view для автоматического сбора (по одному на сервер)
--- ВАЖНО: APPEND — данные накапливаются, а не перезаписываются
--- ВАЖНО: &clear=1 — очищает буфер после успешной доставки
+-- 2. Создать view для автоматического сбора
 CREATE MATERIALIZED VIEW process_metrics_pull_server1
 REFRESH EVERY 30 SECOND APPEND
 TO process_metrics
@@ -155,7 +199,6 @@ AS
 SELECT * FROM url(
     'http://server1:9091/metrics?format=csv&clear=1',
     'CSVWithNames',
-    -- явная схема колонок (без неё ClickHouse делает GET-пробу):
     'timestamp DateTime64(9),
      hostname String,
      event_type String,
@@ -212,39 +255,24 @@ SELECT * FROM url(
 );
 ```
 
-Требуется ClickHouse >= 23.12. Полная схема с кодеками и индексами — в [examples/clickhouse_schema.sql](examples/clickhouse_schema.sql).
+Требуется ClickHouse >= 23.12. Полная схема с кодеками — в [examples/clickhouse_schema.sql](examples/clickhouse_schema.sql).
 
-### Оптимизация хранения
+### Типы событий
 
-**ORDER BY** `(hostname, event_type, rule, pid, timestamp)`:
-- `event_type` на втором месте — почти каждый запрос фильтрует по типу события
-- `pid` перед `timestamp` — история одного процесса читается последовательно
-
-**Кодеки (per-column)**:
-| Кодек | Где применяется | Почему |
-|-------|----------------|--------|
-| `Delta + ZSTD` | timestamp, счётчики (cpu_ns, io_*, net_*, faults, ctxsw), rss/vsize/shmem/swap | Монотонно растущие значения → малые дельты → высокая компрессия |
-| `Gorilla + ZSTD` | cpu_usage_ratio | IEEE 754 XOR-кодирование для float: соседние значения близки |
-| `T64 + ZSTD` | PID-ы, threads, exit_code, oom_*, is_root, cgroup лимиты, uptime | Целые числа, не использующие полный диапазон UInt64 |
-| `ZSTD(1)` | строки (hostname, rule, comm, exec, args, cgroup) | Уровень 1: ~95% сжатия при ~10x быстрее чем ZSTD(3) |
-| `LowCardinality` | hostname, event_type, rule, comm, cgroup, state | Словарная кодировка: строки → integer indices |
-
-### Типы event_type
-
-| event_type | Когда записывается | Описание |
-|------------|-------------------|----------|
-| `snapshot` | Каждые `snapshot_interval` секунд | Снимок всех живых отслеживаемых процессов |
-| `exec` | При exec() совпадающего процесса | Новый процесс подходит под правило |
-| `fork` | При fork() от отслеживаемого | Порождение потомка |
-| `exit` | При завершении процесса | Содержит финальные метрики (cpu, rss_max, exit_code) |
-| `oom_kill` | При OOM kill | Процесс убит OOM killer |
-| `net_close` | При закрытии TCP-соединения | IP-адреса, порты, длительность, байты (если track_bytes) |
-| `file_close` | При закрытии файла | Путь, флаги, read/write bytes, open_count |
+| event_type | Когда | Описание |
+|------------|-------|----------|
+| `snapshot` | Каждые N секунд | Снимок всех живых отслеживаемых процессов |
+| `exec` | exec() | Новый процесс подходит под правило |
+| `fork` | fork() | Потомок отслеживаемого процесса |
+| `exit` | Завершение | Финальные метрики (cpu, rss_max, exit_code) |
+| `oom_kill` | OOM | Процесс убит OOM killer |
+| `net_close` | Закрытие TCP | IP-адреса, порты, длительность, байты |
+| `file_close` | Закрытие файла | Путь, флаги, read/write bytes |
 
 ### Примеры запросов
 
 ```sql
--- Текущее состояние процессов (последний снимок)
+-- Текущее состояние процессов
 SELECT pid, comm, exec, rule,
        rss_bytes / 1048576 AS rss_mb,
        cpu_usage_ratio
@@ -253,7 +281,7 @@ WHERE event_type = 'snapshot'
   AND timestamp > now() - INTERVAL 1 MINUTE
 ORDER BY rss_bytes DESC;
 
--- Все exit-события за последний час
+-- Завершившиеся процессы за час
 SELECT timestamp, hostname, pid, comm, exec, args, rule,
        exit_code, cpu_ns / 1e9 AS cpu_sec,
        rss_max_bytes / 1048576 AS rss_max_mb
@@ -262,7 +290,7 @@ WHERE event_type = 'exit'
   AND timestamp > now() - INTERVAL 1 HOUR
 ORDER BY timestamp DESC;
 
--- Топ-10 файлов по записи за последний час
+-- Топ-10 файлов по записи
 SELECT file_path,
        sum(file_write_bytes) AS total_write,
        count() AS close_count
@@ -287,136 +315,65 @@ ORDER BY timestamp DESC;
 
 | Capability | Назначение |
 |---|---|
-| `CAP_BPF` | Загрузка BPF-программ (kernel 5.8+) |
+| `CAP_BPF` | Загрузка BPF-программ (ядро 5.8+) |
 | `CAP_PERFMON` | Подключение к tracepoints и kprobes |
-| `CAP_SYS_PTRACE` | Чтение /proc/PID/* процессов других пользователей |
-| `CAP_KILL` | kill(pid, 0) для проверки liveness чужих процессов |
+| `CAP_SYS_PTRACE` | Чтение /proc/PID/* чужих процессов |
+| `CAP_KILL` | kill(pid, 0) для проверки liveness |
 | `CAP_DAC_READ_SEARCH` | Чтение /sys/fs/cgroup/* и /proc/*/cgroup |
 
 ### Требования к ядру
 
 - `CONFIG_BPF_SYSCALL=y`
 - `CONFIG_BPF_EVENTS=y`
-- BTF: `/sys/kernel/btf/vmlinux` (для CO-RE)
-- `kernel.perf_event_paranoid <= 2` (Debian default=3)
-- `kernel.unprivileged_bpf_disabled <= 1` (Debian default=2)
+- `CONFIG_DEBUG_INFO_BTF=y` (для CO-RE)
+- `kernel.perf_event_paranoid <= 2`
+- `kernel.unprivileged_bpf_disabled <= 1`
 
 ```bash
-# Настройка sysctl (или скопируйте ci/99-process-metrics.conf)
 sudo sysctl -w kernel.perf_event_paranoid=2
 sudo sysctl -w kernel.unprivileged_bpf_disabled=1
 ```
 
-### Установка
-
-```bash
-# 1. Создать пользователя
-sudo useradd -r -s /usr/sbin/nologin process_metrics
-sudo mkdir -p /var/lib/process_metrics
-sudo chown process_metrics:process_metrics /var/lib/process_metrics
-
-# 2. Установить бинарник и конфиг
-sudo cp build/process_metrics /usr/local/bin/
-sudo mkdir -p /etc/process_metrics
-sudo cp examples/process_metrics.conf /etc/process_metrics/
-
-# 3. Установить sysctl и systemd unit
-sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
-sudo sysctl --system
-sudo cp ci/process_metrics.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now process_metrics
-```
-
-### Варианты запуска
-
-**systemd unit (рекомендуется)**
-```bash
-sudo systemctl start process_metrics
-sudo systemctl status process_metrics
-journalctl -u process_metrics -f
-```
-
-**От root (для отладки)**
-```bash
-sudo ./build/process_metrics -c process_metrics.conf
-```
-
 ## Метрики (Prometheus)
 
-Отдаются через встроенный HTTP-сервер (`GET /metrics?format=prom`). Снапшот обновляется каждые `snapshot_interval` секунд. Все метрики используют префикс из `metric_prefix` (по умолчанию `process_metrics`).
+Отдаются через `GET /metrics?format=prom`. Обновляются каждые `snapshot_interval` секунд.
 
-Лейблы `hostname`, `rule`, `root_pid`, `pid` присутствуют на всех per-process метриках. Метрика `_info` дополнительно содержит `comm`, `exec`, `args`, `cgroup`.
+Лейблы: `hostname`, `rule`, `root_pid`, `pid`. Метрика `_info` дополнительно содержит `comm`, `exec`, `args`, `cgroup`.
 
-### Per-process (живые процессы)
-
-#### Информационные
+### Per-process
 
 | Метрика | Тип | Описание |
 |---------|-----|----------|
-| `{prefix}_info` | gauge | Информационная метрика (всегда 1). Несёт метаданные в лейблах |
-| `{prefix}_start_time_seconds` | gauge | Время запуска процесса (unix epoch) |
-| `{prefix}_uptime_seconds` | gauge | Время работы процесса в секундах |
-| `{prefix}_is_root` | gauge | 1 — корневой процесс, 0 — потомок |
-
-#### CPU
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_cpu_seconds_total` | counter | Суммарное CPU-время (user + system) |
-| `{prefix}_cpu_usage_ratio` | gauge | Утилизация CPU за последний интервал (1.0 = 1 ядро) |
-
-#### Память
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_rss_bytes` | gauge | Текущий RSS в байтах |
-| `{prefix}_rss_min_bytes` | gauge | Минимальный RSS за время жизни |
-| `{prefix}_rss_max_bytes` | gauge | Максимальный RSS за время жизни |
-| `{prefix}_vsize_bytes` | gauge | Виртуальная память в байтах |
-| `{prefix}_shmem_bytes` | gauge | Shared memory в байтах |
-| `{prefix}_swap_bytes` | gauge | Swap usage в байтах |
-
-#### Дисковый I/O
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_io_read_bytes_total` | counter | Фактически прочитано с диска |
-| `{prefix}_io_write_bytes_total` | counter | Фактически записано на диск |
+| `{prefix}_info` | gauge | Метаданные в лейблах (всегда 1) |
+| `{prefix}_start_time_seconds` | gauge | Время запуска (unix epoch) |
+| `{prefix}_uptime_seconds` | gauge | Время работы |
+| `{prefix}_cpu_seconds_total` | counter | CPU-время (user + system) |
+| `{prefix}_cpu_usage_ratio` | gauge | Утилизация CPU (1.0 = 1 ядро) |
+| `{prefix}_rss_bytes` | gauge | Текущий RSS |
+| `{prefix}_rss_min_bytes` | gauge | Минимальный RSS |
+| `{prefix}_rss_max_bytes` | gauge | Максимальный RSS |
+| `{prefix}_vsize_bytes` | gauge | Виртуальная память |
+| `{prefix}_shmem_bytes` | gauge | Shared memory |
+| `{prefix}_swap_bytes` | gauge | Swap |
+| `{prefix}_io_read_bytes_total` | counter | Прочитано с диска |
+| `{prefix}_io_write_bytes_total` | counter | Записано на диск |
 | `{prefix}_major_page_faults_total` | counter | Major page faults |
 | `{prefix}_minor_page_faults_total` | counter | Minor page faults |
-
-#### Планировщик
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
 | `{prefix}_voluntary_ctxsw_total` | counter | Добровольные переключения контекста |
 | `{prefix}_involuntary_ctxsw_total` | counter | Принудительные переключения контекста |
-
-#### Сеть
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_net_tx_bytes_total` | counter | TCP+UDP байт отправлено |
-| `{prefix}_net_rx_bytes_total` | counter | TCP+UDP байт получено |
-
-#### Прочие
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_threads` | gauge | Количество потоков |
+| `{prefix}_net_tx_bytes_total` | counter | TCP+UDP отправлено |
+| `{prefix}_net_rx_bytes_total` | counter | TCP+UDP получено |
+| `{prefix}_threads` | gauge | Потоки |
 | `{prefix}_oom_score_adj` | gauge | OOM score adjustment |
-| `{prefix}_oom_kill` | gauge | 1 если убит OOM killer |
-| `{prefix}_state` | gauge | Состояние процесса (R/S/D/T/Z) |
+| `{prefix}_state` | gauge | Состояние (R/S/D/T/Z) |
 
-### Exited (недавно завершившиеся)
+### Завершившиеся процессы
 
 | Метрика | Тип | Описание |
 |---------|-----|----------|
 | `{prefix}_exited_exit_code` | gauge | Код завершения |
-| `{prefix}_exited_signal` | gauge | Сигнал (0 = нормальное завершение) |
-| `{prefix}_exited_oom_kill` | gauge | 1 если OOM kill |
-| `{prefix}_exited_cpu_seconds_total` | gauge | CPU-время завершившегося процесса |
+| `{prefix}_exited_signal` | gauge | Сигнал |
+| `{prefix}_exited_cpu_seconds_total` | gauge | CPU-время |
 | `{prefix}_exited_rss_max_bytes` | gauge | Максимальный RSS |
 | `{prefix}_exited_net_tx_bytes_total` | gauge | Сетевой TX |
 | `{prefix}_exited_net_rx_bytes_total` | gauge | Сетевой RX |
@@ -431,33 +388,25 @@ sudo ./build/process_metrics -c process_metrics.conf
 | `{prefix}_cgroup_cpu_weight` | gauge | cpu.weight |
 | `{prefix}_cgroup_pids_current` | gauge | pids.current |
 
-## Регенерация vmlinux.h
-
-```bash
-make vmlinux
-```
-
 ## Структура проекта
 
 ```
-examples/
-  process_metrics.conf           — пример конфига (libconfig)
-  clickhouse_schema.sql          — DDL таблицы + materialized view для pull
-ci/
-  process_metrics.service        — systemd unit
-  99-process-metrics.conf        — sysctl для BPF capabilities
 src/
-  process_metrics.bpf.c          — BPF-программа (tracepoints, kprobes)
-  process_metrics.c              — userspace: загрузчик, конфиг, снапшоты
-  process_metrics_common.h       — общие типы (BPF ↔ userspace)
-  event_file.h                   — API файлового буфера событий + struct metric_event
-  event_file.c                   — двухфазная доставка (swap/commit), batch lock
-  http_server.h                  — API встроенного HTTP-сервера
-  http_server.c                  — HTTP/1.1 сервер (CSV read-only, CSV clear, Prometheus)
-  vmlinux.h                      — типы ядра (CO-RE)
-  bpftool/                       — vendored bpftool
-build/                           — артефакты сборки
-Makefile                         — сборка, установка зависимостей
+  process_metrics.bpf.c        — BPF-программа (tracepoints, kprobes)
+  process_metrics.c            — userspace: загрузчик, конфиг, снапшоты
+  process_metrics_common.h     — общие типы (BPF <-> userspace)
+  event_file.c/h               — двухфазная доставка событий (swap/commit)
+  http_server.c/h              — встроенный HTTP/1.1 сервер
+  vmlinux.h                    — типы ядра (CO-RE, генерируется)
+  bpftool/                     — vendored bpftool
+examples/
+  process_metrics.conf         — пример конфигурации
+  clickhouse_schema.sql        — DDL таблицы + materialized view
+ci/
+  process_metrics.service      — systemd unit
+  99-process-metrics.conf      — sysctl для BPF capabilities
+build/                         — артефакты сборки
+Makefile                       — сборка, установка зависимостей
 ```
 
 ## Сигналы
@@ -465,4 +414,4 @@ Makefile                         — сборка, установка завис
 | Сигнал | Действие |
 |--------|----------|
 | `SIGTERM` / `SIGINT` | Корректное завершение |
-| `SIGHUP` | Перезагрузка правил, пересканирование `/proc` |
+| `SIGHUP` | Перезагрузка правил, пересканирование /proc |
