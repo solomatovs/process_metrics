@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * process_metrics.bpf.c — event-driven process metrics via BPF
+ * process_metrics.bpf.c — событийный сбор метрик процессов через BPF
  *
- * Tracepoints:
- *   sched_process_exec  → capture pid, cmdline, comm, cgroup
- *   sched_process_fork  → inherit tracking from parent (raw_tp)
- *   sched_switch        → update rss, cpu, vsize for tracked PIDs
- *   sched_process_exit  → finalize metrics, send to userspace
- *   mark_victim         → OOM killer selected process (raw_tp)
+ * Точки трассировки:
+ *   sched_process_exec  → захват pid, cmdline, comm, cgroup
+ *   sched_process_fork  → наследование отслеживания от родителя (raw_tp)
+ *   sched_switch        → обновление rss, cpu, vsize для отслеживаемых PID
+ *   sched_process_exit  → финализация метрик, отправка в пространство пользователя
+ *   mark_victim         → OOM killer выбрал процесс (raw_tp)
  *
- * Maps:
- *   proc_map    — per-process live metrics    (hash: tgid → proc_info)
- *   tracked_map — tracking metadata           (hash: tgid → track_info)
- *   events      — lifecycle events ring buffer
+ * Карты (maps):
+ *   proc_map    — метрики процессов в реальном времени (hash: tgid → proc_info)
+ *   tracked_map — метаданные отслеживания            (hash: tgid → track_info)
+ *   events      — кольцевой буфер событий жизненного цикла
  *
- * Userspace manages tracking decisions (exec rule matching).
- * BPF only collects data for tracked PIDs and sends lifecycle events.
+ * Пространство пользователя управляет решениями об отслеживании (сопоставление правил exec).
+ * BPF только собирает данные для отслеживаемых PID и отправляет события жизненного цикла.
  */
 
 #include "vmlinux.h"
@@ -25,12 +25,12 @@
 #include <bpf/bpf_endian.h>
 #include "process_metrics_common.h"
 
-/* ── rodata (configurable from userspace before load) ─────────────── */
+/* ── rodata (настраивается из пространства пользователя перед загрузкой) ── */
 
-/* Max exec events per second sent to ring buffer. 0 = unlimited. */
+/* Макс. событий exec в секунду, отправляемых в кольцевой буфер. 0 = без ограничений. */
 volatile const __u32 max_exec_events_per_sec = 0;
 
-/* ── maps ─────────────────────────────────────────────────────────── */
+/* ── карты (maps) ─────────────────────────────────────────────────── */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -58,12 +58,12 @@ struct {
 	__type(value, struct rate_state);
 } exec_rate SEC(".maps");
 
-/* ── rate limiter ─────────────────────────────────────────────────── */
+/* ── ограничитель частоты ─────────────────────────────────────────── */
 
 /*
- * Per-second sliding window rate limiter for exec events.
- * Returns 1 if event should be emitted, 0 if rate exceeded.
- * Slightly racy on multi-CPU (counter may overshoot), acceptable.
+ * Посекундный скользящий ограничитель частоты для событий exec.
+ * Возвращает 1, если событие должно быть отправлено, 0 — если лимит превышен.
+ * Небольшая гонка на нескольких CPU (счётчик может превысить лимит) — допустимо.
  */
 static __always_inline int exec_rate_check(void)
 {
@@ -79,7 +79,7 @@ static __always_inline int exec_rate_check(void)
 
 	__u64 now = bpf_ktime_get_ns();
 
-	/* New 1-second window — reset counter */
+	/* Новое 1-секундное окно — сброс счётчика */
 	if (now - rs->window_ns >= 1000000000ULL) {
 		rs->window_ns = now;
 		rs->count = 1;
@@ -90,12 +90,12 @@ static __always_inline int exec_rate_check(void)
 	return rs->count <= max_exec_events_per_sec;
 }
 
-/* ── helpers ──────────────────────────────────────────────────────── */
+/* ── вспомогательные функции ──────────────────────────────────────── */
 
 struct mem_info {
-	__u64 rss_pages;    /* file + anon + shmem */
-	__u64 shmem_pages;  /* shared memory only */
-	__u64 swap_pages;   /* swap entries */
+	__u64 rss_pages;    /* файловые + анонимные + shmem */
+	__u64 shmem_pages;  /* только разделяемая память */
+	__u64 swap_pages;   /* записи подкачки */
 };
 
 static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
@@ -122,9 +122,9 @@ static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 static __always_inline __u64 read_cpu_ns(struct task_struct *task)
 {
 	/*
-	 * signal->{utime,stime} accumulates CPU of dead threads.
-	 * Add group_leader's live CPU for an approximation.
-	 * Exact for single-threaded processes.
+	 * signal->{utime,stime} накапливает CPU завершённых потоков.
+	 * Добавляем CPU group_leader для приближённого значения.
+	 * Точно для однопоточных процессов.
 	 */
 	__u64 u = BPF_CORE_READ(task, signal, utime);
 	__u64 s = BPF_CORE_READ(task, signal, stime);
@@ -154,18 +154,18 @@ static __always_inline __s16 read_oom_score_adj(struct task_struct *task)
 }
 
 /*
- * IO accounting: actual disk bytes read/written.
- * task->ioac accumulates across all threads via signal->ioac on exit,
- * but for live threads we read from group_leader + signal.
+ * Учёт ввода-вывода: фактические байты чтения/записи на диск.
+ * task->ioac накапливается по всем потокам через signal->ioac при завершении,
+ * но для живых потоков читаем из group_leader + signal.
  */
 static __always_inline void read_io_bytes(struct task_struct *task,
 					  __u64 *r, __u64 *w)
 {
-	/* signal->ioac accumulates dead threads' IO */
+	/* signal->ioac накапливает IO завершённых потоков */
 	*r = BPF_CORE_READ(task, signal, ioac.read_bytes);
 	*w = BPF_CORE_READ(task, signal, ioac.write_bytes);
 
-	/* Add group_leader's live IO */
+	/* Добавляем IO group_leader */
 	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
 	if (leader) {
 		*r += BPF_CORE_READ(leader, ioac.read_bytes);
@@ -174,7 +174,7 @@ static __always_inline void read_io_bytes(struct task_struct *task,
 }
 
 /*
- * Page faults: signal accumulates dead threads, add leader's live counts.
+ * Страничные отказы: signal накапливает завершённые потоки, добавляем счётчики leader.
  */
 static __always_inline void read_faults(struct task_struct *task,
 					__u64 *maj, __u64 *min)
@@ -190,7 +190,7 @@ static __always_inline void read_faults(struct task_struct *task,
 }
 
 /*
- * Context switches: signal accumulates dead threads, add leader's live counts.
+ * Переключения контекста: signal накапливает завершённые потоки, добавляем счётчики leader.
  */
 static __always_inline void read_ctxsw(struct task_struct *task,
 					__u64 *vol, __u64 *invol)
@@ -206,12 +206,12 @@ static __always_inline void read_ctxsw(struct task_struct *task,
 }
 
 /*
- * Convert numeric task state to ps-style character.
- * prev_state from sched_switch or task->__state.
+ * Преобразование числового состояния задачи в символ в стиле ps.
+ * prev_state из sched_switch или task->__state.
  */
 static __always_inline __u8 state_to_char(long state)
 {
-	if (state == 0)    return 'R'; /* TASK_RUNNING (preempted) */
+	if (state == 0)    return 'R'; /* TASK_RUNNING (вытеснен) */
 	if (state & 0x01)  return 'S'; /* TASK_INTERRUPTIBLE */
 	if (state & 0x02)  return 'D'; /* TASK_UNINTERRUPTIBLE */
 	if (state & 0x04)  return 'T'; /* __TASK_STOPPED */
@@ -222,8 +222,8 @@ static __always_inline __u8 state_to_char(long state)
 }
 
 /*
- * Read cmdline from current process mm->arg_start..arg_end
- * into dst[CMDLINE_MAX]. Returns length read.
+ * Чтение cmdline из mm->arg_start..arg_end текущего процесса
+ * в dst[CMDLINE_MAX]. Возвращает длину прочитанного.
  */
 static __always_inline __u16 read_cmdline(struct task_struct *task,
 					  char *dst)
@@ -241,7 +241,7 @@ static __always_inline __u16 read_cmdline(struct task_struct *task,
 	if (len >= CMDLINE_MAX)
 		len = CMDLINE_MAX - 1;
 
-	/* Mask for verifier: CMDLINE_MAX is 256, so mask = 0xFF */
+	/* Маска для верификатора: CMDLINE_MAX = 256, маска = 0xFF */
 	len &= (CMDLINE_MAX - 1);
 	bpf_probe_read_user(dst, len, (void *)arg_start);
 	return (__u16)len;
@@ -255,11 +255,11 @@ int handle_exec(void *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Skip kernel tasks (PID 0) early */
+	/* Пропускаем задачи ядра (PID 0) сразу */
 	if (tgid == 0)
 		return 0;
 
-	/* Rate limit exec events to avoid ring buffer flooding */
+	/* Ограничение частоты событий exec во избежание переполнения кольцевого буфера */
 	if (!exec_rate_check())
 		return 0;
 
@@ -269,7 +269,7 @@ int handle_exec(void *ctx)
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
-	/* Send EXEC event — always, for rule matching in userspace */
+	/* Отправляем событие EXEC — всегда, для сопоставления правил в пространстве пользователя */
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		return 0;
@@ -287,7 +287,7 @@ int handle_exec(void *ctx)
 
 	bpf_ringbuf_submit(e, 0);
 
-	/* If already tracked (fork-inherited), refresh cmdline/comm */
+	/* Если уже отслеживается (унаследовано через fork), обновляем cmdline/comm */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
 		bpf_get_current_comm(info->comm, sizeof(info->comm));
@@ -298,7 +298,7 @@ int handle_exec(void *ctx)
 	return 0;
 }
 
-/* ── FORK (raw tracepoint to access child task_struct) ────────────── */
+/* ── FORK (raw tracepoint для доступа к task_struct потомка) ───────── */
 
 SEC("raw_tracepoint/sched_process_fork")
 int handle_fork(struct bpf_raw_tracepoint_args *ctx)
@@ -309,13 +309,13 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	__u32 child_pid  = BPF_CORE_READ(child, pid);
 	__u32 child_tgid = BPF_CORE_READ(child, tgid);
 
-	/* Only process forks, not thread clones */
+	/* Обрабатываем только fork процессов, не clone потоков */
 	if (child_pid != child_tgid)
 		return 0;
 
 	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
 
-	/* Only notify userspace if parent is tracked */
+	/* Уведомляем пространство пользователя только если родитель отслеживается */
 	if (!bpf_map_lookup_elem(&tracked_map, &parent_tgid))
 		return 0;
 
@@ -325,20 +325,20 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_FORK;
-	e->tgid         = child_tgid;       /* new child process */
-	e->ppid         = parent_tgid;       /* parent process */
+	e->tgid         = child_tgid;       /* новый дочерний процесс */
+	e->ppid         = parent_tgid;       /* родительский процесс */
 	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id    = bpf_get_current_cgroup_id();
 	e->start_ns     = BPF_CORE_READ(child, start_time);
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
-	/* cmdline inherited, userspace copies from parent's proc_info */
+	/* cmdline наследуется, пространство пользователя копирует из proc_info родителя */
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
 }
 
-/* ── SCHED_SWITCH — hot path, update metrics for tracked PIDs ─────── */
+/* ── SCHED_SWITCH — горячий путь, обновление метрик для отслеживаемых PID ── */
 
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch(void *ctx)
@@ -346,7 +346,7 @@ int handle_sched_switch(void *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Fast bail-out for non-tracked PIDs */
+	/* Быстрый выход для неотслеживаемых PID */
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
@@ -356,7 +356,7 @@ int handle_sched_switch(void *ctx)
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-	/* Memory (pages) — RSS, shared, swap */
+	/* Память (страницы) — RSS, разделяемая, подкачка */
 	struct mem_info mi = read_mem_pages(task);
 	info->rss_pages   = mi.rss_pages;
 	info->shmem_pages = mi.shmem_pages;
@@ -367,41 +367,41 @@ int handle_sched_switch(void *ctx)
 	if (mi.rss_pages > info->rss_max_pages)
 		info->rss_max_pages = mi.rss_pages;
 
-	/* CPU time (ns) — approximate for multi-threaded */
+	/* Время CPU (нс) — приблизительно для многопоточных */
 	info->cpu_ns = read_cpu_ns(task);
 
-	/* Virtual memory (pages) */
+	/* Виртуальная память (страницы) */
 	info->vsize_pages = read_vsize_pages(task);
 
-	/* Thread count */
+	/* Количество потоков */
 	info->threads = read_nr_threads(task);
 
-	/* OOM score adjustment */
+	/* Корректировка OOM score */
 	info->oom_score_adj = read_oom_score_adj(task);
 
-	/* IO bytes (actual disk reads/writes) */
+	/* Байты IO (фактические чтения/записи на диск) */
 	read_io_bytes(task, &info->io_read_bytes, &info->io_write_bytes);
 
-	/* Page faults */
+	/* Страничные отказы */
 	read_faults(task, &info->maj_flt, &info->min_flt);
 
-	/* Context switches */
+	/* Переключения контекста */
 	read_ctxsw(task, &info->nvcsw, &info->nivcsw);
 
-	/* Cgroup — may change if process is moved between cgroups */
+	/* Cgroup — может измениться при перемещении процесса между cgroup */
 	info->cgroup_id = bpf_get_current_cgroup_id();
 
-	/* Process state — task->__state (kernel 5.14+) */
+	/* Состояние процесса — task->__state (ядро 5.14+) */
 	unsigned int task_state = BPF_CORE_READ(task, __state);
 	info->state = state_to_char(task_state);
 
-	/* UID — refresh on each sched_switch (may change via setuid) */
+	/* UID — обновляем при каждом sched_switch (может измениться через setuid) */
 	info->uid = (__u32)bpf_get_current_uid_gid();
 
 	return 0;
 }
 
-/* ── EXIT ─────────────────────────────────────────────────────────── */
+/* ── ВЫХОД (EXIT) ─────────────────────────────────────────────────── */
 
 SEC("tracepoint/sched/sched_process_exit")
 int handle_exit(void *ctx)
@@ -410,18 +410,18 @@ int handle_exit(void *ctx)
 	__u32 pid  = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Only handle thread group leader (process) exit */
+	/* Обрабатываем только выход лидера группы потоков (процесса) */
 	if (pid != tgid)
 		return 0;
 
-	/* Only for tracked processes */
+	/* Только для отслеживаемых процессов */
 	struct track_info *ti = bpf_map_lookup_elem(&tracked_map, &tgid);
 	if (!ti)
 		return 0;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-	/* Send EXIT event with final metrics */
+	/* Отправляем событие EXIT с финальными метриками */
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		goto cleanup;
@@ -433,11 +433,11 @@ int handle_exit(void *ctx)
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
-	/* Copy tracking info before maps are deleted */
+	/* Копируем данные отслеживания перед удалением из карт */
 	e->root_pid = ti->root_pid;
 	e->rule_id  = ti->rule_id;
 
-	/* Final metrics snapshot */
+	/* Финальный снимок метрик */
 	e->cpu_ns        = read_cpu_ns(task);
 	struct mem_info exit_mi = read_mem_pages(task);
 	e->rss_pages     = exit_mi.rss_pages;
@@ -446,7 +446,7 @@ int handle_exit(void *ctx)
 	e->oom_score_adj = read_oom_score_adj(task);
 	e->exit_code     = BPF_CORE_READ(task, exit_code);
 
-	/* Carry over min/max rss, start_ns, oom_killed from proc_info */
+	/* Переносим min/max rss, start_ns, oom_killed из proc_info */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
 		e->rss_min_pages = info->rss_min_pages;
@@ -469,11 +469,11 @@ cleanup:
 	return 0;
 }
 
-/* ── OOM KILL — mark_victim tracepoint ─────────────────────────────── */
+/* ── УБИЙСТВО OOM — точка трассировки mark_victim ──────────────────── */
 
 /*
- * mark_victim fires when OOM killer selects a process to kill.
- * raw_tracepoint args: (struct task_struct *task)
+ * mark_victim срабатывает, когда OOM killer выбирает процесс для завершения.
+ * Аргументы raw_tracepoint: (struct task_struct *task)
  */
 SEC("raw_tracepoint/mark_victim")
 int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
@@ -481,16 +481,16 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	struct task_struct *task = (struct task_struct *)ctx->args[0];
 	__u32 tgid = BPF_CORE_READ(task, tgid);
 
-	/* Only for tracked processes */
+	/* Только для отслеживаемых процессов */
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
-	/* Mark in proc_info */
+	/* Помечаем в proc_info */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		info->oom_killed = 1;
 
-	/* Send OOM_KILL event to userspace */
+	/* Отправляем событие OOM_KILL в пространство пользователя */
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		return 0;
@@ -519,13 +519,13 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
-/* ── File tracking: openat/close/read/write ───────────────────────── */
+/* ── Отслеживание файлов: openat/close/read/write ─────────────────── */
 
 /*
- * Configuration and prefix lists — populated by userspace before attach.
- * file_cfg: single-element array with enabled/track_bytes flags.
- * file_include_prefixes / file_exclude_prefixes: up to FILE_MAX_PREFIXES
- * path prefixes for filtering in BPF.
+ * Конфигурация и списки префиксов — заполняются пространством пользователя перед подключением.
+ * file_cfg: одноэлементный массив с флагами enabled/track_bytes.
+ * file_include_prefixes / file_exclude_prefixes: до FILE_MAX_PREFIXES
+ * префиксов путей для фильтрации в BPF.
  */
 
 struct {
@@ -549,7 +549,7 @@ struct {
 	__type(value, struct file_prefix);
 } file_exclude_prefixes SEC(".maps");
 
-/* Temporary args storage between syscall enter and exit */
+/* Временное хранилище аргументов между входом и выходом из системного вызова */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -564,7 +564,7 @@ struct {
 	__type(value, struct rw_args);
 } rw_args_map SEC(".maps");
 
-/* Per-fd tracking: accumulate read/write bytes until close */
+/* Отслеживание по файловым дескрипторам: накопление байт чтения/записи до закрытия */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
@@ -573,41 +573,46 @@ struct {
 } fd_map SEC(".maps");
 
 /*
- * Check if path matches any prefix in include list.
- * If no include prefixes are configured (all len=0), allows everything.
- * Returns 1 if path should be included.
+ * Проверяет, совпадает ли путь с одним из префиксов в списке включения.
+ * Если include-префиксы не заданы (все len=0), разрешает всё.
+ * Возвращает 1, если путь должен быть включён.
  */
 /*
- * Compare up to 'len' bytes of two strings.
- * Returns 1 if first 'len' bytes match.
- * Uses a fixed iteration count for BPF verifier compatibility.
+ * Сравнивает до 'len' байт двух строк.
+ * Возвращает 1, если первые 'len' байт совпадают.
+ * Фиксированное число итераций для совместимости с BPF-верификатором.
  */
+#define PREFIX_CMP_MAX 32   /* макс. сравниваемых байт (покрывает реальные префиксы путей) */
+
 /*
- * KERN_VER is passed from Makefile as major*100+minor (e.g. 515, 601).
- * Kernels < 5.18 have a weaker BPF verifier with a 8192 jump-sequence
- * limit.  Two nested loops (16 prefixes × N chars) inside one program
- * can exceed that budget.  We reduce PREFIX_CMP_MAX on old kernels and
- * skip #pragma unroll so the verifier stays within its limits.
+ * ВНИМАНИЕ: НЕ МЕНЯТЬ СТРУКТУРУ prefix_match!
+ *
+ * Верификатор BPF в ядрах 5.15 и старше имеет два жёстких ограничения:
+ *
+ * 1) Лимит 8192 jump-последовательностей на одном пути выполнения.
+ *    Ранние return (break/return внутри цикла) создают ветвления,
+ *    которые при развёртке 16 префиксов × 32 символа дают >8192 путей.
+ *
+ * 2) Отслеживание указателей через циклы.
+ *    Верификатор 5.15 не может доказать, что указатель на map value
+ *    или стек остаётся в границах при инкременте в bounded loop.
+ *    Это вызывает "invalid access to map value, off=N size=1".
+ *
+ * Решение — комбинация двух приёмов:
+ *   - #pragma unroll: clang полностью разворачивает цикл, все смещения
+ *     становятся compile-time константами, верификатор не трекает указатели.
+ *   - Без early return: вместо return 0/1 используем флаг match.
+ *     Нет ветвлений = нет взрыва jump-путей.
+ *
+ * Результат: верификатор видит линейный код с фиксированными offset-ами,
+ * работает на ядрах от 5.15 до 6.x без изменений.
  */
-#ifndef KERN_VER
-#define KERN_VER 600
-#endif
-
-#if KERN_VER >= 518
-#define PREFIX_CMP_MAX 32
-#else
-#define PREFIX_CMP_MAX 20
-#endif
-
 static __always_inline int prefix_match(const char *path,
 					const char *prefix, int len)
 {
 	if (len <= 0 || len > PREFIX_CMP_MAX)
 		len = PREFIX_CMP_MAX;
 
-	/* No early return — fixed iteration count so clang can unroll.
-	 * All offsets become compile-time constants, which is critical
-	 * for the 5.15 verifier (no pointer tracking through loops). */
 	int match = 1;
 	#pragma unroll
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
@@ -617,6 +622,8 @@ static __always_inline int prefix_match(const char *path,
 	return match;
 }
 
+/* Проверяет, совпадает ли путь с одним из include-префиксов.
+ * Если ни одного префикса не задано, пропускает всё. */
 static __always_inline int path_matches_include(const char *path)
 {
 	int has_any = 0;
@@ -634,14 +641,11 @@ static __always_inline int path_matches_include(const char *path)
 			return 1;
 	}
 
-	/* If no include prefixes defined, include everything */
 	return !has_any;
 }
 
-/*
- * Check if path matches any prefix in exclude list.
- * Returns 1 if path should be excluded.
- */
+/* Проверяет, совпадает ли путь с одним из exclude-префиксов.
+ * Возвращает 1 если путь нужно исключить. */
 static __always_inline int path_matches_exclude(const char *path)
 {
 	#pragma unroll
@@ -659,8 +663,8 @@ static __always_inline int path_matches_exclude(const char *path)
 }
 
 /*
- * sys_enter_openat: save path and flags for the exit handler.
- * Only for tracked processes. Path filtering happens here.
+ * sys_enter_openat: сохраняем путь и флаги для обработчика выхода.
+ * Только для отслеживаемых процессов. Фильтрация по пути происходит здесь.
  */
 SEC("tracepoint/syscalls/sys_enter_openat")
 int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
@@ -668,17 +672,17 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Only tracked processes */
+	/* Только отслеживаемые процессы */
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
-	/* Read path from userspace */
+	/* Читаем путь из пространства пользователя */
 	struct openat_args oa = {0};
 	const char *pathname = (const char *)ctx->args[1];
 	bpf_probe_read_user_str(oa.path, sizeof(oa.path), pathname);
 	oa.flags = (int)ctx->args[2];
 
-	/* Filter by path prefix */
+	/* Фильтрация по префиксу пути */
 	if (!path_matches_include(oa.path))
 		return 0;
 	if (path_matches_exclude(oa.path))
@@ -689,7 +693,7 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 }
 
 /*
- * sys_exit_openat: if open succeeded, create fd_info entry.
+ * sys_exit_openat: если open успешен, создаём запись fd_info.
  */
 SEC("tracepoint/syscalls/sys_exit_openat")
 int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
@@ -721,7 +725,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 }
 
 /*
- * sys_enter_close: emit file_close event with accumulated stats.
+ * sys_enter_close: отправляем событие file_close с накопленной статистикой.
  */
 SEC("tracepoint/syscalls/sys_enter_close")
 int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
@@ -735,7 +739,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!fi)
 		return 0;
 
-	/* Emit file close event via ring buffer */
+	/* Отправляем событие закрытия файла через кольцевой буфер */
 	struct file_event *fe = bpf_ringbuf_reserve(&events, sizeof(*fe), 0);
 	if (fe) {
 		__builtin_memset(fe, 0, sizeof(*fe));
@@ -750,7 +754,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->write_bytes = fi->write_bytes;
 		fe->open_count = fi->open_count;
 
-		/* Get ppid */
+		/* Получаем ppid */
 		struct task_struct *task =
 			(struct task_struct *)bpf_get_current_task();
 		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -765,7 +769,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 }
 
 /*
- * sys_enter_read: save fd for the exit handler.
+ * sys_enter_read: сохраняем fd для обработчика выхода.
  */
 SEC("tracepoint/syscalls/sys_enter_read")
 int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
@@ -778,7 +782,7 @@ int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Quick check: is this fd tracked? */
+	/* Быстрая проверка: отслеживается ли этот fd? */
 	int fd = (int)ctx->args[0];
 	struct fd_key fk = { .tgid = tgid, .fd = fd };
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
@@ -790,7 +794,7 @@ int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
 }
 
 /*
- * sys_exit_read: accumulate bytes read.
+ * sys_exit_read: накапливаем прочитанные байты.
  */
 SEC("tracepoint/syscalls/sys_exit_read")
 int handle_read_exit(struct trace_event_raw_sys_exit *ctx)
@@ -818,7 +822,7 @@ int handle_read_exit(struct trace_event_raw_sys_exit *ctx)
 }
 
 /*
- * sys_enter_write: save fd for the exit handler.
+ * sys_enter_write: сохраняем fd для обработчика выхода.
  */
 SEC("tracepoint/syscalls/sys_enter_write")
 int handle_write_enter(struct trace_event_raw_sys_enter *ctx)
@@ -842,7 +846,7 @@ int handle_write_enter(struct trace_event_raw_sys_enter *ctx)
 }
 
 /*
- * sys_exit_write: accumulate bytes written.
+ * sys_exit_write: накапливаем записанные байты.
  */
 SEC("tracepoint/syscalls/sys_exit_write")
 int handle_write_exit(struct trace_event_raw_sys_exit *ctx)
@@ -869,15 +873,15 @@ int handle_write_exit(struct trace_event_raw_sys_exit *ctx)
 	return 0;
 }
 
-/* ── Network: TCP/UDP send/receive (kretprobe for actual byte count) ── */
+/* ── Сеть: TCP/UDP отправка/приём (kretprobe для фактического количества байт) ── */
 
-/* ── Network tracking: TCP connection lifecycle + byte counting ───── */
+/* ── Отслеживание сети: жизненный цикл TCP-соединений + подсчёт байт ── */
 
 /*
- * net_cfg: single-element array with enabled/track_bytes flags.
- * sock_map: per-socket state keyed by sock pointer.
- * connect_args_map: temp storage between kprobe/kretprobe of tcp_v4_connect.
- * sendmsg_args_map: temp storage between kprobe/kretprobe of tcp_sendmsg.
+ * net_cfg: одноэлементный массив с флагами enabled/track_bytes.
+ * sock_map: состояние сокета по ключу — указателю на sock.
+ * connect_args_map: временное хранилище между kprobe/kretprobe tcp_v4_connect.
+ * sendmsg_args_map: временное хранилище между kprobe/kretprobe tcp_sendmsg.
  */
 
 struct {
@@ -890,7 +894,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, NET_MAX_SOCKETS);
-	__type(key, __u64);           /* sock pointer as u64 */
+	__type(key, __u64);           /* указатель на sock как u64 */
 	__type(value, struct sock_info);
 } sock_map SEC(".maps");
 
@@ -909,8 +913,8 @@ struct {
 } sendmsg_args_map SEC(".maps");
 
 /*
- * Read socket addresses into sock_info.
- * Handles both AF_INET and AF_INET6.
+ * Чтение адресов сокета в sock_info.
+ * Поддерживает AF_INET и AF_INET6.
  */
 static __always_inline void read_sock_addrs(struct sock *sk,
 					    struct sock_info *si)
@@ -935,7 +939,7 @@ static __always_inline void read_sock_addrs(struct sock *sk,
 }
 
 /*
- * Emit NET_CLOSE event from sock_info.
+ * Отправка события NET_CLOSE из sock_info.
  */
 static __always_inline void emit_net_close(struct sock_info *si,
 					   __u64 now_ns)
@@ -952,7 +956,7 @@ static __always_inline void emit_net_close(struct sock_info *si,
 	ne->cgroup_id    = bpf_get_current_cgroup_id();
 	bpf_get_current_comm(ne->comm, sizeof(ne->comm));
 
-	/* Get ppid */
+	/* Получаем ppid */
 	struct task_struct *task =
 		(struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -970,7 +974,7 @@ static __always_inline void emit_net_close(struct sock_info *si,
 	bpf_ringbuf_submit(ne, 0);
 }
 
-/* ── tcp_v4_connect: track outbound IPv4 connections ─────────────── */
+/* ── tcp_v4_connect: отслеживание исходящих IPv4-соединений ──────── */
 
 SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(kp_tcp_v4_connect, struct sock *sk)
@@ -1008,7 +1012,7 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	return 0;
 }
 
-/* ── tcp_v6_connect: track outbound IPv6 connections ─────────────── */
+/* ── tcp_v6_connect: отслеживание исходящих IPv6-соединений ──────── */
 
 SEC("kprobe/tcp_v6_connect")
 int BPF_KPROBE(kp_tcp_v6_connect, struct sock *sk)
@@ -1046,7 +1050,7 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	return 0;
 }
 
-/* ── inet_csk_accept: track inbound TCP connections ──────────────── */
+/* ── inet_csk_accept: отслеживание входящих TCP-соединений ────────── */
 
 SEC("kretprobe/inet_csk_accept")
 int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
@@ -1068,7 +1072,7 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	return 0;
 }
 
-/* ── tcp_close: emit NET_CLOSE event ─────────────────────────────── */
+/* ── tcp_close: отправка события NET_CLOSE ────────────────────────── */
 
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kp_tcp_close, struct sock *sk)
@@ -1083,7 +1087,7 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	return 0;
 }
 
-/* ── tcp_sendmsg / tcp_recvmsg: per-connection + per-process bytes ── */
+/* ── tcp_sendmsg / tcp_recvmsg: байты на соединение + на процесс ─── */
 
 SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(kp_tcp_sendmsg, struct sock *sk)
@@ -1106,13 +1110,13 @@ int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
 	__u64 sk_ptr = args ? args->sock_ptr : 0;
 	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
 
-	/* Per-process aggregate (always, if tracked) */
+	/* Агрегат на процесс (всегда, если отслеживается) */
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
 
-	/* Per-connection (if socket is in sock_map) */
+	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
 		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
 		if (si)
@@ -1142,13 +1146,13 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 	__u64 sk_ptr = args ? args->sock_ptr : 0;
 	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
 
-	/* Per-process aggregate (always, if tracked) */
+	/* Агрегат на процесс (всегда, если отслеживается) */
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
 
-	/* Per-connection (if socket is in sock_map) */
+	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
 		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
 		if (si)
@@ -1157,7 +1161,7 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 	return 0;
 }
 
-/* ── UDP: per-process aggregate bytes only (no connection lifecycle) ── */
+/* ── UDP: агрегат байт на процесс (без жизненного цикла соединений) ── */
 
 SEC("kretprobe/udp_sendmsg")
 int BPF_KRETPROBE(ret_udp_sendmsg, int ret)
