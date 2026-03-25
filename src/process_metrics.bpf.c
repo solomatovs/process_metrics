@@ -605,27 +605,23 @@ static __always_inline int prefix_match(const char *path,
 	if (len <= 0 || len > PREFIX_CMP_MAX)
 		len = PREFIX_CMP_MAX;
 
-	/* Copy prefix to stack so the 5.15 verifier only checks
-	 * stack accesses in the loop (no map value pointer tracking). */
-	char pfx[PREFIX_CMP_MAX];
-	__builtin_memcpy(pfx, prefix, PREFIX_CMP_MAX);
-
+	/* No early return — fixed iteration count so clang can unroll.
+	 * All offsets become compile-time constants, which is critical
+	 * for the 5.15 verifier (no pointer tracking through loops). */
+	int match = 1;
+	#pragma unroll
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
-		if (j >= len)
-			return 1;
-		if (path[j] != pfx[j])
-			return 0;
+		if (j < len && path[j] != prefix[j])
+			match = 0;
 	}
-	return 1;
+	return match;
 }
 
 static __always_inline int path_matches_include(const char *path)
 {
 	int has_any = 0;
 
-#if KERN_VER >= 518
 	#pragma unroll
-#endif
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
 		struct file_prefix *fp = bpf_map_lookup_elem(
@@ -648,9 +644,7 @@ static __always_inline int path_matches_include(const char *path)
  */
 static __always_inline int path_matches_exclude(const char *path)
 {
-#if KERN_VER >= 518
 	#pragma unroll
-#endif
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
 		struct file_prefix *fp = bpf_map_lookup_elem(
