@@ -50,11 +50,8 @@ CLANG   ?= $(shell best=""; best_ver=0; \
 BPFTOOL ?= $(BPFTOOL_BIN)
 CC      := $(CLANG)
 
-# Kernel version detection (major * 100 + minor, e.g. 5.15 → 515, 6.1 → 601)
-KERN_VER := $(shell uname -r | awk -F'[.-]' '{ printf "%d%02d", $$1, $$2 }')
-
 # Flags
-BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86 -DKERN_VER=$(KERN_VER)
+BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 
@@ -84,7 +81,7 @@ help:
 	@echo "  make test       run unit tests"
 	@echo ""
 	@echo "Detected clang:   $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
-	@echo "Kernel version:   $(KERN_VER) ($(shell uname -r))"
+	@echo "Kernel version:   $(shell uname -r)"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make deps && make all"
@@ -94,7 +91,7 @@ help:
 all: check-clang vmlinux bpftool bpf binary
 	@echo ""
 	@echo "Build complete: $(BINARY)"
-	@echo "  kernel: $(KERN_VER) ($(shell uname -r))"
+	@echo "  kernel: $(shell uname -r)"
 	@file $(BINARY) | sed 's/^/  /'
 
 # --- clang version check ---
@@ -112,7 +109,7 @@ check-clang:
 		echo "Install clang >= $(MIN_CLANG_VER) or specify: make all CLANG=clang-11"; \
 		exit 1; \
 	fi; \
-	echo "Using $(CLANG) (version $$ver), kernel $(KERN_VER)"
+	echo "Using $(CLANG) (version $$ver), kernel $(shell uname -r)"
 
 # --- dependency installation ---
 
