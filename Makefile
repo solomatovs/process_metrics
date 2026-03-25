@@ -8,20 +8,22 @@
 # Usage:
 #   make               — show this help
 #   make deps          — install build dependencies (auto-detects apt/yum)
-#   make all           — build bpftool (if needed) + process_metrics
+#   make all           — full build: vmlinux.h + bpftool + BPF + binary
 #   make bpftool       — build only bpftool from src/bpftool/
+#   make vmlinux       — regenerate vmlinux.h from running kernel BTF
+#   make bpf           — compile BPF object + generate skeleton
+#   make binary        — compile userspace binary (requires skeleton)
 #   make clean         — remove build artifacts
-#   make vmlinux       — regenerate vmlinux.h from running kernel
 #
 # Requirements:
-#   clang >= 10        — for BPF CO-RE (preserve_access_index)
-#   gcc                — for userspace loader
+#   clang >= 10        — for BPF CO-RE and userspace
+#   gcc                — for vendored bpftool
 #   libbpf-dev, libelf-dev, zlib1g-dev
 
 SRCDIR   := src
 BUILDDIR := build
 
-# Source files — new event-driven implementation
+# Source files
 BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
 USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c
 COMMON_H   := $(SRCDIR)/process_metrics_common.h
@@ -67,26 +69,33 @@ MIN_CLANG_VER := 10
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
-.PHONY: help all clean vmlinux deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse
+.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse
 
 help:
 	@echo "process_metrics — event-driven BPF process metrics collector"
 	@echo ""
 	@echo "  make deps       install build dependencies (auto-detects apt/yum)"
-	@echo "  make deps-apt   install dependencies via apt (Astra Linux, Debian)"
-	@echo "  make deps-yum   install dependencies via yum/dnf (RHEL, CentOS)"
+	@echo "  make all        full build: vmlinux + bpftool + bpf + binary"
+	@echo "  make vmlinux    regenerate vmlinux.h from running kernel BTF"
 	@echo "  make bpftool    build bpftool from vendored sources"
-	@echo "  make all        build everything (bpftool + process_metrics)"
+	@echo "  make bpf        compile BPF object + generate skeleton"
+	@echo "  make binary     compile userspace binary"
 	@echo "  make clean      remove build artifacts"
 	@echo "  make test       run unit tests"
-	@echo "  make vmlinux    regenerate vmlinux.h from running kernel BTF"
 	@echo ""
-	@echo "Detected clang: $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
+	@echo "Detected clang:   $(or $(CLANG),NOT FOUND — install clang >= $(MIN_CLANG_VER))"
+	@echo "Kernel version:   $(KERN_VER) ($(shell uname -r))"
 	@echo ""
 	@echo "Quick start:"
 	@echo "  make deps && make all"
 
-all: check-clang $(BINARY)
+# --- main targets ---
+
+all: check-clang vmlinux bpftool bpf binary
+	@echo ""
+	@echo "Build complete: $(BINARY)"
+	@echo "  kernel: $(KERN_VER) ($(shell uname -r))"
+	@file $(BINARY) | sed 's/^/  /'
 
 # --- clang version check ---
 
@@ -103,7 +112,7 @@ check-clang:
 		echo "Install clang >= $(MIN_CLANG_VER) or specify: make all CLANG=clang-11"; \
 		exit 1; \
 	fi; \
-	echo "Using $(CLANG) (version $$ver)"
+	echo "Using $(CLANG) (version $$ver), kernel $(KERN_VER)"
 
 # --- dependency installation ---
 
@@ -143,6 +152,13 @@ deps-yum:
 	yum install -y kernel-devel-$(shell uname -r) 2>/dev/null || \
 		echo "Note: kernel-devel not found (OK for containers, needed only for vmlinux.h regeneration)"
 
+# --- vmlinux.h from running kernel BTF ---
+
+vmlinux: $(BPFTOOL_BIN)
+	chmod ugo+x $(BPFTOOL)
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)
+	@echo "vmlinux.h regenerated from $(shell uname -r)"
+
 # --- bpftool from vendored source ---
 
 bpftool: $(BPFTOOL_BIN)
@@ -157,18 +173,21 @@ $(BPFTOOL_BIN): | $(BUILDDIR)
 	cp $(CURDIR)/$(BUILDDIR)/bpftool-build/bpftool $@
 	rm -rf $(CURDIR)/$(BUILDDIR)/bpftool-build
 
-# --- build steps ---
+# --- BPF compilation ---
 
-# Step 1: compile BPF C → BPF ELF object
+bpf: $(SKEL_H)
+
 $(BPF_OBJ): $(BPF_SRC) $(COMMON_H) $(VMLINUX_H) | $(BUILDDIR)
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
 
-# Step 2: generate skeleton header from BPF object (depends on bpftool)
 $(SKEL_H): $(BPF_OBJ) $(BPFTOOL_BIN)
 	chmod ugo+x $(BPFTOOL)
 	$(BPFTOOL) gen skeleton $< > $@
 
-# Step 3: compile userspace (includes skeleton with embedded ELF)
+# --- userspace binary ---
+
+binary: $(BINARY)
+
 $(BINARY): $(USER_SRCS) $(COMMON_H) $(EF_H) $(HS_H) $(SKEL_H)
 	$(CC) $(CFLAGS) -o $@ $(USER_SRCS) $(LDFLAGS)
 
@@ -194,8 +213,3 @@ test-clickhouse: $(BINARY)
 	tests/test_clickhouse_integration.sh
 
 test: test-unit
-
-# Regenerate vmlinux.h from running kernel's BTF
-vmlinux:
-	chmod ugo+x $(BPFTOOL)
-	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $(VMLINUX_H)
