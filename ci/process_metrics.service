@@ -48,6 +48,11 @@ CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_S
 NoNewPrivileges=yes
 SecureBits=no-setuid-fixup
 
+# --- Подготовка (от root: префикс «+») ---
+# tracefs может быть не смонтирован (Astra Linux, hardened-ядра).
+# libbpf читает из него perf event ID для tracepoints.
+ExecStartPre=+/bin/sh -c 'mountpoint -q /sys/kernel/tracing 2>/dev/null || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true'
+
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \
     -c /etc/process_metrics/process_metrics.conf
