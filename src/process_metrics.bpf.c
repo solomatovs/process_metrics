@@ -608,10 +608,11 @@ static __always_inline int prefix_match(const char *path,
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
 		if (j >= len)
 			return 1;
-		/* Mask so the 5.15 verifier can prove the access is in-bounds.
-		 * PREFIX_CMP_MAX is a power-of-two-minus-one friendly value
-		 * (20 or 32), mask with 31 keeps idx < 32 < FILE_PREFIX_CAP. */
+		/* Mask idx to 0..31 so the verifier proves access is in-bounds
+		 * (offset <= 1+31 = 32, well within value_size=128).
+		 * asm volatile prevents clang from optimizing the mask away. */
 		int idx = j & 31;
+		asm volatile("" : "+r"(idx));
 		if (path[idx] != prefix[idx])
 			return 0;
 	}
