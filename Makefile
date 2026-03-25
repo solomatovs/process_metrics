@@ -46,12 +46,12 @@ CLANG   ?= $(shell best=""; best_ver=0; \
               [ -n "$$ver" ] && [ "$$ver" -ge 10 ] 2>/dev/null && [ "$$ver" -gt "$$best_ver" ] && best=$$c && best_ver=$$ver; \
             done; echo $$best)
 BPFTOOL ?= $(BPFTOOL_BIN)
-CC      ?= gcc
+CC      := $(CLANG)
 
 # Flags
 BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
-LDFLAGS    := -lbpf -lelf -lz -lconfig -lpthread
+LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 
 # Dependency packages
 APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm libconfig-dev
