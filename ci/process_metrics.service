@@ -45,8 +45,11 @@ Group=process_metrics
 # --- Capabilities (минимальный набор) ---
 AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+# --- если не поддерживается CAP_BPF CAP_PERFMON, то придется CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+
 NoNewPrivileges=yes
-SecureBits=no-setuid-fixup
 
 # --- Подготовка (от root: префикс «+») ---
 # tracefs может быть не смонтирован (Astra Linux, hardened-ядра).
