@@ -485,11 +485,16 @@ static void *server_thread(void *arg)
 		struct sockaddr_in client_addr;
 		socklen_t addr_len = sizeof(client_addr);
 
-		int client_fd = accept(g_listen_fd,
+		int fd = g_listen_fd;
+		if (fd < 0)
+			break;
+
+		int client_fd = accept(fd,
 				       (struct sockaddr *)&client_addr,
 				       &addr_len);
 		if (client_fd < 0) {
-			if (errno == EINTR || errno == EAGAIN)
+			if (errno == EINTR || errno == EAGAIN ||
+			    errno == EBADF || errno == EINVAL)
 				continue;
 			if (!g_running)
 				break;
@@ -500,6 +505,8 @@ static void *server_thread(void *arg)
 
 		struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
 		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+			   &tv, sizeof(tv));
+		setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
 			   &tv, sizeof(tv));
 
 		handle_request(client_fd, &client_addr);
@@ -581,7 +588,10 @@ void http_server_stop(void)
 
 	g_running = 0;
 
+	/* shutdown() wakes accept() blocked in another thread;
+	 * close() alone does not guarantee this on Linux. */
 	if (g_listen_fd >= 0) {
+		shutdown(g_listen_fd, SHUT_RDWR);
 		close(g_listen_fd);
 		g_listen_fd = -1;
 	}
