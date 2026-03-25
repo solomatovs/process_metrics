@@ -721,7 +721,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	if (cgroup)
 		snprintf(out->cgroup, sizeof(out->cgroup), "%s", cgroup);
 	/* exit-specific fields */
-	out->exit_code = e->exit_code;
+	out->exit_code = (e->exit_code >> 8) & 0xff;
 	out->cpu_ns = e->cpu_ns;
 	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
 	out->rss_min_bytes = e->rss_min_pages * (unsigned long)sysconf(_SC_PAGESIZE);
