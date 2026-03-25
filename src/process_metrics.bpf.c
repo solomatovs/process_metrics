@@ -582,15 +582,21 @@ struct {
  * Returns 1 if first 'len' bytes match.
  * Uses a fixed iteration count for BPF verifier compatibility.
  */
-#define PREFIX_CMP_MAX 32   /* max compared bytes (covers most real path prefixes) */
-
 /*
  * KERN_VER is passed from Makefile as major*100+minor (e.g. 515, 601).
- * Kernels < 5.18 have a less capable verifier that chokes on unrolled
- * prefix loops (>8192 jump sequences), so we avoid #pragma unroll there.
+ * Kernels < 5.18 have a weaker BPF verifier with a 8192 jump-sequence
+ * limit.  Two nested loops (16 prefixes × N chars) inside one program
+ * can exceed that budget.  We reduce PREFIX_CMP_MAX on old kernels and
+ * skip #pragma unroll so the verifier stays within its limits.
  */
 #ifndef KERN_VER
 #define KERN_VER 600
+#endif
+
+#if KERN_VER >= 518
+#define PREFIX_CMP_MAX 32
+#else
+#define PREFIX_CMP_MAX 20
 #endif
 
 static __always_inline int prefix_match(const char *path,
