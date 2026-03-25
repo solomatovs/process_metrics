@@ -31,6 +31,7 @@ enum event_type {
 	EVENT_OOM_KILL   = 4,
 	EVENT_FILE_CLOSE = 5,
 	EVENT_NET_CLOSE  = 6,
+	EVENT_SIGNAL     = 7,
 };
 
 /* ── file tracking constants ──────────────────────────────────────── */
@@ -299,6 +300,23 @@ struct net_event {
 	__u64 tx_bytes;
 	__u64 rx_bytes;
 	__u64 duration_ns;    /* how long the connection was open */
+};
+
+/*
+ * Signal event — sent from BPF to userspace when a signal is delivered.
+ * Captures sender (current task) and target info from the tracepoint.
+ */
+struct signal_event {
+	__u32 type;           /* EVENT_SIGNAL */
+	__u32 sender_tgid;    /* sender PID */
+	__u32 sender_uid;     /* sender UID */
+	__u32 target_pid;     /* target PID (from tracepoint) */
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  sender_comm[COMM_LEN];
+	int   sig;            /* signal number (SIGKILL=9, etc.) */
+	int   sig_code;       /* SI_USER=0, SI_KERNEL=0x80, etc. */
+	int   sig_result;     /* 0 = delivered successfully */
 };
 
 #endif /* PROCESS_METRICS_COMMON_H */

@@ -107,6 +107,13 @@ struct metric_event {
 
 	/* ── filesystem ───────────────────────────────────────────── */
 	char  pwd[256];             /* current working directory */
+
+	/* ── signal tracking (EVENT_SIGNAL only) ──────────────────── */
+	__u32 sig_num;              /* signal number (SIGKILL=9, etc.) */
+	__u32 sig_target_pid;       /* target PID that received the signal */
+	char  sig_target_comm[COMM_LEN]; /* target process comm */
+	__s32 sig_code;             /* SI_USER=0, SI_KERNEL=0x80, etc. */
+	__s32 sig_result;           /* 0 = delivered successfully */
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */

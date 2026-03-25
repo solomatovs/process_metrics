@@ -71,7 +71,9 @@ static const char *CSV_HEADER =
 	"file_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
 	/* сетевой трекинг */
 	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
-	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms\n";
+	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms,"
+	/* сигналы */
+	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result\n";
 
 static int csv_escape_field(const char *src, char *dst, int dstlen)
 {
@@ -101,6 +103,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	char file_path_esc[600];
 	char net_local_esc[100], net_remote_esc[100];
 	char pwd_esc[600];
+	char sig_target_comm_esc[200];
 
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
 	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));
@@ -114,6 +117,8 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(ev->net_local_addr, net_local_esc, sizeof(net_local_esc));
 	csv_escape_field(ev->net_remote_addr, net_remote_esc, sizeof(net_remote_esc));
 	csv_escape_field(ev->pwd, pwd_esc, sizeof(pwd_esc));
+	csv_escape_field(ev->sig_target_comm, sig_target_comm_esc,
+			 sizeof(sig_target_comm_esc));
 
 	/* Format timestamp as ISO 8601: YYYY-MM-DD HH:MM:SS.mmm
 	 * This format is natively parsed by ClickHouse DateTime64(3) */
@@ -157,7 +162,9 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* файловый трекинг */
 		"%s,%u,%llu,%llu,%u,"
 		/* сетевой трекинг */
-		"%s,%s,%u,%u,%llu,%llu,%llu\n",
+		"%s,%s,%u,%u,%llu,%llu,%llu,"
+		/* сигналы */
+		"%u,%u,%s,%d,%d\n",
 		/* идентификация */
 		ts_str, hostname_esc, event_type_esc, rule_esc, tags_esc,
 		ev->root_pid, ev->pid, ev->ppid, ev->uid,
@@ -216,7 +223,11 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		(unsigned)ev->net_remote_port,
 		(unsigned long long)ev->net_conn_tx_bytes,
 		(unsigned long long)ev->net_conn_rx_bytes,
-		(unsigned long long)ev->net_duration_ms);
+		(unsigned long long)ev->net_duration_ms,
+		/* сигналы */
+		ev->sig_num, ev->sig_target_pid,
+		sig_target_comm_esc,
+		(int)ev->sig_code, (int)ev->sig_result);
 
 	return n < buflen ? n : -1;
 }

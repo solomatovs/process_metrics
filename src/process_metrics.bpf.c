@@ -698,6 +698,76 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
+/* ── СИГНАЛ (SIGNAL) — перехват отправки сигналов ──────────────────── */
+
+/*
+ * signal_generate срабатывает при доставке сигнала.
+ * Перехватываем только пользовательские сигналы (SI_USER, SI_TKILL, SI_QUEUE)
+ * от/к отслеживаемым процессам.
+ *
+ * Tracepoint args: sig, errno, code, comm(__data_loc), pid, group, result
+ */
+SEC("raw_tracepoint/signal_generate")
+int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
+{
+	/*
+	 * btf_trace_signal_generate(void *, int sig, struct kernel_siginfo *info,
+	 *                           struct task_struct *task, int group, int result)
+	 * raw_tracepoint args:
+	 *   args[0] = int sig
+	 *   args[1] = struct kernel_siginfo *info
+	 *   args[2] = struct task_struct *task  (target)
+	 *   args[3] = int group
+	 *   args[4] = int result
+	 */
+	int sig        = (int)ctx->args[0];
+	int result     = (int)ctx->args[4];
+	struct task_struct *target = (struct task_struct *)ctx->args[2];
+	int target_pid = BPF_CORE_READ(target, tgid);
+
+	/* Read signal code from kernel_siginfo */
+	struct kernel_siginfo *sinfo = (struct kernel_siginfo *)ctx->args[1];
+	int code = 0;
+	bpf_probe_read_kernel(&code, sizeof(code), &sinfo->si_code);
+
+	/* Only user-initiated signals via kill() syscall: SI_USER=0
+	 * Skip SI_TKILL (-6) — too noisy from Go runtime SIGURG and pthread_kill.
+	 * Skip SI_KERNEL (128) and other kernel codes (>0). */
+	if (code != 0)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 sender_tgid = (__u32)(pid_tgid >> 32);
+	__u32 target_tgid = (__u32)target_pid;
+
+	/* Send event if sender OR target is tracked */
+	if (!bpf_map_lookup_elem(&tracked_map, &sender_tgid) &&
+	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
+		return 0;
+
+	struct signal_event *se = bpf_ringbuf_reserve(&events, sizeof(*se), 0);
+	if (!se)
+		return 0;
+
+	__builtin_memset(se, 0, sizeof(*se));
+	se->type         = EVENT_SIGNAL;
+	se->sender_tgid  = sender_tgid;
+	se->sender_uid   = (__u32)bpf_get_current_uid_gid();
+	se->target_pid   = target_tgid;
+	se->timestamp_ns = bpf_ktime_get_boot_ns();
+	se->sig          = sig;
+	se->sig_code     = code;
+	se->sig_result   = result;
+	bpf_get_current_comm(se->sender_comm, sizeof(se->sender_comm));
+
+	/* cgroup id from sender */
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+
+	bpf_ringbuf_submit(se, 0);
+	return 0;
+}
+
 /* ── Отслеживание файлов: openat/close/read/write ─────────────────── */
 
 /*

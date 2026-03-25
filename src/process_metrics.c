@@ -1230,6 +1230,97 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
+	/* Handle signal events separately */
+	if (type == EVENT_SIGNAL) {
+		if (size < sizeof(struct signal_event))
+			return 0;
+		const struct signal_event *se = data;
+
+		/* Resolve rule name from sender or target */
+		struct track_info ti;
+		const char *rname = "?";
+		if (bpf_map_lookup_elem(tracked_map_fd, &se->sender_tgid, &ti) == 0)
+			rname = (ti.rule_id < num_rules)
+				? rules[ti.rule_id].name : "?";
+		if (rname[0] == '?' && rname[1] == '\0') {
+			if (bpf_map_lookup_elem(tracked_map_fd, &se->target_pid, &ti) == 0)
+				rname = (ti.rule_id < num_rules)
+					? rules[ti.rule_id].name : "?";
+		}
+
+		log_debug("SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
+			  "rule=%s comm=%.16s",
+			  se->sender_tgid, se->target_pid, se->sig,
+			  se->sig_code, se->sig_result, rname,
+			  se->sender_comm);
+
+		if (g_http_cfg.enabled) {
+			const char *cg = resolve_cgroup(se->cgroup_id);
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "signal");
+			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+
+			/* Tags: try sender first, then target */
+			const char *sig_tags = tags_lookup(se->sender_tgid);
+			if (!sig_tags[0])
+				sig_tags = tags_lookup(se->target_pid);
+			snprintf(cev.tags, sizeof(cev.tags), "%s", sig_tags);
+
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&se->sender_tgid, &ti) == 0) {
+				cev.root_pid = ti.root_pid;
+				cev.is_root = ti.is_root;
+			}
+			cev.pid = se->sender_tgid;
+			cev.uid = se->sender_uid;
+			memcpy(cev.comm, se->sender_comm, COMM_LEN);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+
+			/* Sender identity from proc_info */
+			struct proc_info sender_pi;
+			if (bpf_map_lookup_elem(proc_map_fd,
+						&se->sender_tgid,
+						&sender_pi) == 0) {
+				cev.loginuid = sender_pi.loginuid;
+				cev.sessionid = sender_pi.sessionid;
+				cev.euid = sender_pi.euid;
+				cev.tty_nr = sender_pi.tty_nr;
+			}
+
+			/* Signal-specific fields */
+			cev.sig_num = (__u32)se->sig;
+			cev.sig_target_pid = se->target_pid;
+			cev.sig_code = se->sig_code;
+			cev.sig_result = se->sig_result;
+
+			/* Read target comm from /proc */
+			char tcomm_path[64], tcomm_buf[COMM_LEN + 2];
+			snprintf(tcomm_path, sizeof(tcomm_path),
+				 "/proc/%u/comm", se->target_pid);
+			FILE *tcf = fopen(tcomm_path, "r");
+			if (tcf) {
+				if (fgets(tcomm_buf, sizeof(tcomm_buf), tcf)) {
+					tcomm_buf[strcspn(tcomm_buf, "\n")] = 0;
+					snprintf(cev.sig_target_comm,
+						 sizeof(cev.sig_target_comm),
+						 "%s", tcomm_buf);
+				}
+				fclose(tcf);
+			}
+
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
 	const struct event *e = data;
 	if (size < sizeof(*e))
 		return 0;
