@@ -251,6 +251,28 @@ static __always_inline void read_identity(struct task_struct *task,
 }
 
 /*
+ * Read controlling terminal device number.
+ * Encodes as (major << 8 | (minor_start + index)), matching /proc/PID/stat tty_nr.
+ * Returns 0 if no controlling tty.
+ */
+static __always_inline __u32 read_tty_nr(struct task_struct *task)
+{
+	struct signal_struct *sig = BPF_CORE_READ(task, signal);
+	if (!sig)
+		return 0;
+	struct tty_struct *tty = BPF_CORE_READ(sig, tty);
+	if (!tty)
+		return 0;
+	struct tty_driver *driver = BPF_CORE_READ(tty, driver);
+	if (!driver)
+		return 0;
+	int major = BPF_CORE_READ(driver, major);
+	int minor_start = BPF_CORE_READ(driver, minor_start);
+	int index = BPF_CORE_READ(tty, index);
+	return (__u32)((major << 8) | (minor_start + index));
+}
+
+/*
  * Read namespace inode numbers. nsproxy can be NULL during exit.
  */
 static __always_inline void read_ns_inums(struct task_struct *task,
@@ -377,6 +399,7 @@ int handle_exec(void *ctx)
 		info->cmdline_len = read_cmdline(task, info->cmdline);
 		read_identity(task, &info->loginuid, &info->sessionid,
 			      &info->euid);
+		/* tty_nr preserved from userspace */
 		info->sched_policy = BPF_CORE_READ(task, policy);
 		read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
 			      &info->net_ns_inum, &info->cgroup_ns_inum);
@@ -434,6 +457,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	/* Inherit identity/scheduler/namespaces from parent */
 	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
 		      &child_pi->euid);
+	/* tty_nr will be filled by userspace fork handler */
 	child_pi->sched_policy = BPF_CORE_READ(parent, policy);
 	read_ns_inums(parent, &child_pi->mnt_ns_inum, &child_pi->pid_ns_inum,
 		      &child_pi->net_ns_inum, &child_pi->cgroup_ns_inum);
@@ -525,6 +549,7 @@ int handle_sched_switch(void *ctx)
 
 	/* Identity: loginuid, sessionid, euid */
 	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
+	/* tty_nr is set by userspace (BPF can't reliably read signal->tty) */
 
 	/* Scheduling policy */
 	info->sched_policy = BPF_CORE_READ(task, policy);
@@ -603,6 +628,7 @@ int handle_exit(void *ctx)
 		e->loginuid      = info->loginuid;
 		e->sessionid     = info->sessionid;
 		e->euid          = info->euid;
+		e->tty_nr        = info->tty_nr;
 		e->sched_policy  = info->sched_policy;
 		e->io_rchar      = info->io_rchar;
 		e->io_wchar      = info->io_wchar;

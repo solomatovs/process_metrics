@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     loginuid               UInt32                      CODEC(T64, ZSTD(1)),
     sessionid              UInt32                      CODEC(T64, ZSTD(1)),
     euid                   UInt32                      CODEC(T64, ZSTD(1)),
+    tty_nr                 UInt32                      CODEC(T64, ZSTD(1)),
 
     -- ── метаданные процесса ───────────────────────────────────────
     comm                   LowCardinality(String)      CODEC(ZSTD(1)),
@@ -178,7 +179,7 @@ SETTINGS
 -- ClickHouse сдвигает следующий refresh на случайный интервал,
 -- чтобы избежать зависания планировщика.
 CREATE OR REPLACE MATERIALIZED VIEW process_metrics_pull_server1
-REFRESH EVERY 30 SECOND RANDOMIZE FOR 10 SECOND APPEND
+REFRESH EVERY 3 SECOND RANDOMIZE FOR 1 SECOND APPEND
 TO process_metrics
 AS
 SELECT * REPLACE (if(tags = '', [], splitByChar('|', tags)) AS tags)
@@ -187,7 +188,7 @@ FROM url(
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
-     loginuid UInt32, sessionid UInt32, euid UInt32,
+     loginuid UInt32, sessionid UInt32, euid UInt32, tty_nr UInt32,
      comm String, exec String, args String, cgroup String, pwd String,
      is_root UInt8, state String, exit_code UInt32, sched_policy UInt32,
      cpu_ns UInt64, cpu_usage_ratio Float64,
@@ -219,7 +220,7 @@ SELECT * FROM url(
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
-     loginuid UInt32, sessionid UInt32, euid UInt32,
+     loginuid UInt32, sessionid UInt32, euid UInt32, tty_nr UInt32,
      comm String, exec String, args String, cgroup String, pwd String,
      is_root UInt8, state String, exit_code UInt32, sched_policy UInt32,
      cpu_ns UInt64, cpu_usage_ratio Float64,

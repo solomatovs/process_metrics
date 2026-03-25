@@ -46,7 +46,7 @@ static char          g_prom_path[512];
 static const char *CSV_HEADER =
 	/* идентификация */
 	"timestamp,hostname,event_type,rule,tags,"
-	"root_pid,pid,ppid,uid,loginuid,sessionid,euid,"
+	"root_pid,pid,ppid,uid,loginuid,sessionid,euid,tty_nr,"
 	/* метаданные процесса */
 	"comm,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
 	/* CPU */
@@ -135,7 +135,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	int n = snprintf(buf, buflen,
 		/* идентификация */
 		"%s,%s,%s,%s,%s,"
-		"%u,%u,%u,%u,%u,%u,%u,"
+		"%u,%u,%u,%u,%u,%u,%u,%u,"
 		/* метаданные процесса */
 		"%s,%s,%s,%s,%s,%u,%s,%u,%u,"
 		/* CPU */
@@ -161,7 +161,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* идентификация */
 		ts_str, hostname_esc, event_type_esc, rule_esc, tags_esc,
 		ev->root_pid, ev->pid, ev->ppid, ev->uid,
-		ev->loginuid, ev->sessionid, ev->euid,
+		ev->loginuid, ev->sessionid, ev->euid, ev->tty_nr,
 		/* метаданные процесса */
 		comm_esc, exec_esc, args_esc, cgroup_esc, pwd_esc,
 		(unsigned)ev->is_root, state_esc, ev->exit_code,

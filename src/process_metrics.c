@@ -733,6 +733,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->loginuid      = e->loginuid;
 	out->sessionid     = e->sessionid;
 	out->euid          = e->euid;
+	out->tty_nr        = e->tty_nr;
 	out->sched_policy  = e->sched_policy;
 	out->io_rchar      = e->io_rchar;
 	out->io_wchar      = e->io_wchar;
@@ -769,25 +770,30 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	memcpy(pi->comm, lp + 1, clen);
 	pi->comm[clen] = '\0';
 
-	/* fields after ") " */
+	/* fields after ") " :
+	 * state ppid pgrp session tty_nr tpgid flags
+	 * minflt cminflt majflt cmajflt utime stime cutime cstime
+	 * priority nice num_threads itrealvalue starttime vsize rss */
 	char *p = rp + 2;
 	char state;
 	int ppid;
+	int tty_nr;
 	unsigned long minflt, cminflt, majflt, cmajflt;
 	unsigned long utime, stime, starttime, vsize;
 	long rss;
 	int threads;
 	if (sscanf(p,
-		   "%c %d %*d %*d %*d %*d %*d "
+		   "%c %d %*d %*d %d %*d %*d "
 		   "%lu %lu %lu %lu %lu %lu %*d %*d "
 		   "%*d %*d %d %*d %lu %lu %ld",
-		   &state, &ppid,
+		   &state, &ppid, &tty_nr,
 		   &minflt, &cminflt, &majflt, &cmajflt,
 		   &utime, &stime,
-		   &threads, &starttime, &vsize, &rss) != 12)
+		   &threads, &starttime, &vsize, &rss) != 13)
 		return -1;
 
 	pi->ppid = (__u32)ppid;
+	pi->tty_nr = (__u32)(tty_nr > 0 ? tty_nr : 0);
 	pi->state = (__u8)state;
 	pi->threads = (__u32)threads;
 	pi->rss_pages = rss > 0 ? (__u64)rss : 0;
@@ -907,6 +913,28 @@ static __s16 read_proc_oom(__u32 pid)
 	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
 	fclose(f);
 	return (__s16)atoi(buf);
+}
+
+/*
+ * Read tty_nr from /proc/PID/stat (field 7 after pid and comm).
+ * Returns 0 if process has no controlling terminal.
+ */
+static __u32 read_proc_tty_nr(__u32 pid)
+{
+	char path[64], buf[512];
+	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
+	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+	fclose(f);
+	char *rp = strrchr(buf, ')');
+	if (!rp) return 0;
+	/* fields: state ppid pgrp session tty_nr */
+	char state;
+	int ppid, pgrp, session, tty;
+	if (sscanf(rp + 2, "%c %d %d %d %d", &state, &ppid, &pgrp, &session, &tty) != 5)
+		return 0;
+	return (__u32)(tty > 0 ? tty : 0);
 }
 
 /*
@@ -1268,6 +1296,24 @@ static int handle_event(void *ctx, void *data, size_t size)
 			break;
 		tags_inherit(e->tgid, e->ppid);
 
+		/* Inherit tty_nr from parent proc_info (BPF can't read signal->tty).
+		 * Child inherits parent's controlling terminal on fork. */
+		__u32 child_tty = 0;
+		{
+			struct proc_info parent_pi;
+			if (bpf_map_lookup_elem(proc_map_fd, &e->ppid, &parent_pi) == 0)
+				child_tty = parent_pi.tty_nr;
+		}
+		if (!child_tty)
+			child_tty = read_proc_tty_nr(e->tgid);
+		if (child_tty) {
+			struct proc_info pi;
+			if (bpf_map_lookup_elem(proc_map_fd, &e->tgid, &pi) == 0) {
+				pi.tty_nr = child_tty;
+				bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_EXIST);
+			}
+		}
+
 		/* Send fork event to ClickHouse / event file */
 		if (g_http_cfg.enabled) {
 			const char *rname = (parent_ti.rule_id < num_rules)
@@ -1277,6 +1323,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			event_from_bpf(&cev, e, "fork", rname,
 				       tags_lookup(e->tgid), cg);
 			cev.root_pid = parent_ti.root_pid;
+			cev.tty_nr = child_tty;
 			ef_append(&cev, cfg_hostname);
 		}
 		break;
@@ -1602,9 +1649,8 @@ static void write_snapshot(void)
 		double cpu_ratio = 0;
 		if (elapsed_ns > 0) {
 			__u64 prev_ns = cpu_prev_lookup(key);
-			double delta = (double)(pi.cpu_ns - prev_ns);
-			cpu_ratio = (prev_ns > 0 && delta >= 0)
-				? delta / elapsed_ns : 0;
+			cpu_ratio = (prev_ns > 0 && pi.cpu_ns >= prev_ns)
+				? (double)(pi.cpu_ns - prev_ns) / elapsed_ns : 0;
 		}
 		cpu_prev_update(key, pi.cpu_ns);
 
@@ -1783,6 +1829,7 @@ static void write_snapshot(void)
 			cev.loginuid       = pi.loginuid;
 			cev.sessionid      = pi.sessionid;
 			cev.euid           = pi.euid;
+			cev.tty_nr         = pi.tty_nr;
 			cev.sched_policy   = pi.sched_policy;
 			cev.io_rchar       = pi.io_rchar;
 			cev.io_wchar       = pi.io_wchar;

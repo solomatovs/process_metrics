@@ -154,6 +154,7 @@ struct proc_info {
 	__u32 loginuid;          /* audit loginuid (4294967295 = unset) */
 	__u32 sessionid;         /* audit session id */
 	__u32 euid;              /* effective UID (cred->euid) */
+	__u32 tty_nr;            /* controlling terminal (major<<8|minor), 0 = none */
 
 	/* ── scheduler ───────────────────────────────────────────── */
 	__u32 sched_policy;      /* SCHED_NORMAL=0, SCHED_FIFO=1, SCHED_RR=2, ... */
@@ -215,6 +216,7 @@ struct event {
 	__u32 loginuid;
 	__u32 sessionid;
 	__u32 euid;
+	__u32 tty_nr;
 
 	/* ── scheduler ───────────────────────────────────────────── */
 	__u32 sched_policy;
