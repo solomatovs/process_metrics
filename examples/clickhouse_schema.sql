@@ -48,15 +48,20 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     pid                    UInt32                      CODEC(T64, ZSTD(1)),
     ppid                   UInt32                      CODEC(T64, ZSTD(1)),
     uid                    UInt32                      CODEC(T64, ZSTD(1)),
+    loginuid               UInt32                      CODEC(T64, ZSTD(1)),
+    sessionid              UInt32                      CODEC(T64, ZSTD(1)),
+    euid                   UInt32                      CODEC(T64, ZSTD(1)),
 
     -- ── метаданные процесса ───────────────────────────────────────
     comm                   LowCardinality(String)      CODEC(ZSTD(1)),
     exec                   String                      CODEC(ZSTD(1)),
     args                   String                      CODEC(ZSTD(1)),
     cgroup                 LowCardinality(String)      CODEC(ZSTD(1)),
+    pwd                    String                      CODEC(ZSTD(1)),
     is_root                UInt8                       CODEC(T64, ZSTD(1)),
     state                  LowCardinality(String)      CODEC(ZSTD(1)),
     exit_code              UInt32                      CODEC(T64, ZSTD(1)),
+    sched_policy           UInt32                      CODEC(T64, ZSTD(1)),
 
     -- ── CPU ───────────────────────────────────────────────────────
     cpu_ns                 UInt64                      CODEC(Delta, ZSTD(1)),
@@ -70,28 +75,36 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     swap_bytes             UInt64                      CODEC(Delta, ZSTD(1)),
     vsize_bytes            UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── дисковый ввод-вывод (монотонные счётчики) ─────────────────
+    -- ── I/O (монотонные счётчики) ───────────────────────────────
     io_read_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
     io_write_bytes         UInt64                      CODEC(Delta, ZSTD(1)),
+    io_rchar               UInt64                      CODEC(Delta, ZSTD(1)),
+    io_wchar               UInt64                      CODEC(Delta, ZSTD(1)),
+    io_syscr               UInt64                      CODEC(Delta, ZSTD(1)),
+    io_syscw               UInt64                      CODEC(Delta, ZSTD(1)),
     maj_flt                UInt64                      CODEC(Delta, ZSTD(1)),
     min_flt                UInt64                      CODEC(Delta, ZSTD(1)),
 
-    -- ── планировщик (монотонные счётчики) ─────────────────────────
+    -- ── планировщик / потоки / OOM ──────────────────────────────
     nvcsw                  UInt64                      CODEC(Delta, ZSTD(1)),
     nivcsw                 UInt64                      CODEC(Delta, ZSTD(1)),
-
-    -- ── прочее ────────────────────────────────────────────────────
     threads                UInt32                      CODEC(T64, ZSTD(1)),
     oom_score_adj          Int16                       CODEC(T64, ZSTD(1)),
     oom_killed             UInt8                       CODEC(T64, ZSTD(1)),
 
-    -- ── сеть (монотонные счётчики) ────────────────────────────────
+    -- ── сеть процесса (монотонные счётчики) ─────────────────────
     net_tx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
     net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
 
     -- ── временны́е метки ───────────────────────────────────────────
     start_time_ns          UInt64                      CODEC(Delta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
+
+    -- ── пространства имён (inum из /proc/PID/ns) ────────────────
+    mnt_ns                 UInt32                      CODEC(T64, ZSTD(1)),
+    pid_ns                 UInt32                      CODEC(T64, ZSTD(1)),
+    net_ns                 UInt32                      CODEC(T64, ZSTD(1)),
+    cgroup_ns              UInt32                      CODEC(T64, ZSTD(1)),
 
     -- ── метрики cgroup v2 (заполняются в snapshot, -1 = недоступно) ─
     cgroup_memory_max      Int64                       CODEC(T64, ZSTD(1)),
@@ -161,24 +174,32 @@ SETTINGS
 -- ══════════════════════════════════════════════════════════════════════
 
 -- Пример: забирать данные с server1 каждые 30 секунд
+-- RANDOMIZE FOR — при ошибке (например, перезапуск process_metrics)
+-- ClickHouse сдвигает следующий refresh на случайный интервал,
+-- чтобы избежать зависания планировщика.
 CREATE OR REPLACE MATERIALIZED VIEW process_metrics_pull_server1
-REFRESH EVERY 30 SECOND APPEND
+REFRESH EVERY 30 SECOND RANDOMIZE FOR 10 SECOND APPEND
 TO process_metrics
 AS
-SELECT * REPLACE splitByChar('|', tags) AS tags
+SELECT * REPLACE (if(tags = '', [], splitByChar('|', tags)) AS tags)
 FROM url(
     'http://server1:10003/metrics?format=csv&clear=1',
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
-     comm String, exec String, args String, cgroup String,
-     is_root UInt8, state String, exit_code UInt32,
+     loginuid UInt32, sessionid UInt32, euid UInt32,
+     comm String, exec String, args String, cgroup String, pwd String,
+     is_root UInt8, state String, exit_code UInt32, sched_policy UInt32,
      cpu_ns UInt64, cpu_usage_ratio Float64,
      rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
      shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
-     io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
+     io_read_bytes UInt64, io_write_bytes UInt64,
+     io_rchar UInt64, io_wchar UInt64, io_syscr UInt64, io_syscw UInt64,
+     maj_flt UInt64, min_flt UInt64,
      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
-     net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
+     net_tx_bytes UInt64, net_rx_bytes UInt64,
+     start_time_ns UInt64, uptime_seconds UInt64,
+     mnt_ns UInt32, pid_ns UInt32, net_ns UInt32, cgroup_ns UInt32,
      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
@@ -198,14 +219,19 @@ SELECT * FROM url(
     'CSVWithNames',
     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
-     comm String, exec String, args String, cgroup String,
-     is_root UInt8, state String, exit_code UInt32,
+     loginuid UInt32, sessionid UInt32, euid UInt32,
+     comm String, exec String, args String, cgroup String, pwd String,
+     is_root UInt8, state String, exit_code UInt32, sched_policy UInt32,
      cpu_ns UInt64, cpu_usage_ratio Float64,
      rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
      shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
-     io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
+     io_read_bytes UInt64, io_write_bytes UInt64,
+     io_rchar UInt64, io_wchar UInt64, io_syscr UInt64, io_syscw UInt64,
+     maj_flt UInt64, min_flt UInt64,
      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
-     net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
+     net_tx_bytes UInt64, net_rx_bytes UInt64,
+     start_time_ns UInt64, uptime_seconds UInt64,
+     mnt_ns UInt32, pid_ns UInt32, net_ns UInt32, cgroup_ns UInt32,
      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,

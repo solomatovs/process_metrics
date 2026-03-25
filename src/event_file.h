@@ -83,6 +83,29 @@ struct metric_event {
 	__u64 net_conn_tx_bytes;    /* bytes sent on this connection */
 	__u64 net_conn_rx_bytes;    /* bytes received on this connection */
 	__u64 net_duration_ms;      /* connection duration in milliseconds */
+
+	/* ── identity ─────────────────────────────────────────────── */
+	__u32 loginuid;             /* audit loginuid (4294967295 = unset) */
+	__u32 sessionid;            /* audit session id */
+	__u32 euid;                 /* effective UID */
+
+	/* ── scheduler ────────────────────────────────────────────── */
+	__u32 sched_policy;         /* SCHED_NORMAL=0, SCHED_FIFO=1, ... */
+
+	/* ── I/O accounting (includes page cache) ─────────────────── */
+	__u64 io_rchar;             /* total bytes read (incl. cache) */
+	__u64 io_wchar;             /* total bytes written (incl. cache) */
+	__u64 io_syscr;             /* read syscall count */
+	__u64 io_syscw;             /* write syscall count */
+
+	/* ── namespace inums ──────────────────────────────────────── */
+	__u32 mnt_ns_inum;          /* mount namespace */
+	__u32 pid_ns_inum;          /* PID namespace */
+	__u32 net_ns_inum;          /* network namespace */
+	__u32 cgroup_ns_inum;       /* cgroup namespace */
+
+	/* ── filesystem ───────────────────────────────────────────── */
+	char  pwd[256];             /* current working directory */
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */

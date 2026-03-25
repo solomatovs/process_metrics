@@ -729,6 +729,19 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->net_tx_bytes = e->net_tx_bytes;
 	out->net_rx_bytes = e->net_rx_bytes;
 	out->start_time_ns = e->start_ns;
+	/* new fields */
+	out->loginuid      = e->loginuid;
+	out->sessionid     = e->sessionid;
+	out->euid          = e->euid;
+	out->sched_policy  = e->sched_policy;
+	out->io_rchar      = e->io_rchar;
+	out->io_wchar      = e->io_wchar;
+	out->io_syscr      = e->io_syscr;
+	out->io_syscw      = e->io_syscw;
+	out->mnt_ns_inum   = e->mnt_ns_inum;
+	out->pid_ns_inum   = e->pid_ns_inum;
+	out->net_ns_inum   = e->net_ns_inum;
+	out->cgroup_ns_inum = e->cgroup_ns_inum;
 }
 
 /* ── initial process scan (one-time /proc read at startup) ────────── */
@@ -1248,37 +1261,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	case EVENT_FORK: {
-		/* Parent must be tracked (BPF already filtered) */
+		/* BPF handle_fork уже создал tracked_map и proc_info записи.
+		 * Здесь только наследуем tags (они живут в userspace hash table). */
 		struct track_info parent_ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->ppid, &parent_ti) != 0)
 			break;
-
-		/* Copy parent's proc_info for cmdline inheritance */
-		struct proc_info parent_pi;
-		int has_parent_pi =
-			(bpf_map_lookup_elem(proc_map_fd, &e->ppid, &parent_pi) == 0);
-
-		/* Track child with inherited rule/root */
-		struct track_info child_ti = {
-			.root_pid = parent_ti.root_pid,
-			.rule_id  = parent_ti.rule_id,
-			.is_root  = 0,
-		};
-		bpf_map_update_elem(tracked_map_fd, &e->tgid, &child_ti, BPF_ANY);
 		tags_inherit(e->tgid, e->ppid);
-
-		/* Initialize child proc_info */
-		struct proc_info child_pi = {0};
-		child_pi.tgid      = e->tgid;
-		child_pi.ppid      = e->ppid;
-		child_pi.start_ns  = e->start_ns;
-		child_pi.cgroup_id = e->cgroup_id;
-		memcpy(child_pi.comm, e->comm, COMM_LEN);
-		if (has_parent_pi) {
-			memcpy(child_pi.cmdline, parent_pi.cmdline, CMDLINE_MAX);
-			child_pi.cmdline_len = parent_pi.cmdline_len;
-		}
-		bpf_map_update_elem(proc_map_fd, &e->tgid, &child_pi, BPF_ANY);
 
 		/* Send fork event to ClickHouse / event file */
 		if (g_http_cfg.enabled) {
@@ -1790,6 +1778,31 @@ static void write_snapshot(void)
 			cev.net_rx_bytes = pi.net_rx_bytes;
 			cev.start_time_ns = pi.start_ns;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
+
+			/* New fields from proc_info */
+			cev.loginuid       = pi.loginuid;
+			cev.sessionid      = pi.sessionid;
+			cev.euid           = pi.euid;
+			cev.sched_policy   = pi.sched_policy;
+			cev.io_rchar       = pi.io_rchar;
+			cev.io_wchar       = pi.io_wchar;
+			cev.io_syscr       = pi.io_syscr;
+			cev.io_syscw       = pi.io_syscw;
+			cev.mnt_ns_inum    = pi.mnt_ns_inum;
+			cev.pid_ns_inum    = pi.pid_ns_inum;
+			cev.net_ns_inum    = pi.net_ns_inum;
+			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
+
+			/* pwd via readlink /proc/PID/cwd (userspace only) */
+			{
+				char cwd_path[64];
+				snprintf(cwd_path, sizeof(cwd_path),
+					 "/proc/%u/cwd", pi.tgid);
+				ssize_t cwd_len = readlink(cwd_path, cev.pwd,
+							   sizeof(cev.pwd) - 1);
+				if (cwd_len > 0)
+					cev.pwd[cwd_len] = '\0';
+			}
 
 			/* Fill cgroup metrics from cache */
 			if (cg_idx >= 0 && seen_cg[cg_idx].read) {

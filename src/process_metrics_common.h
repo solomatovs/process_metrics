@@ -149,6 +149,26 @@ struct proc_info {
 	char  comm[COMM_LEN];
 	char  cmdline[CMDLINE_MAX];
 	__u16 cmdline_len;
+
+	/* ── identity ────────────────────────────────────────────── */
+	__u32 loginuid;          /* audit loginuid (4294967295 = unset) */
+	__u32 sessionid;         /* audit session id */
+	__u32 euid;              /* effective UID (cred->euid) */
+
+	/* ── scheduler ───────────────────────────────────────────── */
+	__u32 sched_policy;      /* SCHED_NORMAL=0, SCHED_FIFO=1, SCHED_RR=2, ... */
+
+	/* ── I/O accounting (includes page cache) ────────────────── */
+	__u64 io_rchar;          /* total bytes read (incl. cache) */
+	__u64 io_wchar;          /* total bytes written (incl. cache) */
+	__u64 io_syscr;          /* read syscall count */
+	__u64 io_syscw;          /* write syscall count */
+
+	/* ── namespace inums ─────────────────────────────────────── */
+	__u32 mnt_ns_inum;       /* mount namespace */
+	__u32 pid_ns_inum;       /* PID namespace */
+	__u32 net_ns_inum;       /* network namespace */
+	__u32 cgroup_ns_inum;    /* cgroup namespace */
 };
 
 /*
@@ -190,6 +210,26 @@ struct event {
 	__u8  oom_killed;
 	__u64 net_tx_bytes;
 	__u64 net_rx_bytes;
+
+	/* ── identity ────────────────────────────────────────────── */
+	__u32 loginuid;
+	__u32 sessionid;
+	__u32 euid;
+
+	/* ── scheduler ───────────────────────────────────────────── */
+	__u32 sched_policy;
+
+	/* ── I/O accounting ──────────────────────────────────────── */
+	__u64 io_rchar;
+	__u64 io_wchar;
+	__u64 io_syscr;
+	__u64 io_syscw;
+
+	/* ── namespace inums ─────────────────────────────────────── */
+	__u32 mnt_ns_inum;
+	__u32 pid_ns_inum;
+	__u32 net_ns_inum;
+	__u32 cgroup_ns_inum;
 };
 
 /* ── network tracking constants ──────────────────────────────────── */

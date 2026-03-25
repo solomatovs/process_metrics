@@ -58,6 +58,17 @@ struct {
 	__type(value, struct rate_state);
 } exec_rate SEC(".maps");
 
+/*
+ * Per-CPU scratch buffer for building proc_info on the stack
+ * (proc_info exceeds 512-byte BPF stack limit).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct proc_info);
+} scratch_pi SEC(".maps");
+
 /* ── ограничитель частоты ─────────────────────────────────────────── */
 
 /*
@@ -206,6 +217,73 @@ static __always_inline void read_ctxsw(struct task_struct *task,
 }
 
 /*
+ * I/O accounting: rchar/wchar/syscr/syscw (includes page cache, not just disk).
+ * Same signal + leader pattern as read_io_bytes.
+ */
+static __always_inline void read_io_accounting(struct task_struct *task,
+					       __u64 *rchar, __u64 *wchar,
+					       __u64 *syscr, __u64 *syscw)
+{
+	*rchar = BPF_CORE_READ(task, signal, ioac.rchar);
+	*wchar = BPF_CORE_READ(task, signal, ioac.wchar);
+	*syscr = BPF_CORE_READ(task, signal, ioac.syscr);
+	*syscw = BPF_CORE_READ(task, signal, ioac.syscw);
+
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader) {
+		*rchar += BPF_CORE_READ(leader, ioac.rchar);
+		*wchar += BPF_CORE_READ(leader, ioac.wchar);
+		*syscr += BPF_CORE_READ(leader, ioac.syscr);
+		*syscw += BPF_CORE_READ(leader, ioac.syscw);
+	}
+}
+
+/*
+ * Read identity fields: loginuid, sessionid, euid.
+ */
+static __always_inline void read_identity(struct task_struct *task,
+					  __u32 *loginuid, __u32 *sessionid,
+					  __u32 *euid)
+{
+	*loginuid  = BPF_CORE_READ(task, loginuid.val);
+	*sessionid = BPF_CORE_READ(task, sessionid);
+	*euid      = BPF_CORE_READ(task, cred, euid.val);
+}
+
+/*
+ * Read namespace inode numbers. nsproxy can be NULL during exit.
+ */
+static __always_inline void read_ns_inums(struct task_struct *task,
+					  __u32 *mnt_ns, __u32 *pid_ns,
+					  __u32 *net_ns, __u32 *cgroup_ns)
+{
+	*mnt_ns = 0;
+	*pid_ns = 0;
+	*net_ns = 0;
+	*cgroup_ns = 0;
+
+	struct nsproxy *nsp = BPF_CORE_READ(task, nsproxy);
+	if (!nsp)
+		return;
+
+	struct mnt_namespace *mnt = BPF_CORE_READ(nsp, mnt_ns);
+	if (mnt)
+		*mnt_ns = BPF_CORE_READ(mnt, ns.inum);
+
+	struct pid_namespace *pidns = BPF_CORE_READ(nsp, pid_ns_for_children);
+	if (pidns)
+		*pid_ns = BPF_CORE_READ(pidns, ns.inum);
+
+	struct net *netns = BPF_CORE_READ(nsp, net_ns);
+	if (netns)
+		*net_ns = BPF_CORE_READ(netns, ns.inum);
+
+	struct cgroup_namespace *cgns = BPF_CORE_READ(nsp, cgroup_ns);
+	if (cgns)
+		*cgroup_ns = BPF_CORE_READ(cgns, ns.inum);
+}
+
+/*
  * Преобразование числового состояния задачи в символ в стиле ps.
  * prev_state из sched_switch или task->__state.
  */
@@ -284,6 +362,10 @@ int handle_exec(void *ctx)
 	e->start_ns     = BPF_CORE_READ(task, start_time);
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 	e->cmdline_len  = read_cmdline(task, e->cmdline);
+	read_identity(task, &e->loginuid, &e->sessionid, &e->euid);
+	e->sched_policy = BPF_CORE_READ(task, policy);
+	read_ns_inums(task, &e->mnt_ns_inum, &e->pid_ns_inum,
+		      &e->net_ns_inum, &e->cgroup_ns_inum);
 
 	bpf_ringbuf_submit(e, 0);
 
@@ -293,6 +375,11 @@ int handle_exec(void *ctx)
 		bpf_get_current_comm(info->comm, sizeof(info->comm));
 		info->cgroup_id   = bpf_get_current_cgroup_id();
 		info->cmdline_len = read_cmdline(task, info->cmdline);
+		read_identity(task, &info->loginuid, &info->sessionid,
+			      &info->euid);
+		info->sched_policy = BPF_CORE_READ(task, policy);
+		read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
+			      &info->net_ns_inum, &info->cgroup_ns_inum);
 	}
 
 	return 0;
@@ -316,8 +403,47 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
 
 	/* Уведомляем пространство пользователя только если родитель отслеживается */
-	if (!bpf_map_lookup_elem(&tracked_map, &parent_tgid))
+	struct track_info *parent_ti = bpf_map_lookup_elem(&tracked_map, &parent_tgid);
+	if (!parent_ti)
 		return 0;
+
+	/* Создаём tracked_map запись для потомка прямо в BPF,
+	 * чтобы handle_exec мог найти proc_info до обработки в userspace */
+	struct track_info child_ti = {
+		.root_pid = parent_ti->root_pid,
+		.rule_id  = parent_ti->rule_id,
+		.is_root  = 0,
+	};
+	bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti, BPF_NOEXIST);
+
+	/* Создаём proc_info для потомка через per-CPU scratch buffer
+	 * (proc_info превышает 512-байтовый лимит стека BPF) */
+	__u32 scratch_key = 0;
+	struct proc_info *child_pi = bpf_map_lookup_elem(&scratch_pi, &scratch_key);
+	if (!child_pi)
+		return 0;
+
+	__builtin_memset(child_pi, 0, sizeof(*child_pi));
+	child_pi->tgid      = child_tgid;
+	child_pi->ppid      = parent_tgid;
+	child_pi->uid       = (__u32)bpf_get_current_uid_gid();
+	child_pi->cgroup_id = bpf_get_current_cgroup_id();
+	child_pi->start_ns  = BPF_CORE_READ(child, start_time);
+	bpf_get_current_comm(child_pi->comm, sizeof(child_pi->comm));
+
+	/* Inherit identity/scheduler/namespaces from parent */
+	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
+		      &child_pi->euid);
+	child_pi->sched_policy = BPF_CORE_READ(parent, policy);
+	read_ns_inums(parent, &child_pi->mnt_ns_inum, &child_pi->pid_ns_inum,
+		      &child_pi->net_ns_inum, &child_pi->cgroup_ns_inum);
+
+	struct proc_info *parent_pi = bpf_map_lookup_elem(&proc_map, &parent_tgid);
+	if (parent_pi) {
+		__builtin_memcpy(child_pi->cmdline, parent_pi->cmdline, CMDLINE_MAX);
+		child_pi->cmdline_len = parent_pi->cmdline_len;
+	}
+	bpf_map_update_elem(&proc_map, &child_tgid, child_pi, BPF_NOEXIST);
 
 	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
@@ -325,14 +451,13 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_FORK;
-	e->tgid         = child_tgid;       /* новый дочерний процесс */
-	e->ppid         = parent_tgid;       /* родительский процесс */
-	e->uid          = (__u32)bpf_get_current_uid_gid();
+	e->tgid         = child_tgid;
+	e->ppid         = parent_tgid;
+	e->uid          = child_pi->uid;
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	e->cgroup_id    = bpf_get_current_cgroup_id();
-	e->start_ns     = BPF_CORE_READ(child, start_time);
+	e->cgroup_id    = child_pi->cgroup_id;
+	e->start_ns     = child_pi->start_ns;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
-	/* cmdline наследуется, пространство пользователя копирует из proc_info родителя */
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -398,6 +523,20 @@ int handle_sched_switch(void *ctx)
 	/* UID — обновляем при каждом sched_switch (может измениться через setuid) */
 	info->uid = (__u32)bpf_get_current_uid_gid();
 
+	/* Identity: loginuid, sessionid, euid */
+	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
+
+	/* Scheduling policy */
+	info->sched_policy = BPF_CORE_READ(task, policy);
+
+	/* I/O accounting (includes page cache) */
+	read_io_accounting(task, &info->io_rchar, &info->io_wchar,
+			   &info->io_syscr, &info->io_syscw);
+
+	/* Namespace inode numbers */
+	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
+		      &info->net_ns_inum, &info->cgroup_ns_inum);
+
 	return 0;
 }
 
@@ -459,6 +598,20 @@ int handle_exit(void *ctx)
 		e->net_tx_bytes  = info->net_tx_bytes;
 		e->net_rx_bytes  = info->net_rx_bytes;
 		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
+
+		/* Copy new fields from last sched_switch snapshot */
+		e->loginuid      = info->loginuid;
+		e->sessionid     = info->sessionid;
+		e->euid          = info->euid;
+		e->sched_policy  = info->sched_policy;
+		e->io_rchar      = info->io_rchar;
+		e->io_wchar      = info->io_wchar;
+		e->io_syscr      = info->io_syscr;
+		e->io_syscw      = info->io_syscw;
+		e->mnt_ns_inum   = info->mnt_ns_inum;
+		e->pid_ns_inum   = info->pid_ns_inum;
+		e->net_ns_inum   = info->net_ns_inum;
+		e->cgroup_ns_inum = info->cgroup_ns_inum;
 	}
 
 	bpf_ringbuf_submit(e, 0);

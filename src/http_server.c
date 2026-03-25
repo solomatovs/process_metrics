@@ -44,17 +44,32 @@ static char          g_prom_path[512];
 /* ── CSV formatting ──────────────────────────────────────────────── */
 
 static const char *CSV_HEADER =
-	"timestamp,hostname,event_type,rule,tags,root_pid,pid,ppid,uid,"
-	"comm,exec,args,cgroup,is_root,state,exit_code,"
-	"cpu_ns,cpu_usage_ratio,rss_bytes,rss_min_bytes,rss_max_bytes,"
-	"shmem_bytes,swap_bytes,vsize_bytes,"
-	"io_read_bytes,io_write_bytes,maj_flt,min_flt,"
+	/* идентификация */
+	"timestamp,hostname,event_type,rule,tags,"
+	"root_pid,pid,ppid,uid,loginuid,sessionid,euid,"
+	/* метаданные процесса */
+	"comm,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
+	/* CPU */
+	"cpu_ns,cpu_usage_ratio,"
+	/* память */
+	"rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
+	/* I/O */
+	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,"
+	"maj_flt,min_flt,"
+	/* планировщик / потоки / OOM */
 	"nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
-	"net_tx_bytes,net_rx_bytes,start_time_ns,uptime_seconds,"
+	/* сеть процесса */
+	"net_tx_bytes,net_rx_bytes,"
+	/* время */
+	"start_time_ns,uptime_seconds,"
+	/* пространства имён */
+	"mnt_ns,pid_ns,net_ns,cgroup_ns,"
+	/* cgroup v2 */
 	"cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
 	"cgroup_cpu_weight,cgroup_pids_current,"
-	"file_path,file_flags,file_read_bytes,file_write_bytes,"
-	"file_open_count,"
+	/* файловый трекинг */
+	"file_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
+	/* сетевой трекинг */
 	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
 	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms\n";
 
@@ -85,6 +100,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	char args_esc[600], cgroup_esc[600], state_esc[8];
 	char file_path_esc[600];
 	char net_local_esc[100], net_remote_esc[100];
+	char pwd_esc[600];
 
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
 	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));
@@ -97,6 +113,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(ev->file_path, file_path_esc, sizeof(file_path_esc));
 	csv_escape_field(ev->net_local_addr, net_local_esc, sizeof(net_local_esc));
 	csv_escape_field(ev->net_remote_addr, net_remote_esc, sizeof(net_remote_esc));
+	csv_escape_field(ev->pwd, pwd_esc, sizeof(pwd_esc));
 
 	/* Format timestamp as ISO 8601: YYYY-MM-DD HH:MM:SS.mmm
 	 * This format is natively parsed by ClickHouse DateTime64(3) */
@@ -112,69 +129,89 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 			 tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
 	}
 
-	char state_raw[2] = { (char)(ev->state ? ev->state : '?'), '\0' };
+	char state_raw[2] = { (char)(ev->state ? ev->state : '\0'), '\0' };
 	csv_escape_field(state_raw, state_esc, sizeof(state_esc));
 
 	int n = snprintf(buf, buflen,
-		"%s,%s,%s,%s,%s,%u,%u,%u,%u,"
-		"%s,%s,%s,%s,%u,%s,%u,"
-		"%llu,%.4f,%llu,%llu,%llu,"
-		"%llu,%llu,%llu,"
-		"%llu,%llu,%llu,%llu,"
+		/* идентификация */
+		"%s,%s,%s,%s,%s,"
+		"%u,%u,%u,%u,%u,%u,%u,"
+		/* метаданные процесса */
+		"%s,%s,%s,%s,%s,%u,%s,%u,%u,"
+		/* CPU */
+		"%llu,%.4f,"
+		/* память */
+		"%llu,%llu,%llu,%llu,%llu,%llu,"
+		/* I/O */
+		"%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+		/* планировщик / потоки / OOM */
 		"%llu,%llu,%u,%d,%u,"
-		"%llu,%llu,%llu,%llu,"
+		/* сеть процесса */
+		"%llu,%llu,"
+		/* время */
+		"%llu,%llu,"
+		/* пространства имён */
+		"%u,%u,%u,%u,"
+		/* cgroup v2 */
 		"%lld,%lld,%lld,%lld,%lld,"
+		/* файловый трекинг */
 		"%s,%u,%llu,%llu,%u,"
+		/* сетевой трекинг */
 		"%s,%s,%u,%u,%llu,%llu,%llu\n",
-		ts_str,
-		hostname_esc,
-		event_type_esc,
-		rule_esc,
-		tags_esc,
-		ev->root_pid,
-		ev->pid,
-		ev->ppid,
-		ev->uid,
-		comm_esc,
-		exec_esc,
-		args_esc,
-		cgroup_esc,
-		(unsigned)ev->is_root,
-		state_esc,
-		ev->exit_code,
-		(unsigned long long)ev->cpu_ns,
-		ev->cpu_usage_ratio,
+		/* идентификация */
+		ts_str, hostname_esc, event_type_esc, rule_esc, tags_esc,
+		ev->root_pid, ev->pid, ev->ppid, ev->uid,
+		ev->loginuid, ev->sessionid, ev->euid,
+		/* метаданные процесса */
+		comm_esc, exec_esc, args_esc, cgroup_esc, pwd_esc,
+		(unsigned)ev->is_root, state_esc, ev->exit_code,
+		ev->sched_policy,
+		/* CPU */
+		(unsigned long long)ev->cpu_ns, ev->cpu_usage_ratio,
+		/* память */
 		(unsigned long long)ev->rss_bytes,
 		(unsigned long long)ev->rss_min_bytes,
 		(unsigned long long)ev->rss_max_bytes,
 		(unsigned long long)ev->shmem_bytes,
 		(unsigned long long)ev->swap_bytes,
 		(unsigned long long)ev->vsize_bytes,
+		/* I/O */
 		(unsigned long long)ev->io_read_bytes,
 		(unsigned long long)ev->io_write_bytes,
+		(unsigned long long)ev->io_rchar,
+		(unsigned long long)ev->io_wchar,
+		(unsigned long long)ev->io_syscr,
+		(unsigned long long)ev->io_syscw,
 		(unsigned long long)ev->maj_flt,
 		(unsigned long long)ev->min_flt,
+		/* планировщик / потоки / OOM */
 		(unsigned long long)ev->nvcsw,
 		(unsigned long long)ev->nivcsw,
 		ev->threads,
 		(int)ev->oom_score_adj,
 		(unsigned)ev->oom_killed,
+		/* сеть процесса */
 		(unsigned long long)ev->net_tx_bytes,
 		(unsigned long long)ev->net_rx_bytes,
+		/* время */
 		(unsigned long long)ev->start_time_ns,
 		(unsigned long long)ev->uptime_seconds,
+		/* пространства имён */
+		ev->mnt_ns_inum, ev->pid_ns_inum,
+		ev->net_ns_inum, ev->cgroup_ns_inum,
+		/* cgroup v2 */
 		(long long)ev->cgroup_memory_max,
 		(long long)ev->cgroup_memory_current,
 		(long long)ev->cgroup_swap_current,
 		(long long)ev->cgroup_cpu_weight,
 		(long long)ev->cgroup_pids_current,
-		file_path_esc,
-		ev->file_flags,
+		/* файловый трекинг */
+		file_path_esc, ev->file_flags,
 		(unsigned long long)ev->file_read_bytes,
 		(unsigned long long)ev->file_write_bytes,
 		ev->file_open_count,
-		net_local_esc,
-		net_remote_esc,
+		/* сетевой трекинг */
+		net_local_esc, net_remote_esc,
 		(unsigned)ev->net_local_port,
 		(unsigned)ev->net_remote_port,
 		(unsigned long long)ev->net_conn_tx_bytes,
