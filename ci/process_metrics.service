@@ -66,7 +66,10 @@ ExecStartPre=+/bin/sh -c '\
   || true; \
   mountpoint -q /sys/kernel/debug/tracing 2>/dev/null \
   || mount -t tracefs tracefs /sys/kernel/debug/tracing 2>/dev/null \
-  || true'
+  || true; \
+  chmod 0755 /sys/kernel/tracing 2>/dev/null || true; \
+  chmod 0755 /sys/kernel/debug 2>/dev/null || true; \
+  chmod 0755 /sys/kernel/debug/tracing 2>/dev/null || true'
 
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \

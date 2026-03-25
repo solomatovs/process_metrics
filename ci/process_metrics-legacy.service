@@ -60,28 +60,39 @@ NoNewPrivileges=yes
 # libbpf читает из него perf event ID для tracepoints.
 # Пробуем оба пути: новый /sys/kernel/tracing и legacy /sys/kernel/debug/tracing.
 # На Astra Linux CE 2.12 tracefs обычно доступен через /sys/kernel/debug/tracing.
+# Монтируем tracefs/debugfs с mode=755 чтобы непривилегированный пользователь
+# мог читать tracepoint ID (libbpf требует доступ к events/*/id).
+# mount -o remount,mode=755 меняет права корневой директории и всех файлов tracefs.
 ExecStartPre=+/bin/sh -c '\
-  mountpoint -q /sys/kernel/tracing 2>/dev/null \
-  || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null \
-  || true; \
-  mountpoint -q /sys/kernel/debug 2>/dev/null \
-  || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null \
-  || true; \
-  mountpoint -q /sys/kernel/debug/tracing 2>/dev/null \
-  || mount -t tracefs tracefs /sys/kernel/debug/tracing 2>/dev/null \
-  || true; \
-  echo "=== tracefs diagnostics ==="; \
+  if mountpoint -q /sys/kernel/tracing 2>/dev/null; then \
+    mount -o remount,mode=755 /sys/kernel/tracing 2>/dev/null || true; \
+  else \
+    mount -t tracefs tracefs /sys/kernel/tracing -o mode=755 2>/dev/null || true; \
+  fi; \
+  if ! mountpoint -q /sys/kernel/debug 2>/dev/null; then \
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true; \
+  fi; \
+  chmod 0755 /sys/kernel/debug 2>/dev/null || true; \
+  if mountpoint -q /sys/kernel/debug/tracing 2>/dev/null; then \
+    mount -o remount,mode=755 /sys/kernel/debug/tracing 2>/dev/null || true; \
+  else \
+    mount -t tracefs tracefs /sys/kernel/debug/tracing -o mode=755 2>/dev/null || true; \
+  fi'
+
+# --- Диагностика (запускается от целевого пользователя, внутри namespace) ---
+ExecStartPre=/bin/sh -c '\
+  echo "=== tracefs diagnostics (as service user, inside namespace) ==="; \
+  id; \
   echo "--- mounts ---"; \
-  grep -E "tracefs|debugfs" /proc/mounts || echo "(none)"; \
+  grep -E "tracefs|debugfs" /proc/mounts || echo "(no tracefs/debugfs mounts)"; \
   echo "--- /sys/kernel/tracing ---"; \
   ls -la /sys/kernel/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
   echo "--- /sys/kernel/debug/tracing ---"; \
   ls -la /sys/kernel/debug/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
-  echo "--- permissions ---"; \
-  ls -ld /sys/kernel/tracing 2>&1 || true; \
-  ls -ld /sys/kernel/debug 2>&1 || true; \
-  ls -ld /sys/kernel/debug/tracing 2>&1 || true; \
-  echo "=== end diagnostics ==="'
+  echo "--- cat tracepoint id ---"; \
+  cat /sys/kernel/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
+  cat /sys/kernel/debug/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
+  echo "=== end ==="'
 
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \
