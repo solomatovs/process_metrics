@@ -15,11 +15,11 @@
 #
 # Установка:
 #   sudo useradd -r -s /usr/sbin/nologin process_metrics
-#   sudo mkdir -p /var/lib/process_metrics
-#   sudo chown process_metrics:process_metrics /var/lib/process_metrics
-#   sudo cp build/process_metrics /usr/local/bin/
-#   sudo mkdir -p /etc/process_metrics
-#   sudo cp examples/process_metrics.conf /etc/process_metrics/
+#   sudo mkdir -p /app/process_metrics
+#   sudo chown process_metrics:process_metrics /app/process_metrics
+#   sudo cp build/process_metrics /app/process_metrics/
+#   sudo mkdir -p /app/process_metrics
+#   sudo cp examples/process_metrics.conf /app/process_metrics/
 #   sudo cp ci/process_metrics-legacy.service /etc/systemd/system/process_metrics.service
 #   sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
 #   sudo sysctl --system
@@ -34,7 +34,7 @@
 
 [Unit]
 Description=Process Metrics Collector (eBPF)
-Documentation=file:/etc/process_metrics/process_metrics.conf
+Documentation=file:/app/process_metrics/process_metrics.conf
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -79,24 +79,8 @@ ExecStartPre=+/bin/sh -c '\
     mount -t tracefs tracefs /sys/kernel/debug/tracing -o mode=755 2>/dev/null || true; \
   fi'
 
-# --- Диагностика (запускается от целевого пользователя, внутри namespace) ---
-ExecStartPre=/bin/sh -c '\
-  echo "=== tracefs diagnostics (as service user, inside namespace) ==="; \
-  id; \
-  echo "--- mounts ---"; \
-  grep -E "tracefs|debugfs" /proc/mounts || echo "(no tracefs/debugfs mounts)"; \
-  echo "--- /sys/kernel/tracing ---"; \
-  ls -la /sys/kernel/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
-  echo "--- /sys/kernel/debug/tracing ---"; \
-  ls -la /sys/kernel/debug/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
-  echo "--- cat tracepoint id ---"; \
-  cat /sys/kernel/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
-  cat /sys/kernel/debug/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
-  echo "=== end ==="'
-
 # --- Запуск ---
-ExecStart=/usr/local/bin/process_metrics \
-    -c /etc/process_metrics/process_metrics.conf
+ExecStart=/app/process_metrics/process_metrics -c /app/process_metrics/process_metrics.conf
 
 # --- Перезагрузка конфига по SIGHUP ---
 ExecReload=/bin/kill -HUP $MAINPID
@@ -131,7 +115,7 @@ PrivateDevices=yes
 # Доступ к файловой системе
 ReadOnlyPaths=/proc /sys/fs/cgroup
 ReadOnlyPaths=-/sys/kernel/btf
-ReadWritePaths=/var/lib/process_metrics /etc/process_metrics
+ReadWritePaths=/app/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
 # libbpf ищет tracepoint ID в tracefs. На новых ядрах — /sys/kernel/tracing,
