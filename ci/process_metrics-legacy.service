@@ -1,12 +1,17 @@
-# process_metrics.service — event-driven process metrics collector (eBPF)
+# process_metrics-legacy.service — event-driven process metrics collector (eBPF)
 #
-# Для systemd >= 246 (Debian 12+, Ubuntu 22.04+, RHEL 9+).
-# Использует точечные capabilities CAP_BPF + CAP_PERFMON вместо CAP_SYS_ADMIN.
-# Для старых систем (Astra Linux CE 2.12, Debian 10) используйте
-# process_metrics-legacy.service.
+# Для systemd < 246 (Astra Linux CE 2.12, Debian 10, Ubuntu 18.04, RHEL 7/8).
+# Использует CAP_SYS_ADMIN вместо точечных CAP_BPF/CAP_PERFMON, которые
+# не поддерживаются старыми версиями systemd.
 #
-# Запуск от непривилегированного пользователя с минимальными capabilities.
-# Не требует root — только точечные caps для BPF и чтения /proc.
+# Отличия от основного process_metrics.service:
+#   - CAP_SYS_ADMIN вместо CAP_BPF + CAP_PERFMON (systemd < 246 не знает эти caps)
+#   - MemoryLimit вместо MemoryMax (для систем с cgroup v1)
+#   - Убраны ProtectClock (>= 245), ProtectKernelLogs (>= 244),
+#     ProtectHostname (>= 242) — не поддерживаются в systemd 241
+#   - Убран MemoryDenyWriteExecute — конфликтует с JIT-компиляцией BPF
+#     на ядрах, где CAP_SYS_ADMIN нужен для BPF (ядро выполняет JIT в контексте
+#     процесса, W^X-политика блокирует это)
 #
 # Установка:
 #   sudo useradd -r -s /usr/sbin/nologin process_metrics
@@ -15,23 +20,17 @@
 #   sudo cp build/process_metrics /usr/local/bin/
 #   sudo mkdir -p /etc/process_metrics
 #   sudo cp examples/process_metrics.conf /etc/process_metrics/
-#   sudo cp ci/process_metrics.service /etc/systemd/system/
+#   sudo cp ci/process_metrics-legacy.service /etc/systemd/system/process_metrics.service
 #   sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
 #   sudo sysctl --system
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now process_metrics
 #
 # Capabilities:
-#   CAP_BPF        — загрузка eBPF программ и работа с BPF-картами
-#   CAP_PERFMON    — подключение к tracepoints, kprobes, raw_tracepoints
-#   CAP_SYS_PTRACE — чтение /proc/PID/* процессов других пользователей
-#   CAP_KILL       — kill(pid, 0) для проверки liveness чужих процессов
+#   CAP_SYS_ADMIN      — заменяет CAP_BPF + CAP_PERFMON (для ядер/systemd без их поддержки)
+#   CAP_SYS_PTRACE     — чтение /proc/PID/* процессов других пользователей
+#   CAP_KILL           — kill(pid, 0) для проверки liveness чужих процессов
 #   CAP_DAC_READ_SEARCH — чтение /sys/fs/cgroup/*, /proc/*/cgroup, tracefs
-#
-# Kernel requirements (см. ci/99-process-metrics.conf):
-#   kernel.perf_event_paranoid <= 2  (Debian default=3 блокирует CAP_PERFMON)
-#   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
-#   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
 
 [Unit]
 Description=Process Metrics Collector (eBPF)
@@ -47,9 +46,12 @@ Type=simple
 User=process_metrics
 Group=process_metrics
 
-# --- Capabilities (точечные, без CAP_SYS_ADMIN) ---
-AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+# --- Capabilities ---
+# CAP_SYS_ADMIN — необходим для bpf() и perf_event_open() на ядрах, где
+# CAP_BPF/CAP_PERFMON либо не поддерживаются ядром (< 5.8), либо не распознаются
+# данной версией systemd (< 246).
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
 
 NoNewPrivileges=yes
 
@@ -57,6 +59,7 @@ NoNewPrivileges=yes
 # tracefs может быть не смонтирован (Astra Linux, hardened-ядра).
 # libbpf читает из него perf event ID для tracepoints.
 # Пробуем оба пути: новый /sys/kernel/tracing и legacy /sys/kernel/debug/tracing.
+# На Astra Linux CE 2.12 tracefs обычно доступен через /sys/kernel/debug/tracing.
 ExecStartPre=+/bin/sh -c '\
   mountpoint -q /sys/kernel/tracing 2>/dev/null \
   || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null \
@@ -81,35 +84,36 @@ RestartSec=5
 
 # --- Ограничение ресурсов ---
 # BPF maps + event buffer + working set ≈ 100-120 MB with all collectors enabled.
-MemoryMax=200M
+# MemoryLimit — cgroup v1 аналог MemoryMax (для систем без cgroup v2).
+# Если система на cgroup v2, используйте MemoryMax=200M вместо MemoryLimit.
+MemoryLimit=200M
 CPUQuota=15%
 
 # --- Hardening ---
+# Совместимо с systemd >= 231 (Debian 9+).
+# ProtectClock, ProtectKernelLogs, ProtectHostname убраны — требуют systemd >= 242-245.
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelModules=yes
 ProtectControlGroups=no
-ProtectKernelLogs=yes
-ProtectClock=yes
-ProtectHostname=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 PrivateNetwork=no
 PrivateDevices=yes
 
 # Доступ к файловой системе
-ReadOnlyPaths=/proc /sys/fs/cgroup /sys/kernel/btf
+ReadOnlyPaths=/proc /sys/fs/cgroup
+ReadOnlyPaths=-/sys/kernel/btf
 ReadWritePaths=/var/lib/process_metrics /etc/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
 # libbpf ищет tracepoint ID в tracefs. На новых ядрах — /sys/kernel/tracing,
-# на старых — /sys/kernel/debug/tracing через debugfs.
-ReadOnlyPaths=/sys/fs/bpf
+# на старых (Astra Linux, Debian с ядром < 4.17) — /sys/kernel/debug/tracing.
+ReadOnlyPaths=-/sys/fs/bpf
 ReadOnlyPaths=-/sys/kernel/debug
 ReadOnlyPaths=-/sys/kernel/debug/tracing
 ReadOnlyPaths=-/sys/kernel/tracing
