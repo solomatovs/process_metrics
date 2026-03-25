@@ -86,6 +86,10 @@ static int cfg_net_track_bytes              = 0;
 /* File tracking config */
 static int cfg_file_tracking_enabled        = 0;
 static int cfg_file_track_bytes             = 0;
+
+/* Docker resolve config */
+static char cfg_docker_data_root[PATH_MAX_LEN] = "";
+static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
@@ -339,11 +343,124 @@ static void cpu_prev_remove(__u32 tgid)
 
 struct cgroup_entry {
 	__u64 id;
-	char  path[256];
+	char  path[256];    /* display name (docker/xxx or original) */
+	char  fs_path[256]; /* real filesystem path under /sys/fs/cgroup */
 };
 
 static struct cgroup_entry cgroup_cache[MAX_CGROUPS];
 static int cgroup_cache_count;
+static char docker_data_root[PATH_MAX_LEN] = "";
+
+/*
+ * Detect Docker data-root. Priority:
+ *   1. cfg_docker_data_root (from config file)
+ *   2. Parsed from cfg_docker_daemon_json ("data-root" key)
+ *   3. Fallback: /var/lib/docker
+ */
+static void detect_docker_data_root(void)
+{
+	if (docker_data_root[0])
+		return;
+
+	/* Use explicit config value if set */
+	if (cfg_docker_data_root[0]) {
+		snprintf(docker_data_root, sizeof(docker_data_root),
+			 "%s", cfg_docker_data_root);
+		return;
+	}
+
+	/* Try to parse from daemon.json */
+	FILE *f = fopen(cfg_docker_daemon_json, "r");
+	if (f) {
+		char buf[4096];
+		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = '\0';
+		char *key = strstr(buf, "\"data-root\"");
+		if (key) {
+			char *colon = strchr(key + 11, ':');
+			if (colon) {
+				char *q1 = strchr(colon, '"');
+				if (q1) {
+					q1++;
+					char *q2 = strchr(q1, '"');
+					if (q2 && (size_t)(q2 - q1) < sizeof(docker_data_root)) {
+						memcpy(docker_data_root, q1, q2 - q1);
+						docker_data_root[q2 - q1] = '\0';
+					}
+				}
+			}
+		}
+	}
+
+	if (!docker_data_root[0])
+		snprintf(docker_data_root, sizeof(docker_data_root),
+			 "/var/lib/docker");
+}
+
+/*
+ * Try to resolve a Docker container name from cgroup path.
+ * Looks for pattern "docker-<64hex>.scope" and reads the container name
+ * from config.v2.json. Returns 1 on success (dst filled), 0 otherwise.
+ */
+static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
+{
+	/* Find "docker-" prefix in the last path component */
+	const char *last = strrchr(rel, '/');
+	const char *base = last ? last + 1 : rel;
+
+	if (strncmp(base, "docker-", 7) != 0)
+		return 0;
+	const char *hash_start = base + 7;
+	const char *dot = strstr(hash_start, ".scope");
+	if (!dot || (dot - hash_start) != 64)
+		return 0;
+
+	char container_id[65];
+	memcpy(container_id, hash_start, 64);
+	container_id[64] = '\0';
+
+	detect_docker_data_root();
+
+	char config_path[PATH_MAX_LEN];
+	snprintf(config_path, sizeof(config_path),
+		 "%s/containers/%s/config.v2.json",
+		 docker_data_root, container_id);
+
+	FILE *f = fopen(config_path, "r");
+	if (!f)
+		return 0;
+
+	char buf[4096];
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = '\0';
+
+	/* Parse "Name":"/container_name" — Name is typically the first field */
+	char *key = strstr(buf, "\"Name\"");
+	if (!key)
+		return 0;
+	char *colon = strchr(key + 6, ':');
+	if (!colon)
+		return 0;
+	char *q1 = strchr(colon, '"');
+	if (!q1)
+		return 0;
+	q1++;
+	/* Skip leading / in container name */
+	if (*q1 == '/')
+		q1++;
+	char *q2 = strchr(q1, '"');
+	if (!q2 || q1 == q2)
+		return 0;
+
+	/* Build path: "docker/<container_name>" */
+	size_t name_len = q2 - q1;
+	if (name_len + 8 > dstlen)  /* "docker/" + name + NUL */
+		return 0;
+	snprintf(dst, dstlen, "docker/%.*s", (int)name_len, q1);
+	return 1;
+}
 
 static void scan_cgroup_dir(const char *base, const char *rel)
 {
@@ -353,8 +470,19 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 	struct stat st;
 	if (stat(full, &st) == 0 && cgroup_cache_count < MAX_CGROUPS) {
 		cgroup_cache[cgroup_cache_count].id = (__u64)st.st_ino;
-		snprintf(cgroup_cache[cgroup_cache_count].path,
-			 sizeof(cgroup_cache[0].path), "%s", rel);
+
+		/* Always store real filesystem path */
+		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
+			 sizeof(cgroup_cache[0].fs_path), "%s", rel);
+
+		/* Try to resolve Docker container name for display */
+		char docker_name[256];
+		if (resolve_docker_name(rel, docker_name, sizeof(docker_name)))
+			snprintf(cgroup_cache[cgroup_cache_count].path,
+				 sizeof(cgroup_cache[0].path), "%s", docker_name);
+		else
+			snprintf(cgroup_cache[cgroup_cache_count].path,
+				 sizeof(cgroup_cache[0].path), "%s", rel);
 		cgroup_cache_count++;
 	}
 
@@ -385,22 +513,36 @@ static void build_cgroup_cache(void)
 		scan_cgroup_dir("/sys/fs/cgroup", "");
 }
 
-static const char *resolve_cgroup(__u64 cgroup_id)
+static int resolve_cgroup_idx(__u64 cgroup_id)
 {
 	if (cgroup_id == 0)
-		return "";
+		return -1;
 
 	for (int i = 0; i < cgroup_cache_count; i++)
 		if (cgroup_cache[i].id == cgroup_id)
-			return cgroup_cache[i].path;
+			return i;
 
 	/* Cache miss — rebuild once */
 	build_cgroup_cache();
 	for (int i = 0; i < cgroup_cache_count; i++)
 		if (cgroup_cache[i].id == cgroup_id)
-			return cgroup_cache[i].path;
+			return i;
 
-	return "";
+	return -1;
+}
+
+/* Display name (docker/xxx or original path) */
+static const char *resolve_cgroup(__u64 cgroup_id)
+{
+	int idx = resolve_cgroup_idx(cgroup_id);
+	return idx >= 0 ? cgroup_cache[idx].path : "";
+}
+
+/* Real filesystem path (for reading cgroup files) */
+static const char *resolve_cgroup_fs(__u64 cgroup_id)
+{
+	int idx = resolve_cgroup_idx(cgroup_id);
+	return idx >= 0 ? cgroup_cache[idx].fs_path : "";
 }
 
 /* ── rules parser (from libconfig) ────────────────────────────────── */
@@ -576,6 +718,17 @@ static int load_config(const char *path)
 				}
 			}
 		}
+	}
+
+	/* Docker resolve settings */
+	config_setting_t *dk = config_lookup(&cfg, "docker");
+	if (dk) {
+		if (config_setting_lookup_string(dk, "data_root", &str_val))
+			snprintf(cfg_docker_data_root, sizeof(cfg_docker_data_root),
+				 "%s", str_val);
+		if (config_setting_lookup_string(dk, "daemon_json", &str_val))
+			snprintf(cfg_docker_daemon_json, sizeof(cfg_docker_daemon_json),
+				 "%s", str_val);
 	}
 
 	/* Default paths when http_server is enabled */
@@ -1719,8 +1872,9 @@ static void write_snapshot(void)
 			strcat(args, "...");
 		}
 
-		/* Resolve cgroup */
+		/* Resolve cgroup: display name + real fs path */
 		const char *cg_path = resolve_cgroup(pi.cgroup_id);
+		const char *cg_fs_path = resolve_cgroup_fs(pi.cgroup_id);
 
 		/* Escape labels */
 		char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
@@ -1853,17 +2007,17 @@ static void write_snapshot(void)
 				snprintf(seen_cg[cg_idx].rule,
 					 sizeof(seen_cg[0].rule), "%s", rule_name);
 				seen_cg[cg_idx].read = 0;
-				if (cfg_cgroup_metrics) {
+				if (cfg_cgroup_metrics && cg_fs_path[0]) {
 					seen_cg[cg_idx].mem_max =
-						read_cgroup_value(cg_path, "memory.max");
+						read_cgroup_value(cg_fs_path, "memory.max");
 					seen_cg[cg_idx].mem_cur =
-						read_cgroup_value(cg_path, "memory.current");
+						read_cgroup_value(cg_fs_path, "memory.current");
 					seen_cg[cg_idx].swap_cur =
-						read_cgroup_value(cg_path, "memory.swap.current");
+						read_cgroup_value(cg_fs_path, "memory.swap.current");
 					seen_cg[cg_idx].cpu_weight =
-						read_cgroup_value(cg_path, "cpu.weight");
+						read_cgroup_value(cg_fs_path, "cpu.weight");
 					seen_cg[cg_idx].pids_cur =
-						read_cgroup_value(cg_path, "pids.current");
+						read_cgroup_value(cg_fs_path, "pids.current");
 					seen_cg[cg_idx].read = 1;
 				}
 				seen_cg_count++;
@@ -2367,6 +2521,7 @@ int main(int argc, char *argv[])
 		/* Periodic snapshot */
 		time_t now = time(NULL);
 		if (now - last_snapshot >= cfg_snapshot_interval) {
+			build_cgroup_cache();
 			write_snapshot();
 			last_snapshot = now;
 		}
