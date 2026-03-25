@@ -161,55 +161,55 @@ SETTINGS
 -- ══════════════════════════════════════════════════════════════════════
 
 -- Пример: забирать данные с server1 каждые 30 секунд
--- CREATE MATERIALIZED VIEW process_metrics_pull_server1
--- REFRESH EVERY 30 SECOND APPEND
--- TO process_metrics
--- AS
--- SELECT * REPLACE splitByChar('|', tags) AS tags
--- FROM url(
---     'http://server1:9091/metrics?format=csv&clear=1',
---     'CSVWithNames',
---     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
---      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
---      comm String, exec String, args String, cgroup String,
---      is_root UInt8, state String, exit_code UInt32,
---      cpu_ns UInt64, cpu_usage_ratio Float64,
---      rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
---      shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
---      io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
---      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
---      net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
---      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
---      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
---      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
---      file_open_count UInt32,
---      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
---      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
--- );
+CREATE MATERIALIZED VIEW process_metrics_pull_server1
+REFRESH EVERY 30 SECOND APPEND
+TO process_metrics
+AS
+SELECT * REPLACE splitByChar('|', tags) AS tags
+FROM url(
+    'http://server1:10003/metrics?format=csv&clear=1',
+    'CSVWithNames',
+    'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
+     root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
+     comm String, exec String, args String, cgroup String,
+     is_root UInt8, state String, exit_code UInt32,
+     cpu_ns UInt64, cpu_usage_ratio Float64,
+     rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
+     shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
+     io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
+     nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
+     net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
+     cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
+     cgroup_cpu_weight Int64, cgroup_pids_current Int64,
+     file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
+     file_open_count UInt32,
+     net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
+     net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
+);
 
 -- ══════════════════════════════════════════════════════════════════════
 -- Альтернатива: разовый импорт (без материализованного представления)
 -- ВАЖНО: необходимо указать явную структуру, чтобы избежать двойного GET
 -- ══════════════════════════════════════════════════════════════════════
 
--- INSERT INTO process_metrics
--- SELECT * FROM url(
---     'http://server1:9091/metrics?format=csv&clear=1',
---     'CSVWithNames',
---     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
---      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
---      comm String, exec String, args String, cgroup String,
---      is_root UInt8, state String, exit_code UInt32,
---      cpu_ns UInt64, cpu_usage_ratio Float64,
---      rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
---      shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
---      io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
---      nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
---      net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
---      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
---      cgroup_cpu_weight Int64, cgroup_pids_current Int64,
---      file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
---      file_open_count UInt32,
---      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
---      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
--- );
+INSERT INTO process_metrics
+SELECT * FROM url(
+    'http://server1:10003/metrics?format=csv&clear=1',
+    'CSVWithNames',
+    'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
+     root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
+     comm String, exec String, args String, cgroup String,
+     is_root UInt8, state String, exit_code UInt32,
+     cpu_ns UInt64, cpu_usage_ratio Float64,
+     rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
+     shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
+     io_read_bytes UInt64, io_write_bytes UInt64, maj_flt UInt64, min_flt UInt64,
+     nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
+     net_tx_bytes UInt64, net_rx_bytes UInt64, start_time_ns UInt64, uptime_seconds UInt64,
+     cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
+     cgroup_cpu_weight Int64, cgroup_pids_current Int64,
+     file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
+     file_open_count UInt32,
+     net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
+     net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64'
+);
