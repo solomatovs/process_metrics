@@ -98,6 +98,95 @@ static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
+/* ── tags hash table (userspace-only, per-tgid) ──────────────────── */
+
+#define TAGS_MAX_LEN 512
+#define TAGS_HT_SIZE 16384  /* must be power of 2 */
+
+struct tags_entry {
+	__u32 tgid;           /* 0 = empty slot */
+	char  tags[TAGS_MAX_LEN];
+};
+
+static struct tags_entry tags_ht[TAGS_HT_SIZE];
+
+static void tags_store(__u32 tgid, const char *tags)
+{
+	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	for (int i = 0; i < TAGS_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
+		if (tags_ht[slot].tgid == 0 || tags_ht[slot].tgid == tgid) {
+			tags_ht[slot].tgid = tgid;
+			snprintf(tags_ht[slot].tags, TAGS_MAX_LEN, "%s", tags);
+			return;
+		}
+	}
+}
+
+static const char *tags_lookup(__u32 tgid)
+{
+	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	for (int i = 0; i < TAGS_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
+		if (tags_ht[slot].tgid == tgid)
+			return tags_ht[slot].tags;
+		if (tags_ht[slot].tgid == 0)
+			return "";
+	}
+	return "";
+}
+
+static void tags_remove(__u32 tgid)
+{
+	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	for (int i = 0; i < TAGS_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
+		if (tags_ht[slot].tgid == tgid) {
+			tags_ht[slot].tgid = 0;
+			tags_ht[slot].tags[0] = '\0';
+			return;
+		}
+		if (tags_ht[slot].tgid == 0)
+			return;
+	}
+}
+
+static void tags_inherit(__u32 child_tgid, __u32 parent_tgid)
+{
+	const char *pt = tags_lookup(parent_tgid);
+	tags_store(child_tgid, pt);
+}
+
+static void tags_clear(void)
+{
+	memset(tags_ht, 0, sizeof(tags_ht));
+}
+
+/*
+ * Match cmdline against ALL rules, build pipe-separated tags string.
+ * Returns the index of the first matching rule, or -1 if no match.
+ */
+static int match_rules_all(const char *cmdline, char *tags, int tags_size)
+{
+	int first = -1;
+	int off = 0;
+	for (int i = 0; i < num_rules; i++) {
+		if (regexec(&rules[i].regex, cmdline, 0, NULL, 0) != 0)
+			continue;
+		if (first < 0)
+			first = i;
+		if (off > 0 && off < tags_size - 1)
+			tags[off++] = '|';
+		int n = snprintf(tags + off, tags_size - off, "%s",
+				 rules[i].name);
+		if (n > 0 && off + n < tags_size)
+			off += n;
+	}
+	if (off == 0 && tags_size > 0)
+		tags[0] = '\0';
+	return first;
+}
+
 /* ── exited process cache (circular buffer for last N exits) ──────── */
 
 #define MAX_EXITED 256
@@ -119,6 +208,7 @@ struct exited_proc {
 	char  comm[COMM_LEN];
 	char  cmdline[CMDLINE_MAX];
 	__u16 cmdline_len;
+	char  tags[TAGS_MAX_LEN];
 };
 
 static struct exited_proc exited_ring[MAX_EXITED];
@@ -144,6 +234,8 @@ static void record_exit(const struct event *e)
 	memcpy(ep->comm, e->comm, COMM_LEN);
 	memcpy(ep->cmdline, e->cmdline, CMDLINE_MAX);
 	ep->cmdline_len  = e->cmdline_len;
+	/* Save tags before removing from hash table */
+	snprintf(ep->tags, sizeof(ep->tags), "%s", tags_lookup(e->tgid));
 	exited_head = (exited_head + 1) % MAX_EXITED;
 	if (exited_count < MAX_EXITED)
 		exited_count++;
@@ -558,7 +650,7 @@ static void log_debug(const char *fmt, ...)
 /* Build a metric_event from a BPF ring buffer event */
 static void event_from_bpf(struct metric_event *out, const struct event *e,
 			    const char *event_type, const char *rule_name,
-			    const char *cgroup)
+			    const char *tags, const char *cgroup)
 {
 	memset(out, 0, sizeof(*out));
 	/* Use wall-clock time instead of boot-relative BPF timestamp */
@@ -568,6 +660,8 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 			  + (__u64)ts_now.tv_nsec;
 	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
 	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
+	if (tags)
+		snprintf(out->tags, sizeof(out->tags), "%s", tags);
 	out->root_pid = e->root_pid;
 	out->pid = e->tgid;
 	out->ppid = e->ppid;
@@ -860,19 +954,21 @@ static void initial_scan(void)
 		cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str,
 			       sizeof(cmdline_str));
 
-		for (int r = 0; r < num_rules; r++) {
-			if (regexec(&rules[r].regex, cmdline_str, 0, NULL, 0) != 0)
-				continue;
-
+		char tags_buf[TAGS_MAX_LEN];
+		int first = match_rules_all(cmdline_str, tags_buf,
+					    sizeof(tags_buf));
+		if (first >= 0) {
 			/* Root match */
-			track_pid_from_proc(pid, r, pid, 1);
+			track_pid_from_proc(pid, first, pid, 1);
+			tags_store(pid, tags_buf);
 			tracked++;
-			log_debug("SCAN: pid=%u rule=%s cmdline=%.60s",
-				  pid, rules[r].name, cmdline_str);
+			log_debug("SCAN: pid=%u rule=%s tags=%s cmdline=%.60s",
+				  pid, rules[first].name, tags_buf,
+				  cmdline_str);
 
 			/* Find all descendants */
-			add_descendants(entries, count, pid, r, pid, &tracked);
-			break;
+			add_descendants(entries, count, pid, first, pid,
+					&tracked);
 		}
 	}
 
@@ -923,6 +1019,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "file_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup(fe->tgid));
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&fe->tgid, &ti) == 0) {
 				cev.root_pid = ti.root_pid;
@@ -977,6 +1075,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "net_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup(ne->tgid));
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&ne->tgid, &ti) == 0) {
 				cev.root_pid = ti.root_pid;
@@ -1034,19 +1134,20 @@ static int handle_event(void *ctx, void *data, size_t size)
 		char cmdline[CMDLINE_MAX + 1];
 		cmdline_to_str(e->cmdline, e->cmdline_len, cmdline, sizeof(cmdline));
 
-		/* Match against rules */
-		for (int i = 0; i < num_rules; i++) {
-			if (regexec(&rules[i].regex, cmdline, 0, NULL, 0) != 0)
-				continue;
-
+		/* Match against all rules */
+		char tags_buf[TAGS_MAX_LEN];
+		int first = match_rules_all(cmdline, tags_buf,
+					    sizeof(tags_buf));
+		if (first >= 0) {
 			/* Match — start tracking */
 			struct track_info new_ti = {
 				.root_pid = e->tgid,
-				.rule_id  = (__u16)i,
+				.rule_id  = (__u16)first,
 				.is_root  = 1,
 			};
 			bpf_map_update_elem(tracked_map_fd, &e->tgid,
 					    &new_ti, BPF_ANY);
+			tags_store(e->tgid, tags_buf);
 
 			struct proc_info pi = {0};
 			pi.tgid      = e->tgid;
@@ -1058,18 +1159,20 @@ static int handle_event(void *ctx, void *data, size_t size)
 			pi.cmdline_len = e->cmdline_len;
 			bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
 
-			log_debug("TRACK: pid=%u rule=%s comm=%.16s",
-				  e->tgid, rules[i].name, e->comm);
+			log_debug("TRACK: pid=%u rule=%s tags=%s comm=%.16s",
+				  e->tgid, rules[first].name, tags_buf,
+				  e->comm);
 
 			/* Send exec event to ClickHouse / event file */
 			if (g_http_cfg.enabled) {
 				const char *cg = resolve_cgroup(e->cgroup_id);
 				struct metric_event cev;
-				event_from_bpf(&cev, e, "exec", rules[i].name, cg);
+				event_from_bpf(&cev, e, "exec",
+					       rules[first].name,
+					       tags_buf, cg);
 				cev.is_root = 1;
 				ef_append(&cev, cfg_hostname);
 			}
-			break;
 		}
 		break;
 	}
@@ -1092,6 +1195,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			.is_root  = 0,
 		};
 		bpf_map_update_elem(tracked_map_fd, &e->tgid, &child_ti, BPF_ANY);
+		tags_inherit(e->tgid, e->ppid);
 
 		/* Initialize child proc_info */
 		struct proc_info child_pi = {0};
@@ -1112,7 +1216,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 				? rules[parent_ti.rule_id].name : "unknown";
 			const char *cg = resolve_cgroup(e->cgroup_id);
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "fork", rname, cg);
+			event_from_bpf(&cev, e, "fork", rname,
+				       tags_lookup(e->tgid), cg);
 			cev.root_pid = parent_ti.root_pid;
 			ef_append(&cev, cfg_hostname);
 		}
@@ -1122,6 +1227,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	case EVENT_EXIT: {
 		const char *rname = (e->rule_id < num_rules)
 			? rules[e->rule_id].name : "?";
+		const char *exit_tags = tags_lookup(e->tgid);
 		int sig = e->exit_code & 0x7f;
 		int status = (e->exit_code >> 8) & 0xff;
 
@@ -1133,12 +1239,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  e->oom_killed ? " [OOM]" : "");
 
 		record_exit(e);
+		tags_remove(e->tgid);
 
 		/* Send exit event to ClickHouse / event file */
 		if (g_http_cfg.enabled) {
 			const char *cg = resolve_cgroup(e->cgroup_id);
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "exit", rname, cg);
+			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg);
 			ef_append(&cev, cfg_hostname);
 		}
 		/* BPF already deleted from maps */
@@ -1160,7 +1267,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			const char *cg = resolve_cgroup(e->cgroup_id);
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "oom_kill", rname, cg);
+			event_from_bpf(&cev, e, "oom_kill", rname,
+				       tags_lookup(e->tgid), cg);
 			ef_append(&cev, cfg_hostname);
 		}
 		break;
@@ -1424,10 +1532,14 @@ static void write_snapshot(void)
 
 		/* Write Prometheus metrics */
 		if (f) {
-		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",root_pid=\"%u\","
+		char tags_esc[TAGS_MAX_LEN * 2];
+		escape_label(tags_lookup(key), tags_esc, sizeof(tags_esc));
+		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",tags=\"%s\","
+			"root_pid=\"%u\","
 			"pid=\"%u\",uid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
 			"cgroup=\"%s\"} 1\n",
-			pfx, host_esc, rule_name, ti.root_pid, pi.tgid,
+			pfx, host_esc, rule_name, tags_esc, ti.root_pid,
+			pi.tgid,
 			pi.uid, comm_esc, exec_esc, args_esc, cg_esc);
 		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
 			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
@@ -1550,6 +1662,8 @@ static void write_snapshot(void)
 			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup(key));
 			cev.root_pid = ti.root_pid;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
@@ -1607,6 +1721,7 @@ static void write_snapshot(void)
 		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
 		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
 		cpu_prev_remove(dead_keys[i]);
+		tags_remove(dead_keys[i]);
 	}
 	if (dead_count > 0)
 		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
@@ -1995,6 +2110,7 @@ int main(int argc, char *argv[])
 				bpf_map_delete_elem(proc_map_fd, &del_key);
 			}
 
+			tags_clear();
 			parse_rules_from_config(cfg_config_file);
 			build_cgroup_cache();
 			exited_head = exited_count = 0;

@@ -44,7 +44,7 @@ static char          g_prom_path[512];
 /* ── CSV formatting ──────────────────────────────────────────────── */
 
 static const char *CSV_HEADER =
-	"timestamp,hostname,event_type,rule,root_pid,pid,ppid,uid,"
+	"timestamp,hostname,event_type,rule,tags,root_pid,pid,ppid,uid,"
 	"comm,exec,args,cgroup,is_root,state,exit_code,"
 	"cpu_ns,cpu_usage_ratio,rss_bytes,rss_min_bytes,rss_max_bytes,"
 	"shmem_bytes,swap_bytes,vsize_bytes,"
@@ -80,7 +80,7 @@ static int csv_escape_field(const char *src, char *dst, int dstlen)
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
 	const struct metric_event *ev = &rec->event;
-	char hostname_esc[600], event_type_esc[32], rule_esc[150];
+	char hostname_esc[600], event_type_esc[32], rule_esc[150], tags_esc[1100];
 	char comm_esc[200], exec_esc[600];
 	char args_esc[600], cgroup_esc[600], state_esc[8];
 	char file_path_esc[600];
@@ -89,6 +89,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
 	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));
 	csv_escape_field(ev->rule, rule_esc, sizeof(rule_esc));
+	csv_escape_field(ev->tags, tags_esc, sizeof(tags_esc));
 	csv_escape_field(ev->comm, comm_esc, sizeof(comm_esc));
 	csv_escape_field(ev->exec_path, exec_esc, sizeof(exec_esc));
 	csv_escape_field(ev->args, args_esc, sizeof(args_esc));
@@ -115,7 +116,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(state_raw, state_esc, sizeof(state_esc));
 
 	int n = snprintf(buf, buflen,
-		"%s,%s,%s,%s,%u,%u,%u,%u,"
+		"%s,%s,%s,%s,%s,%u,%u,%u,%u,"
 		"%s,%s,%s,%s,%u,%s,%u,"
 		"%llu,%.4f,%llu,%llu,%llu,"
 		"%llu,%llu,%llu,"
@@ -129,6 +130,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		hostname_esc,
 		event_type_esc,
 		rule_esc,
+		tags_esc,
 		ev->root_pid,
 		ev->pid,
 		ev->ppid,

@@ -25,6 +25,7 @@ struct metric_event {
 	__u64 timestamp_ns;
 	char  event_type[12];         /* "fork","exec","exit","oom_kill","snapshot","file_close" */
 	char  rule[64];
+	char  tags[512];              /* pipe-separated list of all matched rules */
 	__u32 root_pid;
 	__u32 pid;
 	__u32 ppid;

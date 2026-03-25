@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     hostname               LowCardinality(String)      CODEC(ZSTD(1)),
     event_type             LowCardinality(String)      CODEC(ZSTD(1)),
     rule                   LowCardinality(String)      CODEC(ZSTD(1)),
+    tags                   Array(String)               CODEC(ZSTD(1)),
     root_pid               UInt32                      CODEC(T64, ZSTD(1)),
     pid                    UInt32                      CODEC(T64, ZSTD(1)),
     ppid                   UInt32                      CODEC(T64, ZSTD(1)),
@@ -164,11 +165,11 @@ SETTINGS
 -- REFRESH EVERY 30 SECOND APPEND
 -- TO process_metrics
 -- AS
--- SELECT *
+-- SELECT * REPLACE splitByChar('|', tags) AS tags
 -- FROM url(
 --     'http://server1:9091/metrics?format=csv&clear=1',
 --     'CSVWithNames',
---     'timestamp DateTime64(3), hostname String, event_type String, rule String,
+--     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
 --      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
 --      comm String, exec String, args String, cgroup String,
 --      is_root UInt8, state String, exit_code UInt32,
@@ -195,7 +196,7 @@ SETTINGS
 -- SELECT * FROM url(
 --     'http://server1:9091/metrics?format=csv&clear=1',
 --     'CSVWithNames',
---     'timestamp DateTime64(3), hostname String, event_type String, rule String,
+--     'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
 --      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
 --      comm String, exec String, args String, cgroup String,
 --      is_root UInt8, state String, exit_code UInt32,
