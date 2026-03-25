@@ -1,6 +1,8 @@
 -- process_metrics — схема таблицы ClickHouse (оптимизированная)
 --
--- Одна таблица для всех типов событий: snapshot, fork, exec, exit, oom_kill, file_close.
+-- Одна таблица для всех типов событий: snapshot, fork, exec, exit, oom_kill,
+-- file_close, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv,
+-- udp_agg, icmp_agg.
 -- Выполнить один раз на сервере ClickHouse.
 --
 -- Проектные решения:
@@ -137,6 +139,16 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     sig_code               Int32                       CODEC(T64, ZSTD(1)),
     sig_result             Int32                       CODEC(T64, ZSTD(1)),
 
+    -- ── security tracking (tcp_retrans, syn_recv, rst_sent/rst_recv) ─
+    sec_local_addr         String                      CODEC(ZSTD(1)),
+    sec_remote_addr        String                      CODEC(ZSTD(1)),
+    sec_local_port         UInt16                      CODEC(T64, ZSTD(1)),
+    sec_remote_port        UInt16                      CODEC(T64, ZSTD(1)),
+    sec_af                 UInt8                       CODEC(T64, ZSTD(1)),
+    sec_tcp_state          UInt8                       CODEC(T64, ZSTD(1)),
+    sec_direction          UInt8                       CODEC(T64, ZSTD(1)),
+    open_tcp_conns         UInt64                      CODEC(T64, ZSTD(1)),
+
     -- ── skip-индексы ──────────────────────────────────────────────
     INDEX idx_pid pid TYPE bloom_filter(0.01) GRANULARITY 4
 )
@@ -215,7 +227,11 @@ FROM url(
      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64,
      sig_num UInt32, sig_target_pid UInt32, sig_target_comm String,
-     sig_code Int32, sig_result Int32'
+     sig_code Int32, sig_result Int32,
+     sec_local_addr String, sec_remote_addr String,
+     sec_local_port UInt16, sec_remote_port UInt16,
+     sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
+     open_tcp_conns UInt64'
 );
 
 -- ══════════════════════════════════════════════════════════════════════
@@ -249,5 +265,9 @@ SELECT * FROM url(
      net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
      net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64,
      sig_num UInt32, sig_target_pid UInt32, sig_target_comm String,
-     sig_code Int32, sig_result Int32'
+     sig_code Int32, sig_result Int32,
+     sec_local_addr String, sec_remote_addr String,
+     sec_local_port UInt16, sec_remote_port UInt16,
+     sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
+     open_tcp_conns UInt64'
 );

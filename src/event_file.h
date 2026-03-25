@@ -114,6 +114,19 @@ struct metric_event {
 	char  sig_target_comm[COMM_LEN]; /* target process comm */
 	__s32 sig_code;             /* SI_USER=0, SI_KERNEL=0x80, etc. */
 	__s32 sig_result;           /* 0 = delivered successfully */
+
+	/* ── security tracking ────────────────────────────────────── */
+	/* TCP retransmit (EVENT_TCP_RETRANSMIT) */
+	char  sec_local_addr[46];   /* formatted IP string */
+	char  sec_remote_addr[46];  /* formatted IP string */
+	__u16 sec_local_port;
+	__u16 sec_remote_port;
+	__u8  sec_af;               /* AF_INET=2, AF_INET6=10 */
+	__u8  sec_tcp_state;        /* TCP state at retransmit time */
+	__u8  sec_direction;        /* RST: 0=sent, 1=received */
+
+	/* open TCP connections (snapshot only) */
+	__u64 open_tcp_conns;
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */

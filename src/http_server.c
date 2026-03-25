@@ -73,7 +73,10 @@ static const char *CSV_HEADER =
 	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
 	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms,"
 	/* сигналы */
-	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result\n";
+	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
+	/* security tracking */
+	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
+	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns\n";
 
 static int csv_escape_field(const char *src, char *dst, int dstlen)
 {
@@ -104,6 +107,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	char net_local_esc[100], net_remote_esc[100];
 	char pwd_esc[600];
 	char sig_target_comm_esc[200];
+	char sec_local_esc[100], sec_remote_esc[100];
 
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
 	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));
@@ -119,6 +123,10 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(ev->pwd, pwd_esc, sizeof(pwd_esc));
 	csv_escape_field(ev->sig_target_comm, sig_target_comm_esc,
 			 sizeof(sig_target_comm_esc));
+	csv_escape_field(ev->sec_local_addr, sec_local_esc,
+			 sizeof(sec_local_esc));
+	csv_escape_field(ev->sec_remote_addr, sec_remote_esc,
+			 sizeof(sec_remote_esc));
 
 	/* Format timestamp as ISO 8601: YYYY-MM-DD HH:MM:SS.mmm
 	 * This format is natively parsed by ClickHouse DateTime64(3) */
@@ -164,7 +172,9 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* сетевой трекинг */
 		"%s,%s,%u,%u,%llu,%llu,%llu,"
 		/* сигналы */
-		"%u,%u,%s,%d,%d\n",
+		"%u,%u,%s,%d,%d,"
+		/* security tracking */
+		"%s,%s,%u,%u,%u,%u,%u,%llu\n",
 		/* идентификация */
 		ts_str, hostname_esc, event_type_esc, rule_esc, tags_esc,
 		ev->root_pid, ev->pid, ev->ppid, ev->uid,
@@ -227,7 +237,15 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* сигналы */
 		ev->sig_num, ev->sig_target_pid,
 		sig_target_comm_esc,
-		(int)ev->sig_code, (int)ev->sig_result);
+		(int)ev->sig_code, (int)ev->sig_result,
+		/* security tracking */
+		sec_local_esc, sec_remote_esc,
+		(unsigned)ev->sec_local_port,
+		(unsigned)ev->sec_remote_port,
+		(unsigned)ev->sec_af,
+		(unsigned)ev->sec_tcp_state,
+		(unsigned)ev->sec_direction,
+		(unsigned long long)ev->open_tcp_conns);
 
 	return n < buflen ? n : -1;
 }

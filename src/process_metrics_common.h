@@ -25,13 +25,16 @@ struct rate_state {
 };
 
 enum event_type {
-	EVENT_FORK       = 1,
-	EVENT_EXEC       = 2,
-	EVENT_EXIT       = 3,
-	EVENT_OOM_KILL   = 4,
-	EVENT_FILE_CLOSE = 5,
-	EVENT_NET_CLOSE  = 6,
-	EVENT_SIGNAL     = 7,
+	EVENT_FORK           = 1,
+	EVENT_EXEC           = 2,
+	EVENT_EXIT           = 3,
+	EVENT_OOM_KILL       = 4,
+	EVENT_FILE_CLOSE     = 5,
+	EVENT_NET_CLOSE      = 6,
+	EVENT_SIGNAL         = 7,
+	EVENT_TCP_RETRANSMIT = 8,
+	EVENT_SYN_RECV       = 9,
+	EVENT_RST            = 10,
 };
 
 /* ── file tracking constants ──────────────────────────────────────── */
@@ -317,6 +320,103 @@ struct signal_event {
 	int   sig;            /* signal number (SIGKILL=9, etc.) */
 	int   sig_code;       /* SI_USER=0, SI_KERNEL=0x80, etc. */
 	int   sig_result;     /* 0 = delivered successfully */
+};
+
+/* ── security tracking ────────────────────────────────────────────── */
+
+/*
+ * Configuration for security probes (pushed from userspace to BPF).
+ */
+struct sec_config {
+	__u8 tcp_retransmit;     /* 1 = track TCP retransmissions */
+	__u8 syn_tracking;       /* 1 = track SYN-recv events */
+	__u8 rst_tracking;       /* 1 = track RST events */
+	__u8 udp_tracking;       /* 1 = aggregate UDP packets */
+	__u8 icmp_tracking;      /* 1 = aggregate ICMP packets */
+	__u8 open_conn_count;    /* 1 = count open TCP connections */
+};
+
+/*
+ * TCP retransmit event — per-event, sent via ringbuf.
+ */
+struct retransmit_event {
+	__u32 type;           /* EVENT_TCP_RETRANSMIT */
+	__u32 tgid;
+	__u32 uid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  comm[COMM_LEN];
+	__u8  af;             /* AF_INET=2, AF_INET6=10 */
+	__u8  local_addr[16];
+	__u8  remote_addr[16];
+	__u16 local_port;
+	__u16 remote_port;
+	__u8  state;          /* TCP state at retransmit time */
+};
+
+/*
+ * SYN-recv event — incoming TCP SYN (half-open connection).
+ */
+struct syn_event {
+	__u32 type;           /* EVENT_SYN_RECV */
+	__u32 tgid;
+	__u32 uid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  comm[COMM_LEN];
+	__u8  af;
+	__u8  local_addr[16];
+	__u8  remote_addr[16];
+	__u16 local_port;
+	__u16 remote_port;
+};
+
+/*
+ * RST event — TCP reset sent or received.
+ */
+struct rst_event {
+	__u32 type;           /* EVENT_RST */
+	__u32 tgid;
+	__u32 uid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	char  comm[COMM_LEN];
+	__u8  af;
+	__u8  local_addr[16];
+	__u8  remote_addr[16];
+	__u16 local_port;
+	__u16 remote_port;
+	__u8  direction;      /* 0 = sent, 1 = received */
+};
+
+/*
+ * UDP aggregation (BPF map, flushed by userspace on snapshot).
+ */
+struct udp_agg_key {
+	__u32 tgid;
+	__u8  af;
+	__u8  remote_addr[16];
+	__u16 remote_port;
+};
+
+struct udp_agg_val {
+	__u64 tx_packets;
+	__u64 rx_packets;
+	__u64 tx_bytes;
+	__u64 rx_bytes;
+};
+
+/*
+ * ICMP aggregation (BPF map, flushed by userspace on snapshot).
+ */
+struct icmp_agg_key {
+	__u8  src_addr[16];
+	__u8  icmp_type;
+	__u8  icmp_code;
+};
+
+struct icmp_agg_val {
+	__u64 count;
 };
 
 #endif /* PROCESS_METRICS_COMMON_H */

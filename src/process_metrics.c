@@ -90,6 +90,14 @@ static int cfg_file_track_bytes             = 0;
 /* Docker resolve config */
 static char cfg_docker_data_root[PATH_MAX_LEN] = "";
 static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
+
+/* Security tracking config */
+static int cfg_sec_tcp_retransmit  = 0;
+static int cfg_sec_syn_tracking    = 0;
+static int cfg_sec_rst_tracking    = 0;
+static int cfg_sec_udp_tracking    = 0;
+static int cfg_sec_icmp_tracking   = 0;
+static int cfg_sec_open_conn_count = 0;
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
@@ -729,6 +737,23 @@ static int load_config(const char *path)
 		if (config_setting_lookup_string(dk, "daemon_json", &str_val))
 			snprintf(cfg_docker_daemon_json, sizeof(cfg_docker_daemon_json),
 				 "%s", str_val);
+	}
+
+	/* Security tracking settings */
+	config_setting_t *st = config_lookup(&cfg, "security_tracking");
+	if (st) {
+		if (config_setting_lookup_bool(st, "tcp_retransmit", &bool_val))
+			cfg_sec_tcp_retransmit = bool_val;
+		if (config_setting_lookup_bool(st, "syn_tracking", &bool_val))
+			cfg_sec_syn_tracking = bool_val;
+		if (config_setting_lookup_bool(st, "rst_tracking", &bool_val))
+			cfg_sec_rst_tracking = bool_val;
+		if (config_setting_lookup_bool(st, "udp_tracking", &bool_val))
+			cfg_sec_udp_tracking = bool_val;
+		if (config_setting_lookup_bool(st, "icmp_tracking", &bool_val))
+			cfg_sec_icmp_tracking = bool_val;
+		if (config_setting_lookup_bool(st, "open_conn_count", &bool_val))
+			cfg_sec_open_conn_count = bool_val;
 	}
 
 	/* Default paths when http_server is enabled */
@@ -1474,6 +1499,207 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
+	/* Handle TCP retransmit events */
+	if (type == EVENT_TCP_RETRANSMIT) {
+		if (size < sizeof(struct retransmit_event))
+			return 0;
+		const struct retransmit_event *re = data;
+
+		log_debug("TCP_RETRANSMIT: pid=%u port=%u→%u state=%u",
+			  re->tgid, re->local_port, re->remote_port,
+			  re->state);
+
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "tcp_retrans");
+			cev.pid = re->tgid;
+			cev.uid = re->uid;
+			memcpy(cev.comm, re->comm, COMM_LEN);
+			const char *cg = resolve_cgroup(re->cgroup_id);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+			/* Resolve rule */
+			struct track_info ti;
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&re->tgid, &ti) == 0) {
+				if (ti.rule_id < num_rules)
+					snprintf(cev.rule, sizeof(cev.rule),
+						 "%s", rules[ti.rule_id].name);
+				cev.root_pid = ti.root_pid;
+				const char *t = tags_lookup(re->tgid);
+				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+			}
+			/* Address fields */
+			cev.sec_af = re->af;
+			cev.sec_local_port = re->local_port;
+			cev.sec_remote_port = re->remote_port;
+			cev.sec_tcp_state = re->state;
+			if (re->af == 2) {
+				snprintf(cev.sec_local_addr,
+					 sizeof(cev.sec_local_addr),
+					 "%u.%u.%u.%u",
+					 re->local_addr[0], re->local_addr[1],
+					 re->local_addr[2], re->local_addr[3]);
+				snprintf(cev.sec_remote_addr,
+					 sizeof(cev.sec_remote_addr),
+					 "%u.%u.%u.%u",
+					 re->remote_addr[0], re->remote_addr[1],
+					 re->remote_addr[2], re->remote_addr[3]);
+			} else if (re->af == 10) {
+				inet_ntop(AF_INET6, re->local_addr,
+					  cev.sec_local_addr,
+					  sizeof(cev.sec_local_addr));
+				inet_ntop(AF_INET6, re->remote_addr,
+					  cev.sec_remote_addr,
+					  sizeof(cev.sec_remote_addr));
+			}
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
+	/* Handle SYN recv events */
+	if (type == EVENT_SYN_RECV) {
+		if (size < sizeof(struct syn_event))
+			return 0;
+		const struct syn_event *se_syn = data;
+
+		log_debug("SYN_RECV: pid=%u port=%u←%u",
+			  se_syn->tgid, se_syn->local_port,
+			  se_syn->remote_port);
+
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "syn_recv");
+			cev.pid = se_syn->tgid;
+			cev.uid = se_syn->uid;
+			memcpy(cev.comm, se_syn->comm, COMM_LEN);
+			const char *cg = resolve_cgroup(se_syn->cgroup_id);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+			struct track_info ti;
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&se_syn->tgid, &ti) == 0) {
+				if (ti.rule_id < num_rules)
+					snprintf(cev.rule, sizeof(cev.rule),
+						 "%s", rules[ti.rule_id].name);
+				cev.root_pid = ti.root_pid;
+				const char *t = tags_lookup(se_syn->tgid);
+				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+			}
+			cev.sec_af = se_syn->af;
+			cev.sec_local_port = se_syn->local_port;
+			cev.sec_remote_port = se_syn->remote_port;
+			if (se_syn->af == 2) {
+				snprintf(cev.sec_local_addr,
+					 sizeof(cev.sec_local_addr),
+					 "%u.%u.%u.%u",
+					 se_syn->local_addr[0],
+					 se_syn->local_addr[1],
+					 se_syn->local_addr[2],
+					 se_syn->local_addr[3]);
+				snprintf(cev.sec_remote_addr,
+					 sizeof(cev.sec_remote_addr),
+					 "%u.%u.%u.%u",
+					 se_syn->remote_addr[0],
+					 se_syn->remote_addr[1],
+					 se_syn->remote_addr[2],
+					 se_syn->remote_addr[3]);
+			} else if (se_syn->af == 10) {
+				inet_ntop(AF_INET6, se_syn->local_addr,
+					  cev.sec_local_addr,
+					  sizeof(cev.sec_local_addr));
+				inet_ntop(AF_INET6, se_syn->remote_addr,
+					  cev.sec_remote_addr,
+					  sizeof(cev.sec_remote_addr));
+			}
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
+	/* Handle RST events */
+	if (type == EVENT_RST) {
+		if (size < sizeof(struct rst_event))
+			return 0;
+		const struct rst_event *rste = data;
+
+		log_debug("RST: pid=%u port=%u↔%u dir=%s",
+			  rste->tgid, rste->local_port, rste->remote_port,
+			  rste->direction ? "recv" : "sent");
+
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			struct timespec ts_now;
+			clock_gettime(CLOCK_REALTIME, &ts_now);
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+					 + (__u64)ts_now.tv_nsec;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 rste->direction ? "rst_recv" : "rst_sent");
+			cev.pid = rste->tgid;
+			cev.uid = rste->uid;
+			memcpy(cev.comm, rste->comm, COMM_LEN);
+			const char *cg = resolve_cgroup(rste->cgroup_id);
+			if (cg)
+				snprintf(cev.cgroup, sizeof(cev.cgroup),
+					 "%s", cg);
+			struct track_info ti;
+			if (bpf_map_lookup_elem(tracked_map_fd,
+						&rste->tgid, &ti) == 0) {
+				if (ti.rule_id < num_rules)
+					snprintf(cev.rule, sizeof(cev.rule),
+						 "%s", rules[ti.rule_id].name);
+				cev.root_pid = ti.root_pid;
+				const char *t = tags_lookup(rste->tgid);
+				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+			}
+			cev.sec_af = rste->af;
+			cev.sec_local_port = rste->local_port;
+			cev.sec_remote_port = rste->remote_port;
+			cev.sec_direction = rste->direction;
+			if (rste->af == 2) {
+				snprintf(cev.sec_local_addr,
+					 sizeof(cev.sec_local_addr),
+					 "%u.%u.%u.%u",
+					 rste->local_addr[0],
+					 rste->local_addr[1],
+					 rste->local_addr[2],
+					 rste->local_addr[3]);
+				snprintf(cev.sec_remote_addr,
+					 sizeof(cev.sec_remote_addr),
+					 "%u.%u.%u.%u",
+					 rste->remote_addr[0],
+					 rste->remote_addr[1],
+					 rste->remote_addr[2],
+					 rste->remote_addr[3]);
+			} else if (rste->af == 10) {
+				inet_ntop(AF_INET6, rste->local_addr,
+					  cev.sec_local_addr,
+					  sizeof(cev.sec_local_addr));
+				inet_ntop(AF_INET6, rste->remote_addr,
+					  cev.sec_remote_addr,
+					  sizeof(cev.sec_remote_addr));
+			}
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
 	const struct event *e = data;
 	if (size < sizeof(*e))
 		return 0;
@@ -2105,12 +2331,144 @@ static void write_snapshot(void)
 				cev.cgroup_pids_current = seen_cg[cg_idx].pids_cur;
 			}
 
+			/* Open TCP connections count */
+			if (cfg_sec_open_conn_count) {
+				__u64 conn_cnt = 0;
+				int occ_fd = bpf_map__fd(skel->maps.open_conn_map);
+				__u32 occ_key = pi.tgid;
+				if (bpf_map_lookup_elem(occ_fd, &occ_key,
+							&conn_cnt) == 0)
+					cev.open_tcp_conns = conn_cnt;
+			}
+
 			ef_append(&cev, cfg_hostname);
 			snap_count++;
 		}
 		pid_count++;
 	}
 	free(all_keys);
+
+	/* Flush UDP aggregation map before unlocking batch */
+	if (cfg_sec_udp_tracking && g_http_cfg.enabled) {
+		int udp_fd = bpf_map__fd(skel->maps.udp_agg_map);
+		struct udp_agg_key ukey;
+		struct udp_agg_val uval;
+		int udp_count = 0;
+
+		while (bpf_map_get_next_key(udp_fd, NULL, &ukey) == 0) {
+			if (bpf_map_lookup_elem(udp_fd, &ukey, &uval) == 0
+			    && (uval.tx_packets || uval.rx_packets)) {
+				struct metric_event cev;
+				memset(&cev, 0, sizeof(cev));
+				cev.timestamp_ns = snap_timestamp_ns;
+				snprintf(cev.event_type, sizeof(cev.event_type),
+					 "udp_agg");
+				cev.pid = ukey.tgid;
+				cev.sec_af = ukey.af;
+				cev.sec_remote_port = ukey.remote_port;
+				if (ukey.af == 2) {
+					snprintf(cev.sec_remote_addr,
+						 sizeof(cev.sec_remote_addr),
+						 "%u.%u.%u.%u",
+						 ukey.remote_addr[0],
+						 ukey.remote_addr[1],
+						 ukey.remote_addr[2],
+						 ukey.remote_addr[3]);
+				} else if (ukey.af == 10) {
+					inet_ntop(AF_INET6,
+						  ukey.remote_addr,
+						  cev.sec_remote_addr,
+						  sizeof(cev.sec_remote_addr));
+				}
+				cev.net_tx_bytes = uval.tx_bytes;
+				cev.net_rx_bytes = uval.rx_bytes;
+				cev.file_read_bytes = uval.rx_packets;
+				cev.file_write_bytes = uval.tx_packets;
+
+				struct proc_info upi;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&ukey.tgid,
+							&upi) == 0) {
+					memcpy(cev.comm, upi.comm, COMM_LEN);
+					const char *ucg = resolve_cgroup(
+						upi.cgroup_id);
+					if (ucg)
+						snprintf(cev.cgroup,
+							 sizeof(cev.cgroup),
+							 "%s", ucg);
+				}
+				struct track_info uti;
+				if (bpf_map_lookup_elem(tracked_map_fd,
+							&ukey.tgid,
+							&uti) == 0) {
+					if (uti.rule_id < num_rules)
+						snprintf(cev.rule,
+							 sizeof(cev.rule),
+							 "%s",
+							 rules[uti.rule_id].name);
+					cev.root_pid = uti.root_pid;
+					const char *ut = tags_lookup(ukey.tgid);
+					snprintf(cev.tags, sizeof(cev.tags),
+						 "%s", ut);
+				}
+				ef_append(&cev, cfg_hostname);
+				udp_count++;
+			}
+			bpf_map_delete_elem(udp_fd, &ukey);
+		}
+		if (udp_count > 0)
+			log_debug("UDP flush: %d aggregates", udp_count);
+	}
+
+	/* Flush ICMP aggregation map before unlocking batch */
+	if (cfg_sec_icmp_tracking && g_http_cfg.enabled) {
+		int icmp_fd = bpf_map__fd(skel->maps.icmp_agg_map);
+		struct icmp_agg_key ikey;
+		struct icmp_agg_val ival;
+		int icmp_count = 0;
+
+		while (bpf_map_get_next_key(icmp_fd, NULL, &ikey) == 0) {
+			if (bpf_map_lookup_elem(icmp_fd, &ikey, &ival) == 0
+			    && ival.count > 0) {
+				struct metric_event cev;
+				memset(&cev, 0, sizeof(cev));
+				cev.timestamp_ns = snap_timestamp_ns;
+				snprintf(cev.event_type, sizeof(cev.event_type),
+					 "icmp_agg");
+				int is_v4 = 1;
+				for (int b = 4; b < 16; b++) {
+					if (ikey.src_addr[b]) {
+						is_v4 = 0;
+						break;
+					}
+				}
+				if (is_v4) {
+					cev.sec_af = 2;
+					snprintf(cev.sec_remote_addr,
+						 sizeof(cev.sec_remote_addr),
+						 "%u.%u.%u.%u",
+						 ikey.src_addr[0],
+						 ikey.src_addr[1],
+						 ikey.src_addr[2],
+						 ikey.src_addr[3]);
+				} else {
+					cev.sec_af = 10;
+					inet_ntop(AF_INET6,
+						  ikey.src_addr,
+						  cev.sec_remote_addr,
+						  sizeof(cev.sec_remote_addr));
+				}
+				cev.sec_tcp_state = ikey.icmp_type;
+				cev.sec_direction = ikey.icmp_code;
+				cev.open_tcp_conns = ival.count;
+				ef_append(&cev, cfg_hostname);
+				icmp_count++;
+			}
+			bpf_map_delete_elem(icmp_fd, &ikey);
+		}
+		if (icmp_count > 0)
+			log_debug("ICMP flush: %d aggregates", icmp_count);
+	}
 
 	/* Unlock batch — snapshot is complete, safe for swap/snapshot_fd */
 	ef_batch_unlock();
@@ -2389,6 +2747,24 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.handle_write_exit);
 	}
 
+	/* Conditionally disable security tracking programs */
+	if (!cfg_sec_tcp_retransmit)
+		BPF_PROG_DISABLE(skel->progs.handle_tcp_retransmit);
+	if (!cfg_sec_syn_tracking)
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_conn_request);
+	if (!cfg_sec_rst_tracking) {
+		BPF_PROG_DISABLE(skel->progs.handle_tcp_send_reset);
+		BPF_PROG_DISABLE(skel->progs.handle_tcp_receive_reset);
+	}
+	if (!cfg_sec_udp_tracking) {
+		BPF_PROG_DISABLE(skel->progs.kp_udp_sendmsg_sec);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg_sec);
+		BPF_PROG_DISABLE(skel->progs.kp_udp_recvmsg_sec);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg_sec);
+	}
+	if (!cfg_sec_icmp_tracking)
+		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
+
 	/* Load BPF programs */
 	if (process_metrics_bpf__load(skel)) {
 		fprintf(stderr, "FATAL: failed to load BPF programs\n");
@@ -2434,6 +2810,21 @@ int main(int argc, char *argv[])
 		bpf_map_update_elem(net_cfg_fd, &key0, &nc, BPF_ANY);
 	}
 
+	/* Push security tracking config to BPF maps */
+	{
+		int sec_cfg_fd = bpf_map__fd(skel->maps.sec_cfg);
+		__u32 key0 = 0;
+		struct sec_config sc = {
+			.tcp_retransmit  = (__u8)cfg_sec_tcp_retransmit,
+			.syn_tracking    = (__u8)cfg_sec_syn_tracking,
+			.rst_tracking    = (__u8)cfg_sec_rst_tracking,
+			.udp_tracking    = (__u8)cfg_sec_udp_tracking,
+			.icmp_tracking   = (__u8)cfg_sec_icmp_tracking,
+			.open_conn_count = (__u8)cfg_sec_open_conn_count,
+		};
+		bpf_map_update_elem(sec_cfg_fd, &key0, &sc, BPF_ANY);
+	}
+
 	if (process_metrics_bpf__attach(skel)) {
 		fprintf(stderr, "FATAL: failed to attach BPF programs\n");
 		process_metrics_bpf__destroy(skel);
@@ -2474,7 +2865,8 @@ int main(int argc, char *argv[])
 	log_ts("INFO", "started: %d rules, snapshot every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
-	       "net_tracking=%s%s, file_tracking=%s%s",
+	       "net_tracking=%s%s, file_tracking=%s%s, "
+	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s]",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
@@ -2483,7 +2875,13 @@ int main(int argc, char *argv[])
 	       cfg_net_tracking_enabled ? "on" : "off",
 	       cfg_net_track_bytes ? "+bytes" : "",
 	       cfg_file_tracking_enabled ? "on" : "off",
-	       cfg_file_track_bytes ? "+bytes" : "");
+	       cfg_file_track_bytes ? "+bytes" : "",
+	       cfg_sec_tcp_retransmit ? "on" : "off",
+	       cfg_sec_syn_tracking ? "on" : "off",
+	       cfg_sec_rst_tracking ? "on" : "off",
+	       cfg_sec_udp_tracking ? "on" : "off",
+	       cfg_sec_icmp_tracking ? "on" : "off",
+	       cfg_sec_open_conn_count ? "on" : "off");
 
 	/* Main loop */
 	time_t last_snapshot = 0;

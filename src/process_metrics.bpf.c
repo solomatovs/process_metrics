@@ -1161,6 +1161,15 @@ struct {
 	__type(value, struct sendmsg_args);
 } sendmsg_args_map SEC(".maps");
 
+/* Open TCP connection counter per tgid (defined in security section,
+ * declared here for use in connect/close hooks) */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, __u32);
+	__type(value, __u64);
+} open_conn_map SEC(".maps");
+
 /*
  * Чтение адресов сокета в sock_info.
  * Поддерживает AF_INET и AF_INET6.
@@ -1258,6 +1267,12 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+
+	/* open_conn_count: increment */
+	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
+	if (cnt) __sync_fetch_and_add(cnt, 1);
+	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+
 	return 0;
 }
 
@@ -1296,6 +1311,12 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+
+	/* open_conn_count: increment */
+	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
+	if (cnt) __sync_fetch_and_add(cnt, 1);
+	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+
 	return 0;
 }
 
@@ -1318,6 +1339,12 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+
+	/* open_conn_count: increment */
+	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
+	if (cnt) __sync_fetch_and_add(cnt, 1);
+	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+
 	return 0;
 }
 
@@ -1330,6 +1357,11 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
 	if (!si)
 		return 0;
+
+	/* open_conn_count: decrement */
+	__u32 tgid = si->tgid;
+	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
+	if (cnt && *cnt > 0) __sync_fetch_and_sub(cnt, 1);
 
 	emit_net_close(si, bpf_ktime_get_boot_ns());
 	bpf_map_delete_elem(&sock_map, &sk_ptr);
@@ -1435,5 +1467,407 @@ int BPF_KRETPROBE(ret_udp_recvmsg, int ret)
 		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
 	return 0;
 }
+
+/* ── Security probes ─────────────────────────────────────────────── */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct sec_config);
+} sec_cfg SEC(".maps");
+
+/* UDP aggregation map — flushed by userspace on snapshot */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct udp_agg_key);
+	__type(value, struct udp_agg_val);
+} udp_agg_map SEC(".maps");
+
+/* ICMP aggregation map — flushed by userspace on snapshot */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct icmp_agg_key);
+	__type(value, struct icmp_agg_val);
+} icmp_agg_map SEC(".maps");
+
+/* open_conn_map already declared in net section above */
+
+/*
+ * Helper: check if sec_config flag is enabled.
+ */
+static __always_inline int sec_enabled(int offset)
+{
+	__u32 zero = 0;
+	struct sec_config *cfg = bpf_map_lookup_elem(&sec_cfg, &zero);
+	if (!cfg) return 0;
+	return *((__u8 *)cfg + offset);
+}
+
+#define SEC_TCP_RETRANSMIT  0
+#define SEC_SYN_TRACKING    1
+#define SEC_RST_TRACKING    2
+#define SEC_UDP_TRACKING    3
+#define SEC_ICMP_TRACKING   4
+#define SEC_OPEN_CONN_COUNT 5
+
+/*
+ * Helper: read sock addresses into flat fields (reuses sock parsing logic).
+ */
+static __always_inline void read_sock_to_event(
+	struct sock *sk,
+	__u8 *af, __u8 *local_addr, __u8 *remote_addr,
+	__u16 *local_port, __u16 *remote_port)
+{
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	*af = (__u8)family;
+	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+	*remote_port = __bpf_ntohs(dport);
+	*local_port  = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+	if (family == 2) { /* AF_INET */
+		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__builtin_memcpy(remote_addr, &daddr, 4);
+		__builtin_memcpy(local_addr, &saddr, 4);
+	} else if (family == 10) { /* AF_INET6 */
+		BPF_CORE_READ_INTO(remote_addr, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(local_addr, sk,
+				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+	}
+}
+
+/* ── TCP retransmit: raw_tracepoint/tcp_retransmit_skb ───────────── */
+
+SEC("raw_tracepoint/tcp_retransmit_skb")
+int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!sec_enabled(SEC_TCP_RETRANSMIT))
+		return 0;
+
+	/* args[0] = const struct sock *sk, args[1] = const struct sk_buff *skb */
+	struct sock *sk = (struct sock *)ctx->args[0];
+
+	struct retransmit_event *re =
+		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+	if (!re)
+		return 0;
+
+	__builtin_memset(re, 0, sizeof(*re));
+	re->type = EVENT_TCP_RETRANSMIT;
+	re->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(re->comm, sizeof(re->comm));
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	re->tgid = (__u32)(pid_tgid >> 32);
+	re->uid  = (__u32)bpf_get_current_uid_gid();
+
+	/* cgroup */
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+
+	/* addresses from sock */
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
+			   &re->local_port, &re->remote_port);
+
+	/* TCP state */
+	re->state = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
+
+	bpf_ringbuf_submit(re, 0);
+	return 0;
+}
+
+/* ── SYN flood: kprobe/tcp_conn_request ──────────────────────────── */
+
+SEC("kprobe/tcp_conn_request")
+int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
+	       const void *af_ops, struct sock *sk, struct sk_buff *skb)
+{
+	if (!sec_enabled(SEC_SYN_TRACKING))
+		return 0;
+
+	struct syn_event *se =
+		bpf_ringbuf_reserve(&events, sizeof(*se), 0);
+	if (!se)
+		return 0;
+
+	__builtin_memset(se, 0, sizeof(*se));
+	se->type = EVENT_SYN_RECV;
+	se->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(se->comm, sizeof(se->comm));
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	se->tgid = (__u32)(pid_tgid >> 32);
+	se->uid  = (__u32)bpf_get_current_uid_gid();
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+
+	/* Listener local addr/port from sock */
+	se->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	se->af = (__u8)family;
+
+	if (family == 2) { /* AF_INET */
+		__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+		__builtin_memcpy(se->local_addr, &saddr, 4);
+	} else if (family == 10) { /* AF_INET6 */
+		BPF_CORE_READ_INTO(se->local_addr, sk,
+				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+	}
+
+	/* Remote addr from skb IP header */
+	unsigned char *head = BPF_CORE_READ(skb, head);
+	__u16 nh_off = BPF_CORE_READ(skb, network_header);
+	if (family == 2) {
+		struct iphdr *iph = (struct iphdr *)(head + nh_off);
+		__u32 src;
+		bpf_probe_read_kernel(&src, 4, &iph->saddr);
+		__builtin_memcpy(se->remote_addr, &src, 4);
+	} else if (family == 10) {
+		struct ipv6hdr *ip6h = (struct ipv6hdr *)(head + nh_off);
+		bpf_probe_read_kernel(se->remote_addr, 16, &ip6h->saddr);
+	}
+
+	/* Remote port from TCP header */
+	__u16 th_off = BPF_CORE_READ(skb, transport_header);
+	struct tcphdr *th = (struct tcphdr *)(head + th_off);
+	__be16 sport;
+	bpf_probe_read_kernel(&sport, 2, &th->source);
+	se->remote_port = __bpf_ntohs(sport);
+
+	bpf_ringbuf_submit(se, 0);
+	return 0;
+}
+
+/* ── RST sent: raw_tracepoint/tcp_send_reset ─────────────────────── */
+
+SEC("raw_tracepoint/tcp_send_reset")
+int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!sec_enabled(SEC_RST_TRACKING))
+		return 0;
+
+	/* args[0] = const struct sock *sk (may be NULL), args[1] = struct sk_buff *skb */
+	struct sock *sk = (struct sock *)ctx->args[0];
+	if (!sk)
+		return 0;
+
+	struct rst_event *re =
+		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+	if (!re)
+		return 0;
+
+	__builtin_memset(re, 0, sizeof(*re));
+	re->type = EVENT_RST;
+	re->direction = 0; /* sent */
+	re->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(re->comm, sizeof(re->comm));
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	re->tgid = (__u32)(pid_tgid >> 32);
+	re->uid  = (__u32)bpf_get_current_uid_gid();
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
+			   &re->local_port, &re->remote_port);
+
+	bpf_ringbuf_submit(re, 0);
+	return 0;
+}
+
+/* ── RST received: raw_tracepoint/tcp_receive_reset ──────────────── */
+
+SEC("raw_tracepoint/tcp_receive_reset")
+int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
+{
+	if (!sec_enabled(SEC_RST_TRACKING))
+		return 0;
+
+	/* args[0] = struct sock *sk */
+	struct sock *sk = (struct sock *)ctx->args[0];
+
+	struct rst_event *re =
+		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+	if (!re)
+		return 0;
+
+	__builtin_memset(re, 0, sizeof(*re));
+	re->type = EVENT_RST;
+	re->direction = 1; /* received */
+	re->timestamp_ns = bpf_ktime_get_boot_ns();
+	bpf_get_current_comm(re->comm, sizeof(re->comm));
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	re->tgid = (__u32)(pid_tgid >> 32);
+	re->uid  = (__u32)bpf_get_current_uid_gid();
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
+			   &re->local_port, &re->remote_port);
+
+	bpf_ringbuf_submit(re, 0);
+	return 0;
+}
+
+/* ── UDP flood: kprobe entry + kretprobe aggregation ─────────────── */
+
+/* Store sock pointer on entry for address extraction */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 8192);
+	__type(key, __u64);           /* pid_tgid */
+	__type(value, struct sendmsg_args);
+} udp_sendmsg_args SEC(".maps");
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(kp_udp_sendmsg_sec, struct sock *sk)
+{
+	if (!sec_enabled(SEC_UDP_TRACKING))
+		return 0;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/udp_sendmsg")
+int BPF_KRETPROBE(ret_udp_sendmsg_sec, int ret)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args =
+		bpf_map_lookup_elem(&udp_sendmsg_args, &pid_tgid);
+	if (!args)
+		return 0;
+	struct sock *sk = (struct sock *)args->sock_ptr;
+	bpf_map_delete_elem(&udp_sendmsg_args, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	struct udp_agg_key key = {};
+	key.tgid = (__u32)(pid_tgid >> 32);
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	key.af = (__u8)family;
+	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+	key.remote_port = __bpf_ntohs(dport);
+	if (family == 2) {
+		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		__builtin_memcpy(key.remote_addr, &daddr, 4);
+	} else if (family == 10) {
+		BPF_CORE_READ_INTO(key.remote_addr, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+	}
+
+	struct udp_agg_val *val = bpf_map_lookup_elem(&udp_agg_map, &key);
+	if (val) {
+		__sync_fetch_and_add(&val->tx_packets, 1);
+		__sync_fetch_and_add(&val->tx_bytes, (__u64)ret);
+	} else {
+		struct udp_agg_val new_val = {
+			.tx_packets = 1, .tx_bytes = (__u64)ret
+		};
+		bpf_map_update_elem(&udp_agg_map, &key, &new_val, BPF_NOEXIST);
+	}
+	return 0;
+}
+
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(kp_udp_recvmsg_sec, struct sock *sk)
+{
+	if (!sec_enabled(SEC_UDP_TRACKING))
+		return 0;
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/udp_recvmsg")
+int BPF_KRETPROBE(ret_udp_recvmsg_sec, int ret)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args =
+		bpf_map_lookup_elem(&udp_sendmsg_args, &pid_tgid);
+	if (!args)
+		return 0;
+	struct sock *sk = (struct sock *)args->sock_ptr;
+	bpf_map_delete_elem(&udp_sendmsg_args, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	struct udp_agg_key key = {};
+	key.tgid = (__u32)(pid_tgid >> 32);
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	key.af = (__u8)family;
+	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
+	key.remote_port = __bpf_ntohs(dport);
+	if (family == 2) {
+		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+		__builtin_memcpy(key.remote_addr, &daddr, 4);
+	} else if (family == 10) {
+		BPF_CORE_READ_INTO(key.remote_addr, sk,
+				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+	}
+
+	struct udp_agg_val *val = bpf_map_lookup_elem(&udp_agg_map, &key);
+	if (val) {
+		__sync_fetch_and_add(&val->rx_packets, 1);
+		__sync_fetch_and_add(&val->rx_bytes, (__u64)ret);
+	} else {
+		struct udp_agg_val new_val = {
+			.rx_packets = 1, .rx_bytes = (__u64)ret
+		};
+		bpf_map_update_elem(&udp_agg_map, &key, &new_val, BPF_NOEXIST);
+	}
+	return 0;
+}
+
+/* ── ICMP flood: kprobe/icmp_rcv ─────────────────────────────────── */
+
+SEC("kprobe/icmp_rcv")
+int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
+{
+	if (!sec_enabled(SEC_ICMP_TRACKING))
+		return 0;
+
+	struct icmp_agg_key key = {};
+
+	/* Read source IP from IP header */
+	unsigned char *head = BPF_CORE_READ(skb, head);
+	__u16 nh_off = BPF_CORE_READ(skb, network_header);
+	struct iphdr *iph = (struct iphdr *)(head + nh_off);
+	__u32 saddr;
+	bpf_probe_read_kernel(&saddr, 4, &iph->saddr);
+	__builtin_memcpy(key.src_addr, &saddr, 4);
+
+	/* Read ICMP type/code from transport header */
+	__u16 th_off = BPF_CORE_READ(skb, transport_header);
+	struct icmphdr *icmph = (struct icmphdr *)(head + th_off);
+	bpf_probe_read_kernel(&key.icmp_type, 1, &icmph->type);
+	bpf_probe_read_kernel(&key.icmp_code, 1, &icmph->code);
+
+	struct icmp_agg_val *val = bpf_map_lookup_elem(&icmp_agg_map, &key);
+	if (val) {
+		__sync_fetch_and_add(&val->count, 1);
+	} else {
+		struct icmp_agg_val new_val = { .count = 1 };
+		bpf_map_update_elem(&icmp_agg_map, &key, &new_val, BPF_NOEXIST);
+	}
+	return 0;
+}
+
+/* ── Open connection count: instrument existing connect/close ────── */
+/* Increment on successful connect/accept, decrement on tcp_close.
+ * This is done via the open_conn_map, keyed by tgid.
+ * Userspace reads during snapshot. */
 
 char LICENSE[] SEC("license") = "GPL";
