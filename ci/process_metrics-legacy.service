@@ -69,7 +69,19 @@ ExecStartPre=+/bin/sh -c '\
   || true; \
   mountpoint -q /sys/kernel/debug/tracing 2>/dev/null \
   || mount -t tracefs tracefs /sys/kernel/debug/tracing 2>/dev/null \
-  || true'
+  || true; \
+  echo "=== tracefs diagnostics ==="; \
+  echo "--- mounts ---"; \
+  grep -E "tracefs|debugfs" /proc/mounts || echo "(none)"; \
+  echo "--- /sys/kernel/tracing ---"; \
+  ls -la /sys/kernel/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
+  echo "--- /sys/kernel/debug/tracing ---"; \
+  ls -la /sys/kernel/debug/tracing/events/sched/sched_process_exec/id 2>&1 || true; \
+  echo "--- permissions ---"; \
+  ls -ld /sys/kernel/tracing 2>&1 || true; \
+  ls -ld /sys/kernel/debug 2>&1 || true; \
+  ls -ld /sys/kernel/debug/tracing 2>&1 || true; \
+  echo "=== end diagnostics ==="'
 
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \
