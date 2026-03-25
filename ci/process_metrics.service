@@ -54,7 +54,18 @@ NoNewPrivileges=yes
 # --- Подготовка (от root: префикс «+») ---
 # tracefs может быть не смонтирован (Astra Linux, hardened-ядра).
 # libbpf читает из него perf event ID для tracepoints.
-ExecStartPre=+/bin/sh -c 'mountpoint -q /sys/kernel/tracing 2>/dev/null || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true'
+# Пробуем оба пути: новый /sys/kernel/tracing и legacy /sys/kernel/debug/tracing.
+# На старых ядрах (< 4.17) tracefs доступен только через debugfs.
+ExecStartPre=+/bin/sh -c '\
+  mountpoint -q /sys/kernel/tracing 2>/dev/null \
+  || mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null \
+  || true; \
+  mountpoint -q /sys/kernel/debug 2>/dev/null \
+  || mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null \
+  || true; \
+  mountpoint -q /sys/kernel/debug/tracing 2>/dev/null \
+  || mount -t tracefs tracefs /sys/kernel/debug/tracing 2>/dev/null \
+  || true'
 
 # --- Запуск ---
 ExecStart=/usr/local/bin/process_metrics \
@@ -96,7 +107,10 @@ ReadOnlyPaths=/proc /sys/fs/cgroup /sys/kernel/btf
 ReadWritePaths=/var/lib/process_metrics /etc/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
+# libbpf ищет tracepoint ID в tracefs. На новых ядрах — /sys/kernel/tracing,
+# на старых (Astra Linux, Debian с ядром < 4.17) — /sys/kernel/debug/tracing.
 ReadOnlyPaths=/sys/fs/bpf
+ReadOnlyPaths=-/sys/kernel/debug
 ReadOnlyPaths=-/sys/kernel/debug/tracing
 ReadOnlyPaths=-/sys/kernel/tracing
 
