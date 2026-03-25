@@ -110,6 +110,9 @@ struct tags_entry {
 
 static struct tags_entry tags_ht[TAGS_HT_SIZE];
 
+/* Forward declaration — used by tags_inherit() */
+static int try_track_pid(__u32 pid);
+
 static void tags_store(__u32 tgid, const char *tags)
 {
 	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
@@ -154,7 +157,15 @@ static void tags_remove(__u32 tgid)
 static void tags_inherit(__u32 child_tgid, __u32 parent_tgid)
 {
 	const char *pt = tags_lookup(parent_tgid);
-	tags_store(child_tgid, pt);
+	if (pt[0]) {
+		tags_store(child_tgid, pt);
+		return;
+	}
+	/* Parent has no tags — try to resolve by reading /proc/ppid/cmdline */
+	if (try_track_pid(parent_tgid) >= 0) {
+		pt = tags_lookup(parent_tgid);
+		tags_store(child_tgid, pt);
+	}
 }
 
 static void tags_clear(void)
@@ -184,6 +195,43 @@ static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 	}
 	if (off == 0 && tags_size > 0)
 		tags[0] = '\0';
+	return first;
+}
+
+/* Forward declarations for try_track_pid */
+static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
+static int read_proc_cmdline(__u32 pid, char *dst, int dstlen);
+static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
+				__u8 is_root);
+static void log_debug(const char *fmt, ...);
+
+/*
+ * Try to track an unknown PID by reading /proc/<pid>/cmdline.
+ * Called when file_close/net_close/oom_kill/exit arrives for a PID
+ * not in tracked_map. Reads cmdline, matches against all rules,
+ * and adds to tracked_map + tags hash if matched.
+ * Returns the first matched rule index, or -1 if no match / process gone.
+ */
+static int try_track_pid(__u32 pid)
+{
+	char cmdline_raw[CMDLINE_MAX];
+	int clen = read_proc_cmdline(pid, cmdline_raw, sizeof(cmdline_raw));
+	if (clen <= 0)
+		return -1;
+
+	char cmdline_str[CMDLINE_MAX + 1];
+	cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str,
+		       sizeof(cmdline_str));
+
+	char tags_buf[TAGS_MAX_LEN];
+	int first = match_rules_all(cmdline_str, tags_buf, sizeof(tags_buf));
+	if (first < 0)
+		return -1;
+
+	track_pid_from_proc(pid, first, pid, 1);
+	tags_store(pid, tags_buf);
+	log_debug("LATE_TRACK: pid=%u rule=%s tags=%s cmdline=%.60s",
+		  pid, rules[first].name, tags_buf, cmdline_str);
 	return first;
 }
 
@@ -893,6 +941,7 @@ static void add_descendants(struct scan_entry *entries, int count,
 		if (bpf_map_lookup_elem(tracked_map_fd, &child, &ti) == 0)
 			continue;
 		track_pid_from_proc(child, rule_id, root_pid, 0);
+		tags_inherit(child, parent);
 		(*tracked)++;
 		add_descendants(entries, count, child, rule_id, root_pid, tracked);
 	}
@@ -994,10 +1043,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const struct file_event *fe = data;
 
 		struct track_info ti;
+		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
+			try_track_pid(fe->tgid);
 		const char *rname = "?";
 		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
 				? rules[ti.rule_id].name : "?";
+		if (rname[0] == '?' && rname[1] == '\0') {
+			if (bpf_map_lookup_elem(tracked_map_fd, &fe->ppid, &ti) == 0)
+				rname = (ti.rule_id < num_rules)
+					? rules[ti.rule_id].name : "?";
+		}
 
 		log_debug("FILE_CLOSE: pid=%u rule=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
@@ -1019,8 +1075,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "file_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup(fe->tgid));
+			const char *file_tags = tags_lookup(fe->tgid);
+			if (!file_tags[0])
+				tags_inherit(fe->tgid, fe->ppid);
+			file_tags = tags_lookup(fe->tgid);
+			snprintf(cev.tags, sizeof(cev.tags), "%s", file_tags);
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&fe->tgid, &ti) == 0) {
 				cev.root_pid = ti.root_pid;
@@ -1052,10 +1111,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const struct net_event *ne = data;
 
 		struct track_info ti;
+		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) != 0)
+			try_track_pid(ne->tgid);
 		const char *rname = "?";
 		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
 				? rules[ti.rule_id].name : "?";
+		/* Fallback: inherit rule from parent */
+		if (rname[0] == '?' && rname[1] == '\0') {
+			if (bpf_map_lookup_elem(tracked_map_fd, &ne->ppid, &ti) == 0)
+				rname = (ti.rule_id < num_rules)
+					? rules[ti.rule_id].name : "?";
+		}
 
 		log_debug("NET_CLOSE: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
@@ -1075,8 +1142,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "net_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup(ne->tgid));
+				const char *net_tags = tags_lookup(ne->tgid);
+			if (!net_tags[0])
+				tags_inherit(ne->tgid, ne->ppid);
+			net_tags = tags_lookup(ne->tgid);
+			snprintf(cev.tags, sizeof(cev.tags), "%s", net_tags);
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&ne->tgid, &ti) == 0) {
 				cev.root_pid = ti.root_pid;
@@ -1225,9 +1295,22 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	case EVENT_EXIT: {
-		const char *rname = (e->rule_id < num_rules)
-			? rules[e->rule_id].name : "?";
+		__u32 exit_rule_id = e->rule_id;
+		if (exit_rule_id >= num_rules) {
+			struct track_info ti;
+			if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) != 0)
+				try_track_pid(e->tgid);
+			if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
+				exit_rule_id = ti.rule_id;
+		}
+		const char *rname = (exit_rule_id < num_rules)
+			? rules[exit_rule_id].name : "?";
 		const char *exit_tags = tags_lookup(e->tgid);
+		if (!exit_tags[0]) {
+			if (try_track_pid(e->tgid) < 0)
+				tags_inherit(e->tgid, e->ppid);
+			exit_tags = tags_lookup(e->tgid);
+		}
 		int sig = e->exit_code & 0x7f;
 		int status = (e->exit_code >> 8) & 0xff;
 
@@ -1254,10 +1337,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	case EVENT_OOM_KILL: {
 		struct track_info ti;
+		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) != 0)
+			try_track_pid(e->tgid);
 		const char *rname = "?";
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
 				? rules[ti.rule_id].name : "?";
+		if (rname[0] == '?' && rname[1] == '\0') {
+			if (bpf_map_lookup_elem(tracked_map_fd, &e->ppid, &ti) == 0)
+				rname = (ti.rule_id < num_rules)
+					? rules[ti.rule_id].name : "?";
+		}
 		log_ts("WARN", "OOM_KILL: pid=%u rule=%s comm=%.16s "
 		       "rss=%lluMB",
 		       e->tgid, rname, e->comm,
@@ -1662,8 +1752,12 @@ static void write_snapshot(void)
 			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup(key));
+			const char *snap_tags = tags_lookup(key);
+			if (!snap_tags[0]) {
+				try_track_pid(key);
+				snap_tags = tags_lookup(key);
+			}
+			snprintf(cev.tags, sizeof(cev.tags), "%s", snap_tags);
 			cev.root_pid = ti.root_pid;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;

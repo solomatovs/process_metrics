@@ -161,7 +161,7 @@ SETTINGS
 -- ══════════════════════════════════════════════════════════════════════
 
 -- Пример: забирать данные с server1 каждые 30 секунд
-CREATE MATERIALIZED VIEW process_metrics_pull_server1
+CREATE OR REPLACE MATERIALIZED VIEW process_metrics_pull_server1
 REFRESH EVERY 30 SECOND APPEND
 TO process_metrics
 AS
