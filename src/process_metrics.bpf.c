@@ -584,6 +584,15 @@ struct {
  */
 #define PREFIX_CMP_MAX 32   /* max compared bytes (covers most real path prefixes) */
 
+/*
+ * KERN_VER is passed from Makefile as major*100+minor (e.g. 515, 601).
+ * Kernels < 5.18 have a less capable verifier that chokes on unrolled
+ * prefix loops (>8192 jump sequences), so we avoid #pragma unroll there.
+ */
+#ifndef KERN_VER
+#define KERN_VER 600
+#endif
+
 static __always_inline int prefix_match(const char *path,
 					const char *prefix, int len)
 {
@@ -593,9 +602,7 @@ static __always_inline int prefix_match(const char *path,
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
 		if (j >= len)
 			return 1;
-		/* Mask index so 5.15 verifier can prove bounds statically */
-		int idx = j & (FILE_PREFIX_CAP - 1);
-		if (path[idx] != prefix[idx])
+		if (path[j] != prefix[j])
 			return 0;
 	}
 	return 1;
@@ -605,7 +612,9 @@ static __always_inline int path_matches_include(const char *path)
 {
 	int has_any = 0;
 
+#if KERN_VER >= 518
 	#pragma unroll
+#endif
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
 		struct file_prefix *fp = bpf_map_lookup_elem(
@@ -628,7 +637,9 @@ static __always_inline int path_matches_include(const char *path)
  */
 static __always_inline int path_matches_exclude(const char *path)
 {
+#if KERN_VER >= 518
 	#pragma unroll
+#endif
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
 		struct file_prefix *fp = bpf_map_lookup_elem(

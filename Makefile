@@ -48,8 +48,11 @@ CLANG   ?= $(shell best=""; best_ver=0; \
 BPFTOOL ?= $(BPFTOOL_BIN)
 CC      := $(CLANG)
 
+# Kernel version detection (major * 100 + minor, e.g. 5.15 → 515, 6.1 → 601)
+KERN_VER := $(shell uname -r | awk -F'[.-]' '{ printf "%d%02d", $$1, $$2 }')
+
 # Flags
-BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
+BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86 -DKERN_VER=$(KERN_VER)
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 
