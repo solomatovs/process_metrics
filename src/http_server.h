@@ -1,10 +1,10 @@
 /*
  * http_server.h — embedded HTTP server for process_metrics
  *
- * Serves metrics via HTTP in two modes:
- *   GET /metrics?format=prom  — current snapshot (read from prom file, not cleared)
- *   GET /metrics?format=csv   — accumulated events (CSV, cleared after delivery)
- *   GET /metrics              — defaults to CSV
+ * Serves metrics via HTTP (CSV format for ClickHouse):
+ *   GET /metrics                     — accumulated events as CSV (read-only)
+ *   GET /metrics?format=csv         — same as above (explicit format)
+ *   GET /metrics?format=csv&clear=1 — returns CSV and clears buffer after delivery
  */
 
 #ifndef HTTP_SERVER_H
@@ -18,12 +18,9 @@ struct http_config {
 
 /*
  * Start the HTTP server in a background thread.
- * prom_path: path to the .prom snapshot file (written by write_snapshot)
- * metric_prefix: unused for now (prom content comes from file)
  * Returns 0 on success, -1 on error.
  */
-int http_server_start(const struct http_config *cfg,
-		      const char *prom_path);
+int http_server_start(const struct http_config *cfg);
 
 /*
  * Stop the HTTP server and join the thread.

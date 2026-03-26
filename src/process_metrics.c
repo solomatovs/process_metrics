@@ -3,7 +3,7 @@
  *
  * Loads BPF programs, listens to ring buffer events, matches exec'd
  * processes against config rules, and periodically writes metrics.
- * Serves metrics via built-in HTTP server (CSV and Prometheus formats).
+ * Serves metrics via built-in HTTP server (CSV format for ClickHouse).
  *
  * Usage:
  *   ./process_metrics -c config.conf
@@ -71,7 +71,6 @@ static int         num_rules;
 static const char *cfg_config_file     = NULL;
 static char        cfg_hostname[256]               = "";
 static int         cfg_snapshot_interval           = 30;
-static char        cfg_metric_prefix[128]          = "process_metrics";
 static int         cfg_cmdline_max_len             = 500;
 static int         cfg_exec_rate_limit             = 0;  /* 0 = unlimited */
 static int         cfg_cgroup_metrics              = 1;  /* 1 = read cgroup files */
@@ -81,7 +80,6 @@ static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=d
 /* HTTP server config */
 static struct http_config g_http_cfg;
 static char cfg_data_file[PATH_MAX_LEN]    = "";
-static char cfg_prom_path[PATH_MAX_LEN]    = "";  /* internal prom file for HTTP */
 static long long cfg_max_data_file_size    = 1LL * 1024 * 1024 * 1024; /* 1 GB */
 
 /* Network tracking config */
@@ -127,22 +125,19 @@ static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
 /*
- * Три гранулярные RW-блокировки для общих данных:
+ * Две гранулярные RW-блокировки для общих данных:
  *
  * tags_lock — tags_ht (хеш-таблица тегов процессов)
  *   wrlock: EXEC (store), FORK (inherit), EXIT (remove), reload (clear)
  *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL и др. (lookup), snapshot (lookup)
  *
- * exited_lock — exited_ring, exited_head, exited_count
- *   wrlock: EXIT (record_exit), reload (reset)
- *   rdlock: snapshot (обход для вывода метрик завершённых процессов)
- *
  * cgroup_lock — cgroup_cache, cgroup_cache_count
  *   wrlock: snapshot (build_cgroup_cache), reload (rebuild)
  *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL (resolve_cgroup_fast)
  */
+#ifndef NO_TAGS
 static pthread_rwlock_t g_tags_lock    = PTHREAD_RWLOCK_INITIALIZER;
-static pthread_rwlock_t g_exited_lock  = PTHREAD_RWLOCK_INITIALIZER;
+#endif
 static pthread_rwlock_t g_cgroup_lock  = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Аргумент для потока poll */
@@ -184,7 +179,7 @@ static void refresh_boot_to_wall(void)
  * │  char tags[512]; } — 516 байт. Массив 16384 записей = 8 МБ.  │
  * │  При linear probing каждый probe перемещался на 516 байт →    │
  * │  гарантированный L1/L2 cache miss (~100-200 тактов).          │
- * │  perf показал: tags_inherit + record_exit = ~20% CPU,         │
+ * │  perf показал: tags_inherit = ~20% CPU,                       │
  * │  причём 70% времени в них — инструкции mov (чтение tgid).     │
  * │                                                                │
  * │  Решение: разделить на два параллельных массива:              │
@@ -224,6 +219,22 @@ static void refresh_boot_to_wall(void)
 
 #define TAGS_MAX_LEN 512
 #define TAGS_HT_SIZE 16384  /* must be power of 2 */
+
+#ifdef NO_TAGS
+/*
+ * NO_TAGS build: все операции с тегами — no-op.
+ * Собирается через: make binary NO_TAGS=1
+ * Используется для бенчмаркинга — замер overhead тегов.
+ */
+static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
+{ (void)tgid; if (buflen > 0) buf[0] = '\0'; }
+static void tags_store_ts(__u32 tgid, const char *tags)
+{ (void)tgid; (void)tags; }
+static void tags_inherit_ts(__u32 child, __u32 parent)
+{ (void)child; (void)parent; }
+static void tags_clear_ts(void) { }
+
+#else /* !NO_TAGS */
 
 static __u32 tags_tgid[TAGS_HT_SIZE];              /*  64 KB — compact index */
 static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — payload      */
@@ -322,18 +333,6 @@ static void tags_clear(void)
  * _ts_ версии берут g_tags_lock и копируют результат в caller-буфер.
  * Нелокированные версии используются внутри секций, где lock уже взят.
  */
-#ifdef STUB_TAGS
-/* No-op заглушки: полностью убираем теги для замера lock overhead */
-static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
-{ (void)tgid; if (buflen > 0) buf[0] = '\0'; }
-static void tags_store_ts(__u32 tgid, const char *tags)
-{ (void)tgid; (void)tags; }
-static void tags_remove_ts(__u32 tgid)
-{ (void)tgid; }
-static void tags_inherit_ts(__u32 child, __u32 parent)
-{ (void)child; (void)parent; }
-static void tags_clear_ts(void) { }
-#else
 static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
 {
 	pthread_rwlock_rdlock(&g_tags_lock);
@@ -346,13 +345,6 @@ static void tags_store_ts(__u32 tgid, const char *tags)
 {
 	pthread_rwlock_wrlock(&g_tags_lock);
 	tags_store(tgid, tags);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-
-static void tags_remove_ts(__u32 tgid)
-{
-	pthread_rwlock_wrlock(&g_tags_lock);
-	tags_remove(tgid);
 	pthread_rwlock_unlock(&g_tags_lock);
 }
 
@@ -369,24 +361,13 @@ static void tags_clear_ts(void)
 	tags_clear();
 	pthread_rwlock_unlock(&g_tags_lock);
 }
-#endif
+
+#endif /* NO_TAGS */
 
 /*
  * Match cmdline against ALL rules, build pipe-separated tags string.
  * Returns the index of the first matching rule, or -1 if no match.
  */
-#ifdef STUB_MATCH_RULES
-/* Заглушка: всегда матчит первое правило (для замера overhead regex) */
-static int match_rules_all(const char *cmdline, char *tags, int tags_size)
-{
-	(void)cmdline;
-	if (num_rules > 0 && tags_size > 0)
-		snprintf(tags, tags_size, "%s", rules[0].name);
-	else if (tags_size > 0)
-		tags[0] = '\0';
-	return num_rules > 0 ? 0 : -1;
-}
-#else
 static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 {
 	int first = -1;
@@ -407,7 +388,6 @@ static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 		tags[0] = '\0';
 	return first;
 }
-#endif
 
 /* Forward declarations for try_track_pid */
 static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
@@ -447,77 +427,6 @@ static int try_track_pid(__u32 pid)
 		  pid, rules[first].name, tags_buf, cmdline_str);
 	return first;
 }
-
-/* ── exited process cache (circular buffer for last N exits) ──────── */
-
-#define MAX_EXITED 256
-
-struct exited_proc {
-	__u32 tgid;
-	__u32 ppid;
-	__u32 uid;
-	__u32 exit_code;
-	__u16 rule_id;
-	__u32 root_pid;
-	__u64 cpu_ns;
-	__u64 rss_max_pages;
-	__u64 rss_min_pages;
-	__u8  oom_killed;
-	__u64 net_tx_bytes;
-	__u64 net_rx_bytes;
-	__u64 timestamp_ns;       /* when process exited */
-	char  comm[COMM_LEN];
-	char  cmdline[CMDLINE_MAX];
-	__u16 cmdline_len;
-	char  tags[TAGS_MAX_LEN];
-};
-
-static struct exited_proc exited_ring[MAX_EXITED];
-static int exited_head;   /* next write position */
-static int exited_count;  /* total entries (max MAX_EXITED) */
-
-static void record_exit(const struct event *e)
-{
-	struct exited_proc *ep = &exited_ring[exited_head % MAX_EXITED];
-	ep->tgid         = e->tgid;
-	ep->ppid         = e->ppid;
-	ep->uid          = e->uid;
-	ep->exit_code    = e->exit_code;
-	ep->rule_id      = e->rule_id;
-	ep->root_pid     = e->root_pid;
-	ep->cpu_ns       = e->cpu_ns;
-	ep->rss_max_pages = e->rss_max_pages;
-	ep->rss_min_pages = e->rss_min_pages;
-	ep->oom_killed   = e->oom_killed;
-	ep->net_tx_bytes = e->net_tx_bytes;
-	ep->net_rx_bytes = e->net_rx_bytes;
-	ep->timestamp_ns = e->timestamp_ns;
-	memcpy(ep->comm, e->comm, COMM_LEN);
-	memcpy(ep->cmdline, e->cmdline, CMDLINE_MAX);
-	ep->cmdline_len  = e->cmdline_len;
-	/* Save tags before removing from hash table */
-	snprintf(ep->tags, sizeof(ep->tags), "%s", tags_lookup(e->tgid));
-	exited_head = (exited_head + 1) % MAX_EXITED;
-	if (exited_count < MAX_EXITED)
-		exited_count++;
-}
-
-/*
- * Thread-safe обёртка для record_exit.
- * Порядок захвата: tags_lock → exited_lock (record_exit читает tags_lookup).
- */
-#ifdef STUB_TAGS
-static void record_exit_ts(const struct event *e) { (void)e; }
-#else
-static void record_exit_ts(const struct event *e)
-{
-	pthread_rwlock_rdlock(&g_tags_lock);
-	pthread_rwlock_wrlock(&g_exited_lock);
-	record_exit(e);
-	pthread_rwlock_unlock(&g_exited_lock);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-#endif
 
 /* ── CPU usage cache (for computing per-interval ratio) ───────────── */
 
@@ -884,8 +793,6 @@ static int load_config(const char *path)
 		gethostname(cfg_hostname, sizeof(cfg_hostname));
 	if (config_lookup_int(&cfg, "snapshot_interval", &int_val))
 		cfg_snapshot_interval = int_val;
-	if (config_lookup_string(&cfg, "metric_prefix", &str_val))
-		snprintf(cfg_metric_prefix, sizeof(cfg_metric_prefix), "%s", str_val);
 	if (config_lookup_int(&cfg, "cmdline_max_len", &int_val))
 		cfg_cmdline_max_len = int_val;
 	if (config_lookup_int(&cfg, "exec_rate_limit", &int_val))
@@ -1062,9 +969,6 @@ static int load_config(const char *path)
 		if (!cfg_data_file[0])
 			snprintf(cfg_data_file, sizeof(cfg_data_file),
 				 "/tmp/process_metrics_events.dat");
-		/* Prom snapshot file path: <data_file_base>.prom */
-		snprintf(cfg_prom_path, sizeof(cfg_prom_path),
-			 "/tmp/process_metrics.prom");
 	}
 
 	config_destroy(&cfg);
@@ -1133,20 +1037,6 @@ static void cmdline_split(const char *raw, __u16 len,
 	while (alen > 0 && args_out[alen - 1] == ' ')
 		alen--;
 	args_out[alen] = '\0';
-}
-
-static void escape_label(const char *src, char *dst, int dstlen)
-{
-	int j = 0;
-	for (int i = 0; src[i] && j < dstlen - 2; i++) {
-		switch (src[i]) {
-		case '\\': dst[j++] = '\\'; if (j < dstlen-1) dst[j++] = '\\'; break;
-		case '"':  dst[j++] = '\\'; if (j < dstlen-1) dst[j++] = '"';  break;
-		case '\n': dst[j++] = '\\'; if (j < dstlen-1) dst[j++] = 'n';  break;
-		default:   dst[j++] = src[i]; break;
-		}
-	}
-	dst[j] = '\0';
 }
 
 static void log_ts(const char *level, const char *fmt, ...)
@@ -2176,43 +2066,31 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const char *rname = (exit_rule_id < num_rules)
 			? rules[exit_rule_id].name : "?";
 
+		char exit_tags[TAGS_MAX_LEN];
+#ifdef NO_TAGS
+		exit_tags[0] = '\0';
+#else
 		/* ┌───────────────────────────────────────────────────────────┐
 		 * │  ОПТИМИЗАЦИЯ 3: Объединённый lock для EXIT-обработчика   │
 		 * ├───────────────────────────────────────────────────────────┤
-		 * │  Проблема: каждый EXIT-event ранее брал g_tags_lock      │
-		 * │  5 раз (tags_lookup_ts → record_exit_ts → tags_remove_ts,│
-		 * │  каждый — отдельный lock/unlock цикл).                   │
-		 * │  При ~22k events/sec даже ~1µs на lock/unlock × 5 =     │
-		 * │  ~5µs overhead → consumer отставал от producer на ~10%   │
-		 * │  → ring buffer переполнялся.                             │
-		 * │                                                           │
-		 * │  Решение: все tags-операции EXIT (lookup, inherit,       │
-		 * │  record_exit, remove) под ОДНИМ wrlock. Вместо 5         │
-		 * │  lock/unlock — один. Используем bare-функции (без _ts),  │
-		 * │  т.к. wrlock уже взят вручную.                           │
-		 * │                                                           │
-		 * │  Также исправлен latent deadlock: ранее tags_inherit     │
-		 * │  вызывала try_track_pid → tags_store_ts → wrlock         │
-		 * │  повторно (pthread_rwlock_wrlock НЕ рекурсивный).        │
-		 * │  Теперь tags_inherit не вызывает try_track_pid.          │
+		 * │  Все tags-операции EXIT (lookup, inherit, remove)        │
+		 * │  выполняются под ОДНИМ wrlock вместо отдельных           │
+		 * │  lock/unlock циклов для каждой операции.                 │
+		 * │  Используем bare-функции (без _ts), т.к. wrlock         │
+		 * │  уже взят вручную.                                       │
 		 * └───────────────────────────────────────────────────────────┘ */
-		char exit_tags[TAGS_MAX_LEN];
 		pthread_rwlock_wrlock(&g_tags_lock);
 		{
 			const char *t = tags_lookup(e->tgid);
 			if (!t[0]) {
-				/* Нет тегов — наследуем от родителя (wrlock уже взят) */
 				tags_inherit(e->tgid, e->ppid);
 				t = tags_lookup(e->tgid);
 			}
 			snprintf(exit_tags, sizeof(exit_tags), "%s", t);
-			/* record_exit вызывает tags_lookup внутри — безопасно под wrlock */
-			pthread_rwlock_wrlock(&g_exited_lock);
-			record_exit(e);
-			pthread_rwlock_unlock(&g_exited_lock);
 			tags_remove(e->tgid);
 		}
 		pthread_rwlock_unlock(&g_tags_lock);
+#endif
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
 		int sig = e->exit_code & 0x7f;
@@ -2281,7 +2159,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 }
 
 
-/* ── snapshot: write .prom file ───────────────────────────────────── */
+/* ── snapshot: collect metrics ────────────────────────────────────── */
 
 static long long read_cgroup_value(const char *cg_path, const char *file)
 {
@@ -2422,6 +2300,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 	return disk_count;
 }
 
+#ifndef NO_TAGS
 /*
  * Поиск тегов в локальной копии (без lock).
  * snap_tgid/snap_data — snapshot, сделанный через memcpy под кратким rdlock
@@ -2442,6 +2321,7 @@ static const char *tags_lookup_copy(const __u32 *snap_tgid,
 	}
 	return "";
 }
+#endif
 
 static void write_snapshot(void)
 {
@@ -2449,6 +2329,7 @@ static void write_snapshot(void)
 	build_cgroup_cache_ts();
 	refresh_boot_to_wall();
 
+#ifndef NO_TAGS
 	/* ┌───────────────────────────────────────────────────────────────┐
 	 * │  ОПТИМИЗАЦИЯ 4: Snapshot tags через memcpy (anti-starvation) │
 	 * ├───────────────────────────────────────────────────────────────┤
@@ -2471,17 +2352,7 @@ static void write_snapshot(void)
 	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
 	memcpy(snap_data, tags_data, sizeof(tags_data));
 	pthread_rwlock_unlock(&g_tags_lock);
-
-	char tmp_path[PATH_MAX_LEN];
-	FILE *f = NULL;
-
-	if (g_http_cfg.enabled && cfg_prom_path[0]) {
-		snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d",
-			 cfg_prom_path, getpid());
-		f = fopen(tmp_path, "w");
-		if (!f)
-			log_ts("ERROR", "cannot create temp file: %s", tmp_path);
-	}
+#endif
 
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0) page_size = 4096;
@@ -2489,7 +2360,6 @@ static void write_snapshot(void)
 	/* Compute boot offset: monotonic → epoch */
 	struct timespec mono;
 	clock_gettime(CLOCK_MONOTONIC, &mono);
-	time_t now_epoch = time(NULL);
 	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
 
 	/* Elapsed time since previous snapshot (for cpu_usage_ratio) */
@@ -2500,71 +2370,6 @@ static void write_snapshot(void)
 	}
 	prev_snapshot_ts = mono;
 
-	const char *pfx = cfg_metric_prefix;
-
-	/* HELP/TYPE headers — always present */
-	if (f) fprintf(f,
-		"# HELP %s_info Process info (value always 1, metadata in labels)\n"
-		"# TYPE %s_info gauge\n"
-		"# HELP %s_start_time_seconds Process start time as unix epoch\n"
-		"# TYPE %s_start_time_seconds gauge\n"
-		"# HELP %s_uptime_seconds Process uptime in seconds\n"
-		"# TYPE %s_uptime_seconds gauge\n"
-		"# HELP %s_is_root Whether PID is a root of tracked tree (1=root, 0=child)\n"
-		"# TYPE %s_is_root gauge\n",
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
-
-	/* HELP/TYPE headers — sched_switch metrics */
-	if (f) fprintf(f,
-		"# HELP %s_rss_bytes Process RSS memory in bytes\n"
-		"# TYPE %s_rss_bytes gauge\n"
-		"# HELP %s_rss_min_bytes Min observed RSS memory in bytes\n"
-		"# TYPE %s_rss_min_bytes gauge\n"
-		"# HELP %s_rss_max_bytes Max observed RSS memory in bytes\n"
-		"# TYPE %s_rss_max_bytes gauge\n"
-		"# HELP %s_shmem_bytes Shared memory in bytes\n"
-		"# TYPE %s_shmem_bytes gauge\n"
-		"# HELP %s_swap_bytes Swap usage in bytes\n"
-		"# TYPE %s_swap_bytes gauge\n"
-		"# HELP %s_oom_kill Process was killed by OOM killer (1=killed)\n"
-		"# TYPE %s_oom_kill gauge\n"
-		"# HELP %s_vsize_bytes Process virtual memory in bytes\n"
-		"# TYPE %s_vsize_bytes gauge\n"
-		"# HELP %s_cpu_seconds_total Total CPU time (user + system) in seconds\n"
-		"# TYPE %s_cpu_seconds_total counter\n"
-		"# HELP %s_cpu_usage_ratio CPU usage ratio over last snapshot interval (1.0 = 1 core)\n"
-		"# TYPE %s_cpu_usage_ratio gauge\n"
-		"# HELP %s_io_read_bytes_total Actual disk read bytes\n"
-		"# TYPE %s_io_read_bytes_total counter\n"
-		"# HELP %s_io_write_bytes_total Actual disk write bytes\n"
-		"# TYPE %s_io_write_bytes_total counter\n"
-		"# HELP %s_major_page_faults_total Major page faults (required disk IO)\n"
-		"# TYPE %s_major_page_faults_total counter\n"
-		"# HELP %s_minor_page_faults_total Minor page faults (no disk IO)\n"
-		"# TYPE %s_minor_page_faults_total counter\n"
-		"# HELP %s_voluntary_ctxsw_total Voluntary context switches (process yielded CPU)\n"
-		"# TYPE %s_voluntary_ctxsw_total counter\n"
-		"# HELP %s_involuntary_ctxsw_total Involuntary context switches (preempted by kernel)\n"
-		"# TYPE %s_involuntary_ctxsw_total counter\n"
-		"# HELP %s_threads Number of threads\n"
-		"# TYPE %s_threads gauge\n"
-		"# HELP %s_oom_score_adj Current OOM score adjustment\n"
-		"# TYPE %s_oom_score_adj gauge\n"
-		"# HELP %s_state Process state (R=running, S=sleeping, D=disk_sleep, T=stopped, Z=zombie)\n"
-		"# TYPE %s_state gauge\n",
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-		pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx,
-		pfx, pfx, pfx, pfx, pfx, pfx);
-
-	/* HELP/TYPE headers — network kretprobe metrics */
-	if (f) fprintf(f,
-		"# HELP %s_net_tx_bytes_total TCP+UDP bytes sent\n"
-		"# TYPE %s_net_tx_bytes_total counter\n"
-		"# HELP %s_net_rx_bytes_total TCP+UDP bytes received\n"
-		"# TYPE %s_net_rx_bytes_total counter\n",
-		pfx, pfx, pfx, pfx);
-
 	/* Iterate proc_map */
 	__u32 key = 0;
 	struct proc_info pi;
@@ -2573,7 +2378,6 @@ static void write_snapshot(void)
 	/* Collect unique cgroups for cgroup metrics (with cached values) */
 	struct {
 		char path[256];
-		char rule[64];
 		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
 		int read;  /* 1 = values read from /sys/fs/cgroup */
 	} seen_cg[MAX_CGROUPS];
@@ -2677,20 +2481,9 @@ static void write_snapshot(void)
 		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
 		resolve_cgroup_fs_ts(pi.cgroup_id, cg_fs_path, sizeof(cg_fs_path));
 
-		/* Escape labels */
-		char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
-		char args_esc[CMDLINE_MAX * 2], cg_esc[512], host_esc[512];
-		escape_label(pi.comm, comm_esc, sizeof(comm_esc));
-		escape_label(exec_path, exec_esc, sizeof(exec_esc));
-		escape_label(args, args_esc, sizeof(args_esc));
-		escape_label(cg_path, cg_esc, sizeof(cg_esc));
-		escape_label(cfg_hostname, host_esc, sizeof(host_esc));
-
 		/* Compute times */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
 		if (uptime_sec < 0) uptime_sec = 0;
-		time_t start_epoch = now_epoch - (time_t)uptime_sec;
-
 		/* CPU usage ratio */
 		double cpu_ratio = 0;
 		if (elapsed_ns > 0) {
@@ -2699,100 +2492,6 @@ static void write_snapshot(void)
 				? (double)(pi.cpu_ns - prev_ns) / elapsed_ns : 0;
 		}
 		cpu_prev_update(key, pi.cpu_ns);
-
-		/* Write Prometheus metrics */
-		if (f) {
-		char tags_esc[TAGS_MAX_LEN * 2];
-		/* tags_lookup_copy — работаем с локальной копией без lock */
-		const char *snap_tags_buf = tags_lookup_copy(snap_tgid, snap_data, key);
-		escape_label(snap_tags_buf, tags_esc, sizeof(tags_esc));
-		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",tags=\"%s\","
-			"root_pid=\"%u\","
-			"pid=\"%u\",uid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
-			"cgroup=\"%s\"} 1\n",
-			pfx, host_esc, rule_name, tags_esc, ti.root_pid,
-			pi.tgid,
-			pi.uid, comm_esc, exec_esc, args_esc, cg_esc);
-		fprintf(f, "%s_start_time_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, (long)start_epoch);
-		fprintf(f, "%s_uptime_seconds{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %ld\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(long)(uptime_sec > 0 ? uptime_sec : 0));
-		fprintf(f, "%s_is_root{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, ti.is_root);
-
-		fprintf(f, "%s_rss_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.rss_pages * page_size));
-		fprintf(f, "%s_rss_min_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.rss_min_pages * page_size));
-		fprintf(f, "%s_rss_max_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.rss_max_pages * page_size));
-		fprintf(f, "%s_shmem_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.shmem_pages * page_size));
-		fprintf(f, "%s_swap_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.swap_pages * page_size));
-		fprintf(f, "%s_oom_kill{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, pi.oom_killed);
-		fprintf(f, "%s_vsize_bytes{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)(pi.vsize_pages * page_size));
-		fprintf(f, "%s_cpu_seconds_total{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %.2f\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(double)pi.cpu_ns / 1e9);
-
-		if (elapsed_ns > 0) {
-			fprintf(f, "%s_cpu_usage_ratio{rule=\"%s\",root_pid=\"%u\","
-				"pid=\"%u\"} %.4f\n",
-				pfx, rule_name, ti.root_pid, pi.tgid, cpu_ratio);
-		}
-
-		fprintf(f, "%s_io_read_bytes_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.io_read_bytes);
-		fprintf(f, "%s_io_write_bytes_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.io_write_bytes);
-		fprintf(f, "%s_major_page_faults_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.maj_flt);
-		fprintf(f, "%s_minor_page_faults_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.min_flt);
-		fprintf(f, "%s_voluntary_ctxsw_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.nvcsw);
-		fprintf(f, "%s_involuntary_ctxsw_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.nivcsw);
-		fprintf(f, "%s_threads{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %u\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, pi.threads);
-		fprintf(f, "%s_oom_score_adj{rule=\"%s\",root_pid=\"%u\",pid=\"%u\"} %d\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, pi.oom_score_adj);
-		char state_str[2] = { (char)(pi.state ? pi.state : '?'), '\0' };
-		fprintf(f, "%s_state{rule=\"%s\",root_pid=\"%u\",pid=\"%u\","
-			"state=\"%s\"} 1\n",
-			pfx, rule_name, ti.root_pid, pi.tgid, state_str);
-
-		fprintf(f, "%s_net_tx_bytes_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.net_tx_bytes);
-		fprintf(f, "%s_net_rx_bytes_total{rule=\"%s\",root_pid=\"%u\","
-			"pid=\"%u\"} %llu\n",
-			pfx, rule_name, ti.root_pid, pi.tgid,
-			(unsigned long long)pi.net_rx_bytes);
-		} /* if (f) */
 
 		/* Collect unique cgroup for cgroup-level metrics + cache values */
 		int cg_idx = -1;
@@ -2807,8 +2506,6 @@ static void write_snapshot(void)
 				cg_idx = seen_cg_count;
 				snprintf(seen_cg[cg_idx].path,
 					 sizeof(seen_cg[0].path), "%s", cg_path);
-				snprintf(seen_cg[cg_idx].rule,
-					 sizeof(seen_cg[0].rule), "%s", rule_name);
 				seen_cg[cg_idx].read = 0;
 				if (cfg_cgroup_metrics && cg_fs_path[0]) {
 					seen_cg[cg_idx].mem_max =
@@ -2834,8 +2531,9 @@ static void write_snapshot(void)
 			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
-			/* tags_lookup_copy — работаем с локальной копией без lock */
+#ifndef NO_TAGS
 			snprintf(cev.tags, sizeof(cev.tags), "%s", tags_lookup_copy(snap_tgid, snap_data, key));
+#endif
 			cev.root_pid = ti.root_pid;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
@@ -2977,8 +2675,10 @@ static void write_snapshot(void)
 							 "%s",
 							 rules[uti.rule_id].name);
 					cev.root_pid = uti.root_pid;
-					snprintf(cev.tags, sizeof(cev.tags),
+	#ifndef NO_TAGS
+				snprintf(cev.tags, sizeof(cev.tags),
 						 "%s", tags_lookup_copy(snap_tgid, snap_data, ukey.tgid));
+#endif
 				}
 				ef_append(&cev, cfg_hostname);
 				udp_count++;
@@ -3056,145 +2756,8 @@ static void write_snapshot(void)
 		cpu_prev_remove(dead_keys[i]);
 	}
 
-	/* Recently exited processes — читаем под rdlock
-	 * (g_tags_lock rdlock уже взят, exited_lock берём отдельно) */
-	pthread_rwlock_rdlock(&g_exited_lock);
-	if (f && exited_count > 0) {
-		fprintf(f,
-			"# HELP %s_exited_exit_code Exit code of recently exited process\n"
-			"# TYPE %s_exited_exit_code gauge\n"
-			"# HELP %s_exited_signal Signal that killed recently exited process (0=normal)\n"
-			"# TYPE %s_exited_signal gauge\n"
-			"# HELP %s_exited_oom_kill Process was killed by OOM killer\n"
-			"# TYPE %s_exited_oom_kill gauge\n"
-			"# HELP %s_exited_cpu_seconds_total Total CPU of exited process\n"
-			"# TYPE %s_exited_cpu_seconds_total gauge\n"
-			"# HELP %s_exited_rss_max_bytes Max RSS of exited process\n"
-			"# TYPE %s_exited_rss_max_bytes gauge\n",
-			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
-
-		fprintf(f,
-			"# HELP %s_exited_net_tx_bytes_total TCP+UDP bytes sent by exited process\n"
-			"# TYPE %s_exited_net_tx_bytes_total gauge\n"
-			"# HELP %s_exited_net_rx_bytes_total TCP+UDP bytes received by exited process\n"
-			"# TYPE %s_exited_net_rx_bytes_total gauge\n",
-			pfx, pfx, pfx, pfx);
-
-		int start = (exited_count < MAX_EXITED) ? 0 : exited_head;
-		for (int i = 0; i < exited_count; i++) {
-			int idx = (start + i) % MAX_EXITED;
-			struct exited_proc *ep = &exited_ring[idx];
-			const char *rname = (ep->rule_id < num_rules)
-				? rules[ep->rule_id].name : "unknown";
-
-			char ep_exec[CMDLINE_MAX], ep_args[CMDLINE_MAX + 4];
-			cmdline_split(ep->cmdline, ep->cmdline_len,
-				      ep_exec, sizeof(ep_exec),
-				      ep_args, sizeof(ep_args));
-			if ((int)strlen(ep_args) > cfg_cmdline_max_len) {
-				ep_args[cfg_cmdline_max_len] = '\0';
-				strcat(ep_args, "...");
-			}
-
-			char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
-			char args_esc[CMDLINE_MAX * 2], host_esc[512];
-			escape_label(ep->comm, comm_esc, sizeof(comm_esc));
-			escape_label(ep_exec, exec_esc, sizeof(exec_esc));
-			escape_label(ep_args, args_esc, sizeof(args_esc));
-			escape_label(cfg_hostname, host_esc, sizeof(host_esc));
-
-			int sig = ep->exit_code & 0x7f;
-			int status = (ep->exit_code >> 8) & 0xff;
-
-			fprintf(f, "%s_exited_exit_code{hostname=\"%s\","
-				"rule=\"%s\",root_pid=\"%u\","
-				"pid=\"%u\",comm=\"%s\",exec=\"%s\","
-				"args=\"%s\"} %d\n",
-				pfx, host_esc, rname, ep->root_pid,
-				ep->tgid, comm_esc, exec_esc,
-				args_esc, status);
-			fprintf(f, "%s_exited_signal{rule=\"%s\",root_pid=\"%u\","
-				"pid=\"%u\"} %d\n",
-				pfx, rname, ep->root_pid, ep->tgid, sig);
-			fprintf(f, "%s_exited_oom_kill{rule=\"%s\",root_pid=\"%u\","
-				"pid=\"%u\"} %u\n",
-				pfx, rname, ep->root_pid, ep->tgid, ep->oom_killed);
-			fprintf(f, "%s_exited_cpu_seconds_total{rule=\"%s\","
-				"root_pid=\"%u\",pid=\"%u\"} %.2f\n",
-				pfx, rname, ep->root_pid, ep->tgid,
-				(double)ep->cpu_ns / 1e9);
-			fprintf(f, "%s_exited_rss_max_bytes{rule=\"%s\","
-				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
-				pfx, rname, ep->root_pid, ep->tgid,
-				(unsigned long long)(ep->rss_max_pages * page_size));
-			fprintf(f, "%s_exited_net_tx_bytes_total{rule=\"%s\","
-				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
-				pfx, rname, ep->root_pid, ep->tgid,
-				(unsigned long long)ep->net_tx_bytes);
-			fprintf(f, "%s_exited_net_rx_bytes_total{rule=\"%s\","
-				"root_pid=\"%u\",pid=\"%u\"} %llu\n",
-				pfx, rname, ep->root_pid, ep->tgid,
-				(unsigned long long)ep->net_rx_bytes);
-		}
-	}
-	pthread_rwlock_unlock(&g_exited_lock);
-
-	/* Cgroup v2 metrics from /sys/fs/cgroup */
-	if (f && cfg_cgroup_metrics && seen_cg_count > 0) {
-		fprintf(f,
-			"# HELP %s_cgroup_memory_max_bytes Cgroup memory.max (0=unlimited)\n"
-			"# TYPE %s_cgroup_memory_max_bytes gauge\n"
-			"# HELP %s_cgroup_memory_current_bytes Cgroup memory.current\n"
-			"# TYPE %s_cgroup_memory_current_bytes gauge\n"
-			"# HELP %s_cgroup_memory_swap_current_bytes Cgroup memory.swap.current\n"
-			"# TYPE %s_cgroup_memory_swap_current_bytes gauge\n"
-			"# HELP %s_cgroup_cpu_weight Cgroup cpu.weight\n"
-			"# TYPE %s_cgroup_cpu_weight gauge\n"
-			"# HELP %s_cgroup_pids_current Cgroup pids.current\n"
-			"# TYPE %s_cgroup_pids_current gauge\n",
-			pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx, pfx);
-
-		for (int i = 0; i < seen_cg_count; i++) {
-			if (!seen_cg[i].read)
-				continue;
-			char cg_esc[512];
-			escape_label(seen_cg[i].path, cg_esc, sizeof(cg_esc));
-
-			struct { const char *metric; long long val; } kv[] = {
-				{ "memory_max_bytes",          seen_cg[i].mem_max },
-				{ "memory_current_bytes",      seen_cg[i].mem_cur },
-				{ "memory_swap_current_bytes", seen_cg[i].swap_cur },
-				{ "cpu_weight",                seen_cg[i].cpu_weight },
-				{ "pids_current",              seen_cg[i].pids_cur },
-			};
-			for (int k = 0; k < 5; k++) {
-				if (kv[k].val >= 0) {
-					fprintf(f, "%s_cgroup_%s{rule=\"%s\","
-						"cgroup=\"%s\"} %lld\n",
-						pfx, kv[k].metric,
-						seen_cg[i].rule, cg_esc,
-						kv[k].val);
-				}
-			}
-		}
-	}
-
-	if (f) {
-		fclose(f);
-
-		/* Atomic rename */
-		if (rename(tmp_path, cfg_prom_path) == 0)
-			chmod(cfg_prom_path, 0644);
-		else
-			log_ts("ERROR", "rename %s → %s: %s",
-			       tmp_path, cfg_prom_path, strerror(errno));
-
-		log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events → %s",
-		       pid_count, seen_cg_count, snap_count, cfg_prom_path);
-	} else {
-		log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events",
-		       pid_count, seen_cg_count, snap_count);
-	}
+	log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events",
+	       pid_count, seen_cg_count, snap_count);
 
 	/* snap_count events were streamed directly via ef_append above */
 
@@ -3224,12 +2787,14 @@ static void write_snapshot(void)
 		}
 	}
 
-	/* Удаляем теги мёртвых процессов (wrlock) */
 	if (dead_count > 0) {
+#ifndef NO_TAGS
+		/* Удаляем теги мёртвых процессов (wrlock) */
 		pthread_rwlock_wrlock(&g_tags_lock);
 		for (int i = 0; i < dead_count; i++)
 			tags_remove(dead_keys[i]);
 		pthread_rwlock_unlock(&g_tags_lock);
+#endif
 		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
 	}
 }
@@ -3506,7 +3071,7 @@ int main(int argc, char *argv[])
 
 	/* Start HTTP server if enabled */
 	if (g_http_cfg.enabled) {
-		if (http_server_start(&g_http_cfg, cfg_prom_path) < 0) {
+		if (http_server_start(&g_http_cfg) < 0) {
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
 			ring_buffer__free(rb_proc);
 			ring_buffer__free(rb_file);
@@ -3545,7 +3110,6 @@ int main(int argc, char *argv[])
 	 * Каждый поток вызывает ring_buffer__poll() в цикле, пока g_running.
 	 * handle_event внутри использует гранулярные rwlock'и:
 	 *   g_tags_lock   — tags_ht (lookup/store/remove/inherit)
-	 *   g_exited_lock — exited_ring (record_exit)
 	 *   g_cgroup_lock — cgroup_cache (resolve_cgroup_fast)
 	 * Основной поток занимается snapshot и config reload.
 	 */
@@ -3586,10 +3150,6 @@ int main(int argc, char *argv[])
 			tags_clear_ts();
 			parse_rules_from_config(cfg_config_file);
 			build_cgroup_cache_ts();
-
-			pthread_rwlock_wrlock(&g_exited_lock);
-			exited_head = exited_count = 0;
-			pthread_rwlock_unlock(&g_exited_lock);
 
 			cpu_prev_count = 0;
 			prev_snapshot_ts = (struct timespec){0};

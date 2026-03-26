@@ -58,6 +58,12 @@ KERN_VER_MINOR := $(shell uname -r | cut -d. -f2)
 BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86 \
               -DKERN_VER_MAJOR=$(KERN_VER_MAJOR) -DKERN_VER_MINOR=$(KERN_VER_MINOR)
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
+
+# Опциональные флаги сборки:
+#   make binary NO_TAGS=1  — отключить подсистему тегов (для бенчмаркинга)
+ifdef NO_TAGS
+CFLAGS += -DNO_TAGS
+endif
 LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 
 # Пакеты зависимостей

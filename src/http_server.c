@@ -3,11 +3,8 @@
  *
  * Minimal HTTP/1.1 server with these endpoints:
  *
- *   GET /metrics?format=prom       — returns the current .prom snapshot file as-is.
- *                                    File is NOT cleared (overwritten each snapshot).
- *
- *   GET /metrics?format=csv        — returns accumulated events as CSV (read-only).
- *   GET /metrics                     Data is NOT cleared — safe for any consumer.
+ *   GET /metrics                     — returns accumulated events as CSV (read-only).
+ *   GET /metrics?format=csv         — same as above (explicit format).
  *
  *   GET /metrics?format=csv&clear=1 — returns accumulated events as CSV AND clears
  *                                     the buffer after successful delivery.
@@ -24,8 +21,6 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -39,7 +34,6 @@
 static int           g_listen_fd = -1;
 static pthread_t     g_thread;
 static volatile int  g_running;
-static char          g_prom_path[512];
 
 /* ── CSV formatting ──────────────────────────────────────────────── */
 
@@ -419,54 +413,15 @@ static void handle_csv_readonly(int client_fd)
 	close(data_fd);
 }
 
-/* ── Prom: read .prom file ───────────────────────────────────────── */
-
-static char *read_prom_file(int *out_len)
-{
-	*out_len = 0;
-
-	struct stat st;
-	if (stat(g_prom_path, &st) != 0 || st.st_size == 0)
-		return NULL;
-
-	int fd = open(g_prom_path, O_RDONLY);
-	if (fd < 0)
-		return NULL;
-
-	char *buf = malloc(st.st_size + 1);
-	if (!buf) {
-		close(fd);
-		return NULL;
-	}
-
-	ssize_t total = 0;
-	while (total < st.st_size) {
-		ssize_t r = read(fd, buf + total, st.st_size - total);
-		if (r <= 0)
-			break;
-		total += r;
-	}
-	close(fd);
-
-	if (total <= 0) {
-		free(buf);
-		return NULL;
-	}
-
-	buf[total] = '\0';
-	*out_len = (int)total;
-	return buf;
-}
-
 /* ── HTTP response ───────────────────────────────────────────────── */
 
-enum format_type { FMT_CSV, FMT_PROM };
-
-static enum format_type parse_format(const char *request)
+static int parse_format_csv(const char *request)
 {
-	if (strstr(request, "format=prom"))
-		return FMT_PROM;
-	return FMT_CSV;
+	/* Default to CSV; explicit format=csv also accepted */
+	const char *fmt = strstr(request, "format=");
+	if (!fmt)
+		return 1;  /* no format specified → CSV */
+	return strncmp(fmt + 7, "csv", 3) == 0;
 }
 
 static int parse_clear(const char *request)
@@ -506,41 +461,26 @@ static void handle_request(int client_fd,
 		return;
 	}
 
-	enum format_type fmt = parse_format(buf);
+	if (!parse_format_csv(buf)) {
+		fprintf(stderr, "[WARN] http: unsupported format from %s\n",
+			peer_ip);
+		const char *msg = "Unsupported format (use format=csv)\n";
+		send_response(client_fd, 400, "text/plain",
+			      msg, (int)strlen(msg));
+		return;
+	}
 
-	if (fmt == FMT_PROM) {
-		/* Prom: just read and return the snapshot file (no clearing) */
-		int body_len = 0;
-		char *body = read_prom_file(&body_len);
-
-		if (body && body_len > 0) {
-			send_response(client_fd, 200,
-				"text/plain; version=0.0.4; charset=utf-8",
-				body, body_len);
-			fprintf(stderr, "[INFO] http: GET /metrics?format=prom "
-				"from %s → %d bytes\n", peer_ip, body_len);
-		} else {
-			/* No snapshot yet */
-			const char *empty = "# no data\n";
-			send_response(client_fd, 200, "text/plain",
-				      empty, (int)strlen(empty));
-			fprintf(stderr, "[INFO] http: GET /metrics?format=prom "
-				"from %s → no data\n", peer_ip);
-		}
-		free(body);
+	int do_clear = parse_clear(buf);
+	if (do_clear) {
+		/* CSV + clear: swap + stream + commit (for ClickHouse) */
+		fprintf(stderr, "[INFO] http: GET /metrics?format=csv&clear=1 "
+			"from %s\n", peer_ip);
+		handle_csv_clear(client_fd);
 	} else {
-		int do_clear = parse_clear(buf);
-		if (do_clear) {
-			/* CSV + clear: swap + stream + commit (for ClickHouse) */
-			fprintf(stderr, "[INFO] http: GET /metrics?format=csv&clear=1 "
-				"from %s\n", peer_ip);
-			handle_csv_clear(client_fd);
-		} else {
-			/* CSV read-only: snapshot without clearing */
-			fprintf(stderr, "[INFO] http: GET /metrics?format=csv "
-				"from %s (read-only)\n", peer_ip);
-			handle_csv_readonly(client_fd);
-		}
+		/* CSV read-only: snapshot without clearing */
+		fprintf(stderr, "[INFO] http: GET /metrics?format=csv "
+			"from %s (read-only)\n", peer_ip);
+		handle_csv_readonly(client_fd);
 	}
 }
 
@@ -594,13 +534,10 @@ static void *server_thread(void *arg)
 
 /* ── public API ──────────────────────────────────────────────────── */
 
-int http_server_start(const struct http_config *cfg,
-		      const char *prom_path)
+int http_server_start(const struct http_config *cfg)
 {
 	if (!cfg->enabled)
 		return 0;
-
-	snprintf(g_prom_path, sizeof(g_prom_path), "%s", prom_path);
 
 	g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (g_listen_fd < 0) {
