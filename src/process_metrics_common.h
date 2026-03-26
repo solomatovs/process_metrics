@@ -14,27 +14,46 @@
 #define CMDLINE_MAX     256   /* must be power of 2 */
 #define MAX_PROCS       65536
 /*
- * Размер кольцевого буфера для передачи событий из BPF в userspace.
- * RINGBUF_EVENTS — желаемое количество событий (struct event) в буфере.
- * Можно переопределить при компиляции: -DRINGBUF_EVENTS=4096
+ * Размеры кольцевых буферов для передачи событий из BPF в userspace.
+ * Три раздельных буфера — каждый под свой тип событий:
  *
- * Итоговый размер округляется вверх до степени двойки (требование ядра).
- * Каждое событие занимает sizeof(struct event) + 8 байт заголовка ring buffer.
+ *   events      — fork/exec/exit/oom_kill (struct event, ~450 байт)
+ *   events_file — закрытие файлов (struct file_event, ~300 байт)
+ *   events_net  — сетевые и signal события (~60–120 байт)
+ *
+ * Параметризация через количество событий при компиляции:
+ *   -DRINGBUF_PROC_EVENTS=4096  (по умолчанию 2048)
+ *   -DRINGBUF_FILE_EVENTS=4096  (по умолчанию 2048)
+ *   -DRINGBUF_NET_EVENTS=4096   (по умолчанию 2048)
+ *
+ * Итоговый размер = кол-во событий * размер слота, округлён вверх
+ * до степени двойки (требование ядра для BPF ring buffer).
+ * Каждый слот = sizeof(struct) + 8 байт BPF_RINGBUF_HDR_SZ, с запасом.
  */
-#ifndef RINGBUF_EVENTS
-#define RINGBUF_EVENTS  2048
-#endif
 
-/* Вычисление ближайшей степени двойки >= x (compile-time, до 2^30) */
+/* Вычисление ближайшей степени двойки >= x (compile-time) */
 #define _RINGBUF_POW2(x) \
 	((x) <= 1 ? 1 : \
 	 1U << (32 - __builtin_clz((unsigned)((x) - 1))))
 
-/* sizeof(struct event) ещё не известен здесь, используем оценку сверху.
- * struct event ~= 448 байт, + 8 байт BPF_RINGBUF_HDR_SZ = 456, округляем до 512. */
-#define _RINGBUF_EVENT_SLOT  512
+#ifndef RINGBUF_PROC_EVENTS
+#define RINGBUF_PROC_EVENTS  4096
+#endif
+#ifndef RINGBUF_FILE_EVENTS
+#define RINGBUF_FILE_EVENTS  4096
+#endif
+#ifndef RINGBUF_NET_EVENTS
+#define RINGBUF_NET_EVENTS   4096
+#endif
 
-#define RINGBUF_SIZE  _RINGBUF_POW2(RINGBUF_EVENTS * _RINGBUF_EVENT_SLOT)
+/* Размер слота: sizeof(struct) + заголовок, округлено вверх до степени двойки */
+#define _RINGBUF_PROC_SLOT   512   /* struct event ~450 + 8 */
+#define _RINGBUF_FILE_SLOT   512   /* struct file_event ~300 + 8 */
+#define _RINGBUF_NET_SLOT    256   /* struct net_event ~120 + 8 (макс. из сетевых) */
+
+#define RINGBUF_PROC_SIZE  _RINGBUF_POW2(RINGBUF_PROC_EVENTS * _RINGBUF_PROC_SLOT)
+#define RINGBUF_FILE_SIZE  _RINGBUF_POW2(RINGBUF_FILE_EVENTS * _RINGBUF_FILE_SLOT)
+#define RINGBUF_NET_SIZE   _RINGBUF_POW2(RINGBUF_NET_EVENTS  * _RINGBUF_NET_SLOT)
 
 /*
  * Rate limiting state for exec events.

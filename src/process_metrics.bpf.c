@@ -12,7 +12,7 @@
  * Карты (maps):
  *   proc_map    — метрики процессов в реальном времени (hash: tgid → proc_info)
  *   tracked_map — метаданные отслеживания            (hash: tgid → track_info)
- *   events      — кольцевой буфер событий жизненного цикла
+ *   events_proc — кольцевой буфер событий жизненного цикла процессов
  *
  * Пространство пользователя управляет решениями об отслеживании (сопоставление правил exec).
  * BPF только собирает данные для отслеживаемых PID и отправляет события жизненного цикла.
@@ -69,10 +69,23 @@ struct {
 	__type(value, struct track_info);
 } tracked_map SEC(".maps");
 
+/* Ring buffer для событий процессов: fork/exec/exit/oom_kill (struct event) */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
-	__uint(max_entries, RINGBUF_SIZE);
-} events SEC(".maps");
+	__uint(max_entries, RINGBUF_PROC_SIZE);
+} events_proc SEC(".maps");
+
+/* Ring buffer для файловых событий (struct file_event) */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_FILE_SIZE);
+} events_file SEC(".maps");
+
+/* Ring buffer для сетевых и signal событий (net_event, signal_event, retransmit, syn, rst) */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_NET_SIZE);
+} events_net SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -464,7 +477,7 @@ int handle_exec(void *ctx)
 	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
 	/* Отправляем событие EXEC — всегда, для сопоставления правил в пространстве пользователя */
-	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e)
 		return 0;
 
@@ -563,7 +576,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	}
 	bpf_map_update_elem(&proc_map, &child_tgid, child_pi, BPF_NOEXIST);
 
-	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e)
 		return 0;
 
@@ -680,7 +693,7 @@ int handle_exit(void *ctx)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
 	/* Отправляем событие EXIT с финальными метриками */
-	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e)
 		goto cleanup;
 
@@ -764,7 +777,7 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 		info->oom_killed = 1;
 
 	/* Отправляем событие OOM_KILL в пространство пользователя */
-	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e)
 		return 0;
 
@@ -839,7 +852,7 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
 		return 0;
 
-	struct signal_event *se = bpf_ringbuf_reserve(&events, sizeof(*se), 0);
+	struct signal_event *se = bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
 	if (!se)
 		return 0;
 
@@ -1085,7 +1098,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	/* Отправляем событие закрытия файла через кольцевой буфер */
-	struct file_event *fe = bpf_ringbuf_reserve(&events, sizeof(*fe), 0);
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
 	if (fe) {
 		__builtin_memset(fe, 0, sizeof(*fe));
 		fe->type = EVENT_FILE_CLOSE;
@@ -1298,7 +1311,7 @@ static __always_inline void read_sock_addrs(struct sock *sk,
 static __always_inline void emit_net_close(struct sock_info *si,
 					   __u64 now_ns)
 {
-	struct net_event *ne = bpf_ringbuf_reserve(&events, sizeof(*ne), 0);
+	struct net_event *ne = bpf_ringbuf_reserve(&events_net, sizeof(*ne), 0);
 	if (!ne)
 		return;
 
@@ -1648,7 +1661,7 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	struct sock *sk = (struct sock *)ctx->args[0];
 
 	struct retransmit_event *re =
-		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
 	if (!re)
 		return 0;
 
@@ -1686,7 +1699,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 		return 0;
 
 	struct syn_event *se =
-		bpf_ringbuf_reserve(&events, sizeof(*se), 0);
+		bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
 	if (!se)
 		return 0;
 
@@ -1753,7 +1766,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	struct rst_event *re =
-		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
 	if (!re)
 		return 0;
 
@@ -1789,7 +1802,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	struct sock *sk = (struct sock *)ctx->args[0];
 
 	struct rst_event *re =
-		bpf_ringbuf_reserve(&events, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
 	if (!re)
 		return 0;
 

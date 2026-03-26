@@ -3144,11 +3144,26 @@ int main(int argc, char *argv[])
 	tracked_map_fd = bpf_map__fd(skel->maps.tracked_map);
 	proc_map_fd    = bpf_map__fd(skel->maps.proc_map);
 
-	/* Ring buffer */
+	/* Ring buffers: процессы, файлы, сеть — каждый со своим буфером,
+	 * но общий callback handle_event (различает по полю type). */
 	struct ring_buffer *rb = ring_buffer__new(
-		bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
+		bpf_map__fd(skel->maps.events_proc), handle_event, NULL, NULL);
 	if (!rb) {
 		fprintf(stderr, "FATAL: failed to create ring buffer\n");
+		process_metrics_bpf__destroy(skel);
+		return 1;
+	}
+	if (ring_buffer__add(rb, bpf_map__fd(skel->maps.events_file),
+			     handle_event, NULL)) {
+		fprintf(stderr, "FATAL: failed to add events_file ring buffer\n");
+		ring_buffer__free(rb);
+		process_metrics_bpf__destroy(skel);
+		return 1;
+	}
+	if (ring_buffer__add(rb, bpf_map__fd(skel->maps.events_net),
+			     handle_event, NULL)) {
+		fprintf(stderr, "FATAL: failed to add events_net ring buffer\n");
+		ring_buffer__free(rb);
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
