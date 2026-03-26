@@ -1284,27 +1284,6 @@ static __s16 read_proc_oom(__u32 pid)
 	return (__s16)atoi(buf);
 }
 
-/*
- * Read tty_nr from /proc/PID/stat (field 7 after pid and comm).
- * Returns 0 if process has no controlling terminal.
- */
-static __u32 read_proc_tty_nr(__u32 pid)
-{
-	char path[64], buf[512];
-	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
-	FILE *f = fopen(path, "r");
-	if (!f) return 0;
-	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
-	fclose(f);
-	char *rp = strrchr(buf, ')');
-	if (!rp) return 0;
-	/* fields: state ppid pgrp session tty_nr */
-	char state;
-	int ppid, pgrp, session, tty;
-	if (sscanf(rp + 2, "%c %d %d %d %d", &state, &ppid, &pgrp, &session, &tty) != 5)
-		return 0;
-	return (__u32)(tty > 0 ? tty : 0);
-}
 
 /*
  * One-time startup scan: read /proc, match rules, populate BPF maps.
@@ -2014,23 +1993,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		tags_inherit_ts(e->tgid, e->ppid);
 
-		/* Наследуем tty_nr от родителя (BPF не может читать signal->tty).
-		 * Дочерний процесс наследует управляющий терминал при fork. */
+		/* tty_nr уже заполнен BPF (read_tty_nr в handle_fork) */
 		__u32 child_tty = 0;
 		{
-			struct proc_info parent_pi;
-			if (bpf_map_lookup_elem(proc_map_fd, &e->ppid, &parent_pi) == 0)
-				child_tty = parent_pi.tty_nr;
-		}
-		/* Если у родителя нет tty — читаем из /proc */
-		if (!child_tty)
-			child_tty = read_proc_tty_nr(e->tgid);
-		if (child_tty) {
-			struct proc_info pi;
-			if (bpf_map_lookup_elem(proc_map_fd, &e->tgid, &pi) == 0) {
-				pi.tty_nr = child_tty;
-				bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_EXIST);
-			}
+			struct proc_info child_pi;
+			if (bpf_map_lookup_elem(proc_map_fd, &e->tgid, &child_pi) == 0)
+				child_tty = child_pi.tty_nr;
 		}
 
 		/* Отправляем fork-событие в буферный файл */

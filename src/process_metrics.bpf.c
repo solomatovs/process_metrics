@@ -622,7 +622,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	/* Inherit identity/scheduler/namespaces from parent */
 	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
 		      &child_pi->euid);
-	/* tty_nr will be filled by userspace fork handler */
+	child_pi->tty_nr = read_tty_nr(child);
 	child_pi->sched_policy = BPF_CORE_READ(parent, policy);
 	read_ns_inums(parent, &child_pi->mnt_ns_inum, &child_pi->pid_ns_inum,
 		      &child_pi->net_ns_inum, &child_pi->cgroup_ns_inum);
@@ -717,7 +717,7 @@ int handle_sched_switch(void *ctx)
 
 	/* Identity: loginuid, sessionid, euid */
 	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
-	/* tty_nr is set by userspace (BPF can't reliably read signal->tty) */
+	info->tty_nr = read_tty_nr(task);
 
 	/* Scheduling policy */
 	info->sched_policy = BPF_CORE_READ(task, policy);
