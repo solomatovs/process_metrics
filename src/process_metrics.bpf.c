@@ -25,6 +25,29 @@
 #include <bpf/bpf_endian.h>
 #include "process_metrics_common.h"
 
+/*
+ * BPF_ZERO(var) — обнуляет ВСЕ байты структуры на стеке, включая padding.
+ *
+ * Ядро 5.x: верификатор требует инициализации каждого байта стековых
+ * переменных, передаваемых в bpf_map_update_elem / bpf_ringbuf_output.
+ * Designated initializers ({.field = val}) обнуляют только поля,
+ * но не padding-байты между ними — verifier отвергает программу.
+ *
+ * Ядро >= 6.0: верификатор допускает неинициализированный padding,
+ * поэтому memset не нужен — обычные инициализаторы работают корректно.
+ *
+ * KERN_VER_MAJOR передаётся из Makefile через -D.
+ */
+#ifndef KERN_VER_MAJOR
+#define KERN_VER_MAJOR 6
+#endif
+
+#if KERN_VER_MAJOR < 6
+#define BPF_ZERO(var) __builtin_memset(&(var), 0, sizeof(var))
+#else
+#define BPF_ZERO(var) do {} while(0)
+#endif
+
 /* ── rodata (настраивается из пространства пользователя перед загрузкой) ── */
 
 /* Макс. событий exec в секунду, отправляемых в кольцевой буфер. 0 = без ограничений. */
@@ -432,11 +455,11 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 	/* Создаём tracked_map запись для потомка прямо в BPF,
 	 * чтобы handle_exec мог найти proc_info до обработки в userspace */
-	struct track_info child_ti = {
-		.root_pid = parent_ti->root_pid,
-		.rule_id  = parent_ti->rule_id,
-		.is_root  = 0,
-	};
+	struct track_info child_ti;
+	BPF_ZERO(child_ti);
+	child_ti.root_pid = parent_ti->root_pid;
+	child_ti.rule_id  = parent_ti->rule_id;
+	child_ti.is_root  = 0;
 	bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti, BPF_NOEXIST);
 
 	/* Создаём proc_info для потомка через per-CPU scratch buffer
@@ -926,7 +949,8 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	/* Читаем путь из пространства пользователя */
-	struct openat_args oa = {0};
+	struct openat_args oa;
+	BPF_ZERO(oa);
 	const char *pathname = (const char *)ctx->args[1];
 	bpf_probe_read_user_str(oa.path, sizeof(oa.path), pathname);
 	oa.flags = (int)ctx->args[2];
@@ -963,7 +987,8 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct fd_key fk = { .tgid = tgid, .fd = (__s32)ret };
 
-	struct fd_info fi = {0};
+	struct fd_info fi;
+	BPF_ZERO(fi);
 	__builtin_memcpy(fi.path, oa->path, FILE_PATH_MAX);
 	fi.flags = oa->flags;
 	fi.open_count = 1;
@@ -1260,7 +1285,7 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	struct sock_info si = {};
+	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -1304,7 +1329,7 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	struct sock_info si = {};
+	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -1332,7 +1357,7 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u64 sk_ptr = (__u64)sk;
 
-	struct sock_info si = {};
+	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -1752,7 +1777,7 @@ int BPF_KRETPROBE(ret_udp_sendmsg_sec, int ret)
 	if (ret <= 0)
 		return 0;
 
-	struct udp_agg_key key = {};
+	struct udp_agg_key key; BPF_ZERO(key);
 	key.tgid = (__u32)(pid_tgid >> 32);
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	key.af = (__u8)family;
@@ -1804,7 +1829,7 @@ int BPF_KRETPROBE(ret_udp_recvmsg_sec, int ret)
 	if (ret <= 0)
 		return 0;
 
-	struct udp_agg_key key = {};
+	struct udp_agg_key key; BPF_ZERO(key);
 	key.tgid = (__u32)(pid_tgid >> 32);
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	key.af = (__u8)family;
@@ -1839,7 +1864,7 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 	if (!sec_enabled(SEC_ICMP_TRACKING))
 		return 0;
 
-	struct icmp_agg_key key = {};
+	struct icmp_agg_key key; BPF_ZERO(key);
 
 	/* Read source IP from IP header */
 	unsigned char *head = BPF_CORE_READ(skb, head);

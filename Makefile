@@ -50,8 +50,13 @@ CLANG   ?= $(shell best=""; best_ver=0; \
 BPFTOOL ?= $(BPFTOOL_BIN)
 CC      := $(CLANG)
 
+# Версия ядра — для совместимости BPF верификатора (5.15 vs 6.x)
+KERN_VER_MAJOR := $(shell uname -r | cut -d. -f1)
+KERN_VER_MINOR := $(shell uname -r | cut -d. -f2)
+
 # Флаги компиляции
-BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86
+BPF_CFLAGS := -O2 -g -target bpf -I$(SRCDIR) -D__TARGET_ARCH_x86 \
+              -DKERN_VER_MAJOR=$(KERN_VER_MAJOR) -DKERN_VER_MINOR=$(KERN_VER_MINOR)
 CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
 

@@ -184,6 +184,7 @@ struct track_info {
 	__u32 root_pid;
 	__u16 rule_id;
 	__u8  is_root;
+	__u8  _pad;       /* explicit padding — kernel 5.15 verifier requires all stack bytes initialized */
 };
 
 /*
