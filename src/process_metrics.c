@@ -25,6 +25,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <mntent.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <regex.h>
 #include <libconfig.h>
@@ -3083,15 +3084,38 @@ int main(int argc, char *argv[])
 	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_file_size);
 
-	/* Main loop */
+	/* Main loop
+	 *
+	 * Используем ring_buffer__epoll_fd + poll + ring_buffer__consume
+	 * вместо ring_buffer__poll, потому что ring_buffer__poll
+	 * в старых версиях libbpf (0.7, Astra Linux 5.15) может
+	 * игнорировать timeout и блокироваться до появления событий,
+	 * что полностью останавливает цикл snapshot'ов.
+	 *
+	 * poll() на epoll_fd корректно обрабатывает timeout на всех
+	 * версиях ядра. ring_buffer__consume неблокирующий — обрабатывает
+	 * все доступные события и возвращается немедленно.
+	 */
+	int rb_fd = ring_buffer__epoll_fd(rb);
 	time_t last_snapshot = 0;
 
 	while (g_running) {
-		int err = ring_buffer__poll(rb, 1000 /* 1 second timeout */);
-		if (err == -EINTR)
-			continue;
+		/* Вычисляем timeout до следующего snapshot */
+		time_t now = time(NULL);
+		int until_snap = (int)(cfg_snapshot_interval -
+				       (now - last_snapshot));
+		if (until_snap < 0) until_snap = 0;
+		int timeout_ms = until_snap * 1000;
+		if (timeout_ms > 1000) timeout_ms = 1000; /* max 1s для отзывчивости */
+
+		/* Ждём событий или timeout */
+		struct pollfd pfd = { .fd = rb_fd, .events = POLLIN };
+		poll(&pfd, 1, timeout_ms);
+
+		/* Обрабатываем все доступные события (неблокирующий) */
+		int err = ring_buffer__consume(rb);
 		if (err < 0 && err != -EINTR) {
-			log_ts("ERROR", "ring_buffer__poll: %d", err);
+			log_ts("ERROR", "ring_buffer__consume: %d", err);
 			break;
 		}
 
@@ -3117,7 +3141,7 @@ int main(int argc, char *argv[])
 		}
 
 		/* Periodic snapshot */
-		time_t now = time(NULL);
+		now = time(NULL);
 		if (now - last_snapshot >= cfg_snapshot_interval) {
 			build_cgroup_cache();
 			write_snapshot();
