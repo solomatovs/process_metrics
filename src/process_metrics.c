@@ -126,26 +126,13 @@ static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
-/* Snapshot timer — глобальный, чтобы handle_event мог вызвать snapshot
- * даже если ring_buffer__consume не возвращает управление (libbpf 0.7). */
+/* Snapshot timer — глобальный, чтобы handle_event мог прервать
+ * ring_buffer__consume когда пора делать snapshot. */
 static time_t g_last_snapshot;
 
-/* Forward declarations for inline snapshot from callback */
+/* Forward declarations */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
-
-/* Проверка таймера snapshot — вызывается из handle_event и из main loop.
- * На libbpf 0.7 при высокой нагрузке ring_buffer__consume может не
- * возвращать управление, поэтому snapshot нужно делать изнутри callback. */
-static inline void check_snapshot(void)
-{
-	time_t now = time(NULL);
-	if (now - g_last_snapshot >= cfg_snapshot_interval) {
-		build_cgroup_cache();
-		write_snapshot();
-		g_last_snapshot = now;
-	}
-}
 
 /* ── tags hash table (userspace-only, per-tgid) ──────────────────── */
 
@@ -1345,13 +1332,15 @@ static void initial_scan(void)
 
 /* ── ring buffer event handler ────────────────────────────────────── */
 
+/* Счётчики событий для диагностики main loop */
+static long long g_events_total;
+static long long g_events_since_snap;
+
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	(void)ctx;
-
-	/* На libbpf 0.7 ring_buffer__consume может не возвращать управление
-	 * при высокой нагрузке — проверяем таймер snapshot в каждом callback */
-	check_snapshot();
+	g_events_total++;
+	g_events_since_snap++;
 
 	/* Both struct event and struct file_event have __u32 type at offset 0 */
 	if (size < sizeof(__u32))
@@ -1975,6 +1964,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 	default:
 		break;
 	}
+
+	/* Прерываем ring_buffer__consume когда пора делать snapshot.
+	 * На libbpf 0.7 ringbuf_process_ring имеет do...while(got_new_data)
+	 * цикл, который не возвращает управление при постоянном потоке событий.
+	 * return < 0 из callback прерывает этот цикл. cons_pos уже обновлён
+	 * (ringbuf.c:227), поэтому событие НЕ переобрабатывается. */
+	if (time(NULL) - g_last_snapshot >= cfg_snapshot_interval)
+		return -EAGAIN;
 	return 0;
 }
 
@@ -3119,19 +3116,20 @@ int main(int argc, char *argv[])
 
 	/* Main loop
 	 *
-	 * Используем ring_buffer__epoll_fd + poll + ring_buffer__consume
-	 * вместо ring_buffer__poll, потому что ring_buffer__poll
-	 * в старых версиях libbpf (0.7, Astra Linux 5.15) может
-	 * игнорировать timeout и блокироваться до появления событий.
-	 *
-	 * ВАЖНО: на libbpf 0.7 ring_buffer__consume тоже может не
-	 * возвращать управление при постоянном потоке событий — поэтому
-	 * check_snapshot() вызывается ТАКЖЕ из handle_event callback.
+	 * ring_buffer__consume в libbpf имеет do...while(got_new_data) цикл
+	 * (ringbuf.c:215-243), который не возвращает управление при постоянном
+	 * потоке BPF-событий. handle_event прерывает consume (return -1),
+	 * когда наступает время snapshot. cons_pos уже обновлён к этому
+	 * моменту (ringbuf.c:227), поэтому событие не переобрабатывается.
 	 */
 	int rb_fd = ring_buffer__epoll_fd(rb);
+	log_ts("INFO", "ring_buffer epoll_fd=%d", rb_fd);
 	g_last_snapshot = 0;
+	long long loop_iter = 0;
 
 	while (g_running) {
+		loop_iter++;
+
 		/* Вычисляем timeout до следующего snapshot */
 		time_t now = time(NULL);
 		int until_snap = (int)(cfg_snapshot_interval -
@@ -3142,13 +3140,20 @@ int main(int argc, char *argv[])
 
 		/* Ждём событий или timeout */
 		struct pollfd pfd = { .fd = rb_fd, .events = POLLIN };
-		poll(&pfd, 1, timeout_ms);
+		int poll_rc = poll(&pfd, 1, timeout_ms);
 
-		/* Обрабатываем все доступные события.
-		 * check_snapshot() вызывается из handle_event при каждом событии,
-		 * гарантируя snapshot даже если consume не вернётся быстро. */
+		/* Обрабатываем доступные события.
+		 * handle_event прерывает consume (return -EAGAIN) когда пора snapshot. */
+		long long before = g_events_total;
 		int err = ring_buffer__consume(rb);
-		if (err < 0 && err != -EINTR) {
+		long long consumed = g_events_total - before;
+
+		log_debug("LOOP[%lld]: poll=%d(revents=0x%x,timeout=%d) "
+			  "consume=%d events=%lld total=%lld",
+			  loop_iter, poll_rc, pfd.revents, timeout_ms,
+			  err, consumed, g_events_total);
+
+		if (err < 0 && err != -EINTR && err != -EAGAIN) {
 			log_ts("ERROR", "ring_buffer__consume: %d", err);
 			break;
 		}
@@ -3174,8 +3179,18 @@ int main(int argc, char *argv[])
 			initial_scan();
 		}
 
-		/* Periodic snapshot (fallback — основная проверка в handle_event) */
-		check_snapshot();
+		/* Periodic snapshot */
+		now = time(NULL);
+		if (now - g_last_snapshot >= cfg_snapshot_interval) {
+			log_ts("INFO", "snapshot trigger: %lld events since last, "
+			       "loop_iter=%lld, elapsed=%ds",
+			       g_events_since_snap, loop_iter,
+			       (int)(now - g_last_snapshot));
+			build_cgroup_cache();
+			write_snapshot();
+			g_last_snapshot = now;
+			g_events_since_snap = 0;
+		}
 	}
 
 	/* Stop HTTP server */
