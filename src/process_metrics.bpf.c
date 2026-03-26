@@ -194,21 +194,72 @@ static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 	return mi;
 }
 
+/*
+ * THREAD_CPU_STEP — один шаг обхода linked list потоков.
+ *
+ * signal->thread_head → task->thread_node → task->thread_node → ...
+ * (circular: последний .next == head_addr)
+ *
+ * node   — текущий указатель struct list_head * (в ядре)
+ * off    — CO-RE смещение thread_node внутри task_struct
+ * head   — адрес signal->thread_head (маркер конца кольца)
+ * u, s   — аккумуляторы utime/stime
+ */
+#define THREAD_CPU_STEP(node, off, head, u, s)				\
+do {									\
+	if ((node) != (head)) {						\
+		struct task_struct *__t =				\
+			(struct task_struct *)((char *)(node) - (off));	\
+		(u) += BPF_CORE_READ(__t, utime);			\
+		(s) += BPF_CORE_READ(__t, stime);			\
+		struct list_head __ln;					\
+		bpf_core_read(&__ln, sizeof(__ln), (node));		\
+		(node) = __ln.next;					\
+	}								\
+} while (0)
+
+/* THREAD_CPU_STEP_x4 — 4 шага за раз для компактности */
+#define THREAD_CPU_4(n, o, h, u, s) \
+	THREAD_CPU_STEP(n, o, h, u, s); \
+	THREAD_CPU_STEP(n, o, h, u, s); \
+	THREAD_CPU_STEP(n, o, h, u, s); \
+	THREAD_CPU_STEP(n, o, h, u, s)
+
+#define THREAD_CPU_16(n, o, h, u, s) \
+	THREAD_CPU_4(n, o, h, u, s); \
+	THREAD_CPU_4(n, o, h, u, s); \
+	THREAD_CPU_4(n, o, h, u, s); \
+	THREAD_CPU_4(n, o, h, u, s)
+
 static __always_inline __u64 read_cpu_ns(struct task_struct *task)
 {
 	/*
 	 * signal->{utime,stime} накапливает CPU завершённых потоков.
-	 * Добавляем CPU group_leader для приближённого значения.
-	 * Точно для однопоточных процессов.
+	 * Обходим до 64 живых потоков через thread_head / thread_node.
+	 * Для процессов с > 64 потоками — неучтённый «хвост».
 	 */
 	__u64 u = BPF_CORE_READ(task, signal, utime);
 	__u64 s = BPF_CORE_READ(task, signal, stime);
 
-	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
-	if (leader) {
-		u += BPF_CORE_READ(leader, utime);
-		s += BPF_CORE_READ(leader, stime);
-	}
+	/* Адрес thread_head = sig + CO-RE offset */
+	struct signal_struct *sig = BPF_CORE_READ(task, signal);
+	if (!sig)
+		return u + s;
+
+	unsigned long off = bpf_core_field_offset(struct task_struct, thread_node);
+	void *head = (void *)sig +
+		     bpf_core_field_offset(struct signal_struct, thread_head);
+
+	/* Первый узел: thread_head.next */
+	struct list_head lh;
+	bpf_core_read(&lh, sizeof(lh), head);
+	void *node = lh.next;
+
+	THREAD_CPU_16(node, off, head, u, s);  /*  1–16 */
+	THREAD_CPU_16(node, off, head, u, s);  /* 17–32 */
+	THREAD_CPU_16(node, off, head, u, s);  /* 33–48 */
+	THREAD_CPU_16(node, off, head, u, s);  /* 49–64 */
+
 	return u + s;
 }
 
