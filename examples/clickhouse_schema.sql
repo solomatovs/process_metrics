@@ -149,6 +149,11 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     sec_direction          UInt8                       CODEC(T64, ZSTD(1)),
     open_tcp_conns         UInt64                      CODEC(T64, ZSTD(1)),
 
+    -- ── disk usage (только события disk_usage, для остальных — нули) ─
+    disk_total_bytes       UInt64                      CODEC(T64, ZSTD(1)),
+    disk_used_bytes        UInt64                      CODEC(T64, ZSTD(1)),
+    disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
+
     -- ── skip-индексы ──────────────────────────────────────────────
     INDEX idx_pid pid TYPE bloom_filter(0.01) GRANULARITY 4
 )
@@ -231,7 +236,8 @@ FROM url(
      sec_local_addr String, sec_remote_addr String,
      sec_local_port UInt16, sec_remote_port UInt16,
      sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
-     open_tcp_conns UInt64'
+     open_tcp_conns UInt64,
+     disk_total_bytes UInt64, disk_used_bytes UInt64, disk_avail_bytes UInt64'
 );
 
 -- ══════════════════════════════════════════════════════════════════════
@@ -269,5 +275,6 @@ SELECT * FROM url(
      sec_local_addr String, sec_remote_addr String,
      sec_local_port UInt16, sec_remote_port UInt16,
      sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
-     open_tcp_conns UInt64'
+     open_tcp_conns UInt64,
+     disk_total_bytes UInt64, disk_used_bytes UInt64, disk_avail_bytes UInt64'
 );

@@ -2825,6 +2825,246 @@
       ],
       "title": "Error Events (OOM Kill + Non-Zero Exit)",
       "type": "logs"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 179
+      },
+      "id": 90,
+      "title": "Disk Usage",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "percentunit",
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "orange",
+                "value": 0.85
+              },
+              {
+                "color": "red",
+                "value": 0.95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 180
+      },
+      "id": 91,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  concat(comm, ' (', file_path, ')') AS disk,\n  argMax(disk_used_bytes, timestamp) / argMax(disk_total_bytes, timestamp) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY comm, file_path\nORDER BY used_pct DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Usage %",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 16,
+        "x": 8,
+        "y": 180
+      },
+      "id": 92,
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "used_pct",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  comm AS device,\n  file_path AS mount_point,\n  sec_remote_addr AS fs_type,\n  formatReadableSize(argMax(disk_total_bytes, timestamp)) AS total,\n  formatReadableSize(argMax(disk_used_bytes, timestamp)) AS used,\n  formatReadableSize(argMax(disk_avail_bytes, timestamp)) AS available,\n  round(argMax(disk_used_bytes, timestamp) * 100.0 / argMax(disk_total_bytes, timestamp), 1) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY comm, file_path, sec_remote_addr\nORDER BY used_pct DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Details (latest)",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          },
+          "unit": "percentunit",
+          "max": 1,
+          "min": 0
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 186
+      },
+      "id": 93,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_used_bytes) / avg(disk_total_bytes) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Usage % Over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          },
+          "unit": "decbytes"
+        }
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 186
+      },
+      "id": 94,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_avail_bytes) AS available\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Available Space Over Time",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

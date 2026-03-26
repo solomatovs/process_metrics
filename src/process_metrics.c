@@ -23,6 +23,8 @@
 #include <dirent.h>
 #include <getopt.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <mntent.h>
 #include <arpa/inet.h>
 #include <regex.h>
 #include <libconfig.h>
@@ -91,6 +93,17 @@ static int cfg_file_track_bytes             = 0;
 /* Docker resolve config */
 static char cfg_docker_data_root[PATH_MAX_LEN] = "";
 static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
+
+/* Disk tracking config */
+static int cfg_disk_tracking_enabled       = 1;  /* enabled by default */
+#define DISK_MAX_PREFIXES 32
+#define DISK_PREFIX_MAX   256
+static char cfg_disk_include[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
+static int  cfg_disk_include_count         = 0;
+static char cfg_disk_exclude[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
+static int  cfg_disk_exclude_count         = 0;
+static char cfg_disk_fs_types[DISK_MAX_PREFIXES][32];
+static int  cfg_disk_fs_types_count        = 0;
 
 /* Security tracking config */
 static int cfg_sec_tcp_retransmit  = 0;
@@ -758,6 +771,58 @@ static int load_config(const char *path)
 			cfg_sec_icmp_tracking = bool_val;
 		if (config_setting_lookup_bool(st, "open_conn_count", &bool_val))
 			cfg_sec_open_conn_count = bool_val;
+	}
+
+	/* Disk tracking settings */
+	config_setting_t *dt = config_lookup(&cfg, "disk_tracking");
+	if (dt) {
+		if (config_setting_lookup_bool(dt, "enabled", &bool_val))
+			cfg_disk_tracking_enabled = bool_val;
+
+		/* Filesystem types to include (overrides built-in list) */
+		config_setting_t *fst = config_setting_lookup(dt, "fs_types");
+		if (fst && config_setting_is_list(fst)) {
+			int n = config_setting_length(fst);
+			if (n > DISK_MAX_PREFIXES) n = DISK_MAX_PREFIXES;
+			for (int i = 0; i < n; i++) {
+				const char *s =
+					config_setting_get_string_elem(fst, i);
+				if (s)
+					snprintf(cfg_disk_fs_types
+						 [cfg_disk_fs_types_count++],
+						 32, "%s", s);
+			}
+		}
+
+		/* Mount point include prefixes */
+		config_setting_t *inc = config_setting_lookup(dt, "include");
+		if (inc && config_setting_is_list(inc)) {
+			int n = config_setting_length(inc);
+			if (n > DISK_MAX_PREFIXES) n = DISK_MAX_PREFIXES;
+			for (int i = 0; i < n; i++) {
+				const char *s =
+					config_setting_get_string_elem(inc, i);
+				if (s)
+					snprintf(cfg_disk_include
+						 [cfg_disk_include_count++],
+						 DISK_PREFIX_MAX, "%s", s);
+			}
+		}
+
+		/* Mount point exclude prefixes */
+		config_setting_t *exc = config_setting_lookup(dt, "exclude");
+		if (exc && config_setting_is_list(exc)) {
+			int n = config_setting_length(exc);
+			if (n > DISK_MAX_PREFIXES) n = DISK_MAX_PREFIXES;
+			for (int i = 0; i < n; i++) {
+				const char *s =
+					config_setting_get_string_elem(exc, i);
+				if (s)
+					snprintf(cfg_disk_exclude
+						 [cfg_disk_exclude_count++],
+						 DISK_PREFIX_MAX, "%s", s);
+			}
+		}
 	}
 
 	/* Default paths when http_server is enabled */
@@ -1900,6 +1965,127 @@ static long long read_cgroup_value(const char *cg_path, const char *file)
 	return strtoll(buf, NULL, 10);
 }
 
+/*
+ * Emit disk_usage events for each unique real filesystem.
+ * Reads /proc/mounts, applies fs_type/include/exclude filters,
+ * deduplicates by device, calls statvfs().
+ */
+static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
+{
+	/* Default fs types if none configured */
+	static const char *default_fs[] = {
+		"ext2", "ext3", "ext4", "xfs", "btrfs", "vfat",
+		"zfs", "ntfs", "fuseblk", "f2fs", NULL
+	};
+
+	FILE *mf = setmntent("/proc/mounts", "r");
+	if (!mf)
+		return 0;
+
+	char seen_devs[64][256];
+	int seen_count = 0;
+	int disk_count = 0;
+
+	struct mntent *ent;
+	while ((ent = getmntent(mf)) != NULL) {
+		/* Filter by filesystem type */
+		int is_real = 0;
+		if (cfg_disk_fs_types_count > 0) {
+			for (int i = 0; i < cfg_disk_fs_types_count; i++) {
+				if (strcmp(ent->mnt_type,
+					   cfg_disk_fs_types[i]) == 0) {
+					is_real = 1;
+					break;
+				}
+			}
+		} else {
+			for (int i = 0; default_fs[i]; i++) {
+				if (strcmp(ent->mnt_type,
+					   default_fs[i]) == 0) {
+					is_real = 1;
+					break;
+				}
+			}
+		}
+		if (!is_real)
+			continue;
+
+		/* Exclude filter (mount point prefix) */
+		int excluded = 0;
+		for (int i = 0; i < cfg_disk_exclude_count; i++) {
+			if (strncmp(ent->mnt_dir, cfg_disk_exclude[i],
+				    strlen(cfg_disk_exclude[i])) == 0) {
+				excluded = 1;
+				break;
+			}
+		}
+		if (excluded)
+			continue;
+
+		/* Include filter (mount point prefix) — if set, only matching */
+		if (cfg_disk_include_count > 0) {
+			int included = 0;
+			for (int i = 0; i < cfg_disk_include_count; i++) {
+				if (strncmp(ent->mnt_dir, cfg_disk_include[i],
+					    strlen(cfg_disk_include[i])) == 0) {
+					included = 1;
+					break;
+				}
+			}
+			if (!included)
+				continue;
+		}
+
+		/* Skip duplicate devices */
+		int dup = 0;
+		for (int i = 0; i < seen_count; i++) {
+			if (strcmp(seen_devs[i], ent->mnt_fsname) == 0) {
+				dup = 1;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		if (seen_count < 64)
+			snprintf(seen_devs[seen_count++], 256,
+				 "%s", ent->mnt_fsname);
+
+		struct statvfs svfs;
+		if (statvfs(ent->mnt_dir, &svfs) != 0)
+			continue;
+
+		struct metric_event cev;
+		memset(&cev, 0, sizeof(cev));
+		cev.timestamp_ns = timestamp_ns;
+		snprintf(cev.event_type, sizeof(cev.event_type), "disk_usage");
+
+		/* mount point */
+		snprintf(cev.file_path, sizeof(cev.file_path),
+			 "%s", ent->mnt_dir);
+
+		/* device basename in comm */
+		const char *devname = strrchr(ent->mnt_fsname, '/');
+		devname = devname ? devname + 1 : ent->mnt_fsname;
+		snprintf(cev.comm, sizeof(cev.comm), "%s", devname);
+
+		/* fs type */
+		snprintf(cev.sec_remote_addr, sizeof(cev.sec_remote_addr),
+			 "%s", ent->mnt_type);
+
+		__u64 bsz = (__u64)svfs.f_frsize;
+		cev.disk_total_bytes = bsz * (__u64)svfs.f_blocks;
+		cev.disk_used_bytes  = bsz * ((__u64)svfs.f_blocks -
+					      (__u64)svfs.f_bfree);
+		cev.disk_avail_bytes = bsz * (__u64)svfs.f_bavail;
+
+		ef_append(&cev, hostname);
+		disk_count++;
+	}
+
+	endmntent(mf);
+	return disk_count;
+}
+
 static void write_snapshot(void)
 {
 	char tmp_path[PATH_MAX_LEN];
@@ -2474,6 +2660,13 @@ static void write_snapshot(void)
 			log_debug("ICMP flush: %d aggregates", icmp_count);
 	}
 
+	/* Emit disk usage events */
+	if (g_http_cfg.enabled && cfg_disk_tracking_enabled) {
+		int disk_ev = emit_disk_usage_events(snap_timestamp_ns,
+						     cfg_hostname);
+		snap_count += disk_ev;
+	}
+
 	/* Unlock batch — snapshot is complete, safe for swap/snapshot_fd */
 	ef_batch_unlock();
 
@@ -2871,7 +3064,7 @@ int main(int argc, char *argv[])
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net_tracking=%s%s, file_tracking=%s%s, "
 	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s], "
-	       "max_data_file_size=%lld",
+	       "disk_tracking=%s, max_data_file_size=%lld",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
@@ -2887,6 +3080,7 @@ int main(int argc, char *argv[])
 	       cfg_sec_udp_tracking ? "on" : "off",
 	       cfg_sec_icmp_tracking ? "on" : "off",
 	       cfg_sec_open_conn_count ? "on" : "off",
+	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_file_size);
 
 	/* Main loop */

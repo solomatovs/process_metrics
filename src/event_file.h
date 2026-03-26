@@ -127,6 +127,11 @@ struct metric_event {
 
 	/* open TCP connections (snapshot only) */
 	__u64 open_tcp_conns;
+
+	/* ── disk usage (disk_usage event only) ──────────────────────── */
+	__u64 disk_total_bytes;
+	__u64 disk_used_bytes;
+	__u64 disk_avail_bytes;
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */

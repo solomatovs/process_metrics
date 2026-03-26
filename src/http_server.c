@@ -76,7 +76,9 @@ static const char *CSV_HEADER =
 	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
 	/* security tracking */
 	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
-	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns\n";
+	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
+	/* disk usage */
+	"disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
 
 static int csv_escape_field(const char *src, char *dst, int dstlen)
 {
@@ -174,7 +176,9 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* сигналы */
 		"%u,%u,%s,%d,%d,"
 		/* security tracking */
-		"%s,%s,%u,%u,%u,%u,%u,%llu\n",
+		"%s,%s,%u,%u,%u,%u,%u,%llu,"
+		/* disk usage */
+		"%llu,%llu,%llu\n",
 		/* идентификация */
 		ts_str, hostname_esc, event_type_esc, rule_esc, tags_esc,
 		ev->root_pid, ev->pid, ev->ppid, ev->uid,
@@ -245,7 +249,11 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		(unsigned)ev->sec_af,
 		(unsigned)ev->sec_tcp_state,
 		(unsigned)ev->sec_direction,
-		(unsigned long long)ev->open_tcp_conns);
+		(unsigned long long)ev->open_tcp_conns,
+		/* disk usage */
+		(unsigned long long)ev->disk_total_bytes,
+		(unsigned long long)ev->disk_used_bytes,
+		(unsigned long long)ev->disk_avail_bytes);
 
 	return n < buflen ? n : -1;
 }
