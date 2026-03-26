@@ -87,6 +87,12 @@ struct {
 	__uint(max_entries, RINGBUF_NET_SIZE);
 } events_net SEC(".maps");
 
+/* Ring buffer для cgroup событий (struct cgroup_event) */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_CGROUP_SIZE);
+} events_cgroup SEC(".maps");
+
 /* Статистика ring buffer'ов: потери и общее количество событий */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -111,6 +117,8 @@ static __always_inline void rb_stat_inc(__u64 offset)
 #define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
 #define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
 #define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
+#define RB_STAT_TOTAL_CGROUP() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_cgroup))
+#define RB_STAT_DROP_CGROUP()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_cgroup))
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -2066,5 +2074,174 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 /* Increment on successful connect/accept, decrement on tcp_close.
  * This is done via the open_conn_map, keyed by tgid.
  * Userspace reads during snapshot. */
+
+/* ── cgroup lifecycle tracepoints ─────────────────────────────────── */
+
+/*
+ * Helper: read __data_loc string from tracepoint context.
+ * __data_loc is a __u32 where low 16 bits = offset from struct start,
+ * high 16 bits = length.
+ */
+static __always_inline int read_data_loc_str(void *ctx, __u32 data_loc,
+					     char *buf, int buflen)
+{
+	__u16 offset = data_loc & 0xFFFF;
+	return bpf_probe_read_kernel_str(buf, buflen, (char *)ctx + offset);
+}
+
+/* cgroup_mkdir / cgroup_rmdir / cgroup_rename / cgroup_release
+ * All share struct trace_event_raw_cgroup layout:
+ *   int root, int level, u64 id, __data_loc path */
+static __always_inline int emit_cgroup_event(void *ctx, __u32 type)
+{
+	struct trace_event_raw_cgroup *tp = ctx;
+
+	RB_STAT_TOTAL_CGROUP();
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
+						      sizeof(*ce), 0);
+	if (!ce) {
+		RB_STAT_DROP_CGROUP();
+		return 0;
+	}
+
+	__builtin_memset(ce, 0, sizeof(*ce));
+	ce->type         = type;
+	ce->id           = tp->id;
+	ce->level        = tp->level;
+	ce->timestamp_ns = bpf_ktime_get_boot_ns();
+
+	read_data_loc_str(ctx, tp->__data_loc_path,
+			  ce->path, sizeof(ce->path));
+
+	bpf_ringbuf_submit(ce, 0);
+	return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_mkdir")
+int handle_cgroup_mkdir(void *ctx)
+{
+	return emit_cgroup_event(ctx, EVENT_CGROUP_MKDIR);
+}
+
+SEC("tracepoint/cgroup/cgroup_rmdir")
+int handle_cgroup_rmdir(void *ctx)
+{
+	return emit_cgroup_event(ctx, EVENT_CGROUP_RMDIR);
+}
+
+SEC("tracepoint/cgroup/cgroup_rename")
+int handle_cgroup_rename(void *ctx)
+{
+	return emit_cgroup_event(ctx, EVENT_CGROUP_RENAME);
+}
+
+SEC("tracepoint/cgroup/cgroup_release")
+int handle_cgroup_release(void *ctx)
+{
+	return emit_cgroup_event(ctx, EVENT_CGROUP_RELEASE);
+}
+
+/* cgroup_attach_task / cgroup_transfer_tasks
+ * Struct trace_event_raw_cgroup_migrate:
+ *   int dst_root, int dst_level, u64 dst_id, int pid,
+ *   __data_loc dst_path, __data_loc comm */
+static __always_inline int emit_cgroup_migrate(void *ctx, __u32 type)
+{
+	struct trace_event_raw_cgroup_migrate *tp = ctx;
+
+	/* Update cgroup_id in proc_map so snapshot sees the new cgroup */
+	__u32 tgid = (__u32)tp->pid;
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (pi)
+		pi->cgroup_id = tp->dst_id;
+
+	RB_STAT_TOTAL_CGROUP();
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
+						      sizeof(*ce), 0);
+	if (!ce) {
+		RB_STAT_DROP_CGROUP();
+		return 0;
+	}
+
+	__builtin_memset(ce, 0, sizeof(*ce));
+	ce->type         = type;
+	ce->id           = tp->dst_id;
+	ce->level        = tp->dst_level;
+	ce->pid          = tp->pid;
+	ce->timestamp_ns = bpf_ktime_get_boot_ns();
+
+	read_data_loc_str(ctx, tp->__data_loc_dst_path,
+			  ce->path, sizeof(ce->path));
+	read_data_loc_str(ctx, tp->__data_loc_comm,
+			  ce->comm, sizeof(ce->comm));
+
+	bpf_ringbuf_submit(ce, 0);
+	return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_attach_task")
+int handle_cgroup_attach_task(void *ctx)
+{
+	return emit_cgroup_migrate(ctx, EVENT_CGROUP_ATTACH_TASK);
+}
+
+SEC("tracepoint/cgroup/cgroup_transfer_tasks")
+int handle_cgroup_transfer_tasks(void *ctx)
+{
+	return emit_cgroup_migrate(ctx, EVENT_CGROUP_TRANSFER_TASKS);
+}
+
+/* cgroup_notify_populated / cgroup_freeze / cgroup_unfreeze / cgroup_notify_frozen
+ * Struct trace_event_raw_cgroup_event:
+ *   int root, int level, u64 id, __data_loc path, int val */
+static __always_inline int emit_cgroup_state(void *ctx, __u32 type)
+{
+	struct trace_event_raw_cgroup_event *tp = ctx;
+
+	RB_STAT_TOTAL_CGROUP();
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
+						      sizeof(*ce), 0);
+	if (!ce) {
+		RB_STAT_DROP_CGROUP();
+		return 0;
+	}
+
+	__builtin_memset(ce, 0, sizeof(*ce));
+	ce->type         = type;
+	ce->id           = tp->id;
+	ce->level        = tp->level;
+	ce->val          = tp->val;
+	ce->timestamp_ns = bpf_ktime_get_boot_ns();
+
+	read_data_loc_str(ctx, tp->__data_loc_path,
+			  ce->path, sizeof(ce->path));
+
+	bpf_ringbuf_submit(ce, 0);
+	return 0;
+}
+
+SEC("tracepoint/cgroup/cgroup_notify_populated")
+int handle_cgroup_populated(void *ctx)
+{
+	return emit_cgroup_state(ctx, EVENT_CGROUP_POPULATED);
+}
+
+SEC("tracepoint/cgroup/cgroup_freeze")
+int handle_cgroup_freeze(void *ctx)
+{
+	return emit_cgroup_state(ctx, EVENT_CGROUP_FREEZE);
+}
+
+SEC("tracepoint/cgroup/cgroup_unfreeze")
+int handle_cgroup_unfreeze(void *ctx)
+{
+	return emit_cgroup_state(ctx, EVENT_CGROUP_UNFREEZE);
+}
+
+SEC("tracepoint/cgroup/cgroup_notify_frozen")
+int handle_cgroup_frozen(void *ctx)
+{
+	return emit_cgroup_state(ctx, EVENT_CGROUP_FROZEN);
+}
 
 char LICENSE[] SEC("license") = "GPL";

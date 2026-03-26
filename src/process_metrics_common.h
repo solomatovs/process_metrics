@@ -64,9 +64,11 @@ struct ringbuf_stats {
 	__u64 drop_proc;       /* потери в events_proc */
 	__u64 drop_file;       /* потери в events_file */
 	__u64 drop_net;        /* потери в events_net */
+	__u64 drop_cgroup;     /* потери в events_cgroup */
 	__u64 total_proc;      /* всего событий proc */
 	__u64 total_file;      /* всего событий file */
 	__u64 total_net;       /* всего событий net */
+	__u64 total_cgroup;    /* всего событий cgroup */
 };
 
 /*
@@ -89,6 +91,49 @@ enum event_type {
 	EVENT_TCP_RETRANSMIT = 8,
 	EVENT_SYN_RECV       = 9,
 	EVENT_RST            = 10,
+	/* cgroup lifecycle events */
+	EVENT_CGROUP_MKDIR           = 20,
+	EVENT_CGROUP_RMDIR           = 21,
+	EVENT_CGROUP_RENAME          = 22,
+	EVENT_CGROUP_RELEASE         = 23,
+	/* cgroup process migration */
+	EVENT_CGROUP_ATTACH_TASK     = 24,
+	EVENT_CGROUP_TRANSFER_TASKS  = 25,
+	/* cgroup state */
+	EVENT_CGROUP_POPULATED       = 26,
+	EVENT_CGROUP_FREEZE          = 27,
+	EVENT_CGROUP_UNFREEZE        = 28,
+	EVENT_CGROUP_FROZEN          = 29,
+};
+
+/* ── cgroup tracking ─────────────────────────────────────────────── */
+
+#define CGROUP_PATH_MAX  256
+
+/*
+ * Ring buffer size for cgroup events.
+ * Cgroup events are rare (container start/stop, process migration),
+ * so a small buffer is sufficient.
+ */
+#ifndef RINGBUF_CGROUP_EVENTS
+#define RINGBUF_CGROUP_EVENTS  256
+#endif
+#define _RINGBUF_CGROUP_SLOT  512   /* struct cgroup_event ~290 + 8 */
+#define RINGBUF_CGROUP_SIZE  _RINGBUF_POW2(RINGBUF_CGROUP_EVENTS * _RINGBUF_CGROUP_SLOT)
+
+/*
+ * Cgroup event — sent from BPF to userspace via dedicated ring buffer.
+ * First field is __u32 type (EVENT_CGROUP_*), same dispatch convention.
+ */
+struct cgroup_event {
+	__u32 type;              /* EVENT_CGROUP_* */
+	__u64 id;                /* cgroup inode (matches bpf_get_current_cgroup_id) */
+	__u32 level;             /* depth in hierarchy */
+	__u32 pid;               /* for attach/transfer — which PID moved */
+	__s32 val;               /* for populated/frozen — 1/0 */
+	__u64 timestamp_ns;
+	char  path[CGROUP_PATH_MAX]; /* path within cgroup hierarchy */
+	char  comm[COMM_LEN];        /* for attach/transfer — process name */
 };
 
 /* ── file tracking constants ──────────────────────────────────────── */

@@ -131,7 +131,7 @@ static int tracked_map_fd, proc_map_fd;
  *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL и др. (lookup), snapshot (lookup)
  *
  * cgroup_lock — cgroup_cache, cgroup_cache_count
- *   wrlock: snapshot (build_cgroup_cache), reload (rebuild)
+ *   wrlock: cgroup_mkdir/rmdir/rename (BPF events), reload (rebuild)
  *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL (resolve_cgroup_fast)
  */
 #ifndef NO_TAGS
@@ -148,6 +148,7 @@ struct poll_thread_arg {
 /* Forward declarations */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
+static void log_ts(const char *level, const char *fmt, ...);
 
 /* Boot-time to wall-clock offset (computed once at startup,
  * refreshed each snapshot). BPF sends bpf_ktime_get_boot_ns(),
@@ -716,7 +717,7 @@ static void resolve_cgroup_fast_ts(__u64 cgroup_id, char *buf, int buflen)
 }
 
 /* Thread-safe обёртка для resolve_cgroup (без rebuild на промах —
- * кэш обновляется в начале каждого snapshot через build_cgroup_cache_ts). */
+ * кэш обновляется event-driven через BPF cgroup tracepoints). */
 static void resolve_cgroup_ts(__u64 cgroup_id, char *buf, int buflen)
 {
 	pthread_rwlock_rdlock(&g_cgroup_lock);
@@ -746,6 +747,158 @@ static void build_cgroup_cache_ts(void)
 	pthread_rwlock_wrlock(&g_cgroup_lock);
 	build_cgroup_cache();
 	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+/* ── cgroup event handling (BPF → userspace) ─────────────────────── */
+
+/*
+ * Add cgroup entry to cache under wrlock.
+ * If the cgroup id already exists, update its path.
+ */
+static void cgroup_cache_add(__u64 id, const char *path)
+{
+	/* BPF tracepoint paths have leading '/' (e.g. "/test_cg"),
+	 * but scan_cgroup_dir stores relative paths ("test_cg").
+	 * Normalize by stripping leading '/'. */
+	if (path[0] == '/')
+		path++;
+
+	pthread_rwlock_wrlock(&g_cgroup_lock);
+	/* Check if already present — update path */
+	for (int i = 0; i < cgroup_cache_count; i++) {
+		if (cgroup_cache[i].id == id) {
+			snprintf(cgroup_cache[i].fs_path,
+				 sizeof(cgroup_cache[0].fs_path), "%s", path);
+			char docker_name[256];
+			if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
+				snprintf(cgroup_cache[i].path,
+					 sizeof(cgroup_cache[0].path), "%s", docker_name);
+			else
+				snprintf(cgroup_cache[i].path,
+					 sizeof(cgroup_cache[0].path), "%s", path);
+			pthread_rwlock_unlock(&g_cgroup_lock);
+			return;
+		}
+	}
+	/* Add new entry */
+	if (cgroup_cache_count < MAX_CGROUPS) {
+		cgroup_cache[cgroup_cache_count].id = id;
+		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
+			 sizeof(cgroup_cache[0].fs_path), "%s", path);
+		char docker_name[256];
+		if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
+			snprintf(cgroup_cache[cgroup_cache_count].path,
+				 sizeof(cgroup_cache[0].path), "%s", docker_name);
+		else
+			snprintf(cgroup_cache[cgroup_cache_count].path,
+				 sizeof(cgroup_cache[0].path), "%s", path);
+		cgroup_cache_count++;
+	}
+	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+/*
+ * Remove cgroup entry from cache by id under wrlock.
+ * Swaps with last entry for O(1) removal.
+ */
+static void cgroup_cache_remove(__u64 id)
+{
+	pthread_rwlock_wrlock(&g_cgroup_lock);
+	for (int i = 0; i < cgroup_cache_count; i++) {
+		if (cgroup_cache[i].id == id) {
+			cgroup_cache[i] = cgroup_cache[cgroup_cache_count - 1];
+			cgroup_cache_count--;
+			break;
+		}
+	}
+	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+/*
+ * Ring buffer callback for events_cgroup.
+ * Updates cgroup cache on mkdir/rmdir/rename, logs other events.
+ */
+static int handle_cgroup_event(void *ctx, void *data, size_t size)
+{
+	(void)ctx;
+
+	if (size < sizeof(struct cgroup_event))
+		return 0;
+
+	const struct cgroup_event *ce = data;
+
+	switch (ce->type) {
+	case EVENT_CGROUP_MKDIR:
+		cgroup_cache_add(ce->id, ce->path);
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup mkdir: id=%llu level=%d path=%s",
+			       (unsigned long long)ce->id, ce->level, ce->path);
+		break;
+
+	case EVENT_CGROUP_RMDIR:
+		cgroup_cache_remove(ce->id);
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup rmdir: id=%llu path=%s",
+			       (unsigned long long)ce->id, ce->path);
+		break;
+
+	case EVENT_CGROUP_RENAME:
+		/* Update path for existing entry */
+		cgroup_cache_add(ce->id, ce->path);
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup rename: id=%llu path=%s",
+			       (unsigned long long)ce->id, ce->path);
+		break;
+
+	case EVENT_CGROUP_RELEASE:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup release: id=%llu path=%s",
+			       (unsigned long long)ce->id, ce->path);
+		break;
+
+	case EVENT_CGROUP_ATTACH_TASK:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup attach: pid=%d → id=%llu path=%s comm=%s",
+			       ce->pid, (unsigned long long)ce->id,
+			       ce->path, ce->comm);
+		break;
+
+	case EVENT_CGROUP_TRANSFER_TASKS:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup transfer: pid=%d → id=%llu path=%s comm=%s",
+			       ce->pid, (unsigned long long)ce->id,
+			       ce->path, ce->comm);
+		break;
+
+	case EVENT_CGROUP_POPULATED:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup populated: id=%llu path=%s val=%d",
+			       (unsigned long long)ce->id, ce->path, ce->val);
+		break;
+
+	case EVENT_CGROUP_FREEZE:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup freeze: id=%llu path=%s",
+			       (unsigned long long)ce->id, ce->path);
+		break;
+
+	case EVENT_CGROUP_UNFREEZE:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup unfreeze: id=%llu path=%s",
+			       (unsigned long long)ce->id, ce->path);
+		break;
+
+	case EVENT_CGROUP_FROZEN:
+		if (cfg_log_level >= 2)
+			log_ts("DEBUG", "cgroup frozen: id=%llu path=%s val=%d",
+			       (unsigned long long)ce->id, ce->path, ce->val);
+		break;
+
+	default:
+		break;
+	}
+
+	return 0;
 }
 
 /* ── rules parser (from libconfig) ────────────────────────────────── */
@@ -2328,8 +2481,8 @@ static const char *tags_lookup_copy(const __u32 *snap_tgid,
 
 static void write_snapshot(void)
 {
-	/* Обновляем кэш cgroup'ов под wrlock */
-	build_cgroup_cache_ts();
+	/* Кэш cgroup'ов обновляется event-driven через BPF tracepoints
+	 * (cgroup_mkdir/rmdir/rename), периодический rebuild не нужен. */
 	refresh_boot_to_wall();
 
 #ifndef NO_TAGS
@@ -2771,21 +2924,24 @@ static void write_snapshot(void)
 		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
 		if (stats_fd >= 0 &&
 		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
-			if (rs.drop_proc || rs.drop_file || rs.drop_net) {
+			if (rs.drop_proc || rs.drop_file || rs.drop_net || rs.drop_cgroup) {
 				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu cgroup=%llu/%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
 				       (unsigned long long)rs.total_file,
 				       (unsigned long long)rs.drop_net,
-				       (unsigned long long)rs.total_net);
+				       (unsigned long long)rs.total_net,
+				       (unsigned long long)rs.drop_cgroup,
+				       (unsigned long long)rs.total_cgroup);
 			} else if (cfg_log_level >= 2) {
 				log_ts("DEBUG",
-				       "ringbuf totals: proc=%llu file=%llu net=%llu",
+				       "ringbuf totals: proc=%llu file=%llu net=%llu cgroup=%llu",
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.total_file,
-				       (unsigned long long)rs.total_net);
+				       (unsigned long long)rs.total_net,
+				       (unsigned long long)rs.total_cgroup);
 			}
 		}
 	}
@@ -2975,6 +3131,13 @@ int main(int argc, char *argv[])
 	if (!cfg_sec_icmp_tracking)
 		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
 
+	/* cgroup_freeze/cgroup_unfreeze tracepoints use a different
+	 * layout (trace_event_raw_cgroup, no val field) and may not
+	 * support BPF attach on some kernels (e.g. 6.1).
+	 * Disable them — cgroup_notify_frozen covers the same info. */
+	BPF_PROG_DISABLE(skel->progs.handle_cgroup_freeze);
+	BPF_PROG_DISABLE(skel->progs.handle_cgroup_unfreeze);
+
 	/* Load BPF programs */
 	if (process_metrics_bpf__load(skel)) {
 		fprintf(stderr, "FATAL: failed to load BPF programs\n");
@@ -3053,11 +3216,15 @@ int main(int argc, char *argv[])
 		bpf_map__fd(skel->maps.events_file), handle_event, NULL, NULL);
 	struct ring_buffer *rb_net = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_net), handle_event, NULL, NULL);
-	if (!rb_proc || !rb_file || !rb_net) {
+	struct ring_buffer *rb_cgroup = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_cgroup), handle_cgroup_event,
+		NULL, NULL);
+	if (!rb_proc || !rb_file || !rb_net || !rb_cgroup) {
 		fprintf(stderr, "FATAL: failed to create ring buffers\n");
-		if (rb_proc) ring_buffer__free(rb_proc);
-		if (rb_file) ring_buffer__free(rb_file);
-		if (rb_net)  ring_buffer__free(rb_net);
+		if (rb_proc)   ring_buffer__free(rb_proc);
+		if (rb_file)   ring_buffer__free(rb_file);
+		if (rb_net)    ring_buffer__free(rb_net);
+		if (rb_cgroup) ring_buffer__free(rb_cgroup);
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
@@ -3078,6 +3245,7 @@ int main(int argc, char *argv[])
 			ring_buffer__free(rb_proc);
 			ring_buffer__free(rb_file);
 			ring_buffer__free(rb_net);
+			ring_buffer__free(rb_cgroup);
 			process_metrics_bpf__destroy(skel);
 			return 1;
 		}
@@ -3113,16 +3281,19 @@ int main(int argc, char *argv[])
 	 * handle_event внутри использует гранулярные rwlock'и:
 	 *   g_tags_lock   — tags_ht (lookup/store/remove/inherit)
 	 *   g_cgroup_lock — cgroup_cache (resolve_cgroup_fast)
+	 * handle_cgroup_event обновляет cgroup_cache под wrlock
+	 *   при mkdir/rmdir/rename.
 	 * Основной поток занимается snapshot и config reload.
 	 */
-	struct poll_thread_arg args[3] = {
-		{ .rb = rb_proc, .name = "proc" },
-		{ .rb = rb_file, .name = "file" },
-		{ .rb = rb_net,  .name = "net"  },
+	struct poll_thread_arg args[4] = {
+		{ .rb = rb_proc,   .name = "proc"   },
+		{ .rb = rb_file,   .name = "file"   },
+		{ .rb = rb_net,    .name = "net"    },
+		{ .rb = rb_cgroup, .name = "cgroup" },
 	};
-	pthread_t poll_threads[3];
+	pthread_t poll_threads[4];
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
 			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
 				args[i].name);
@@ -3169,7 +3340,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Ждём завершения потоков poll */
-	for (int i = 0; i < 3; i++)
+	for (int i = 0; i < 4; i++)
 		pthread_join(poll_threads[i], NULL);
 
 	/* Stop HTTP server */
@@ -3181,6 +3352,7 @@ int main(int argc, char *argv[])
 	ring_buffer__free(rb_proc);
 	ring_buffer__free(rb_file);
 	ring_buffer__free(rb_net);
+	ring_buffer__free(rb_cgroup);
 	process_metrics_bpf__destroy(skel);
 	free_rules();
 
