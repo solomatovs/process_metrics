@@ -32,10 +32,16 @@
 #   kernel.perf_event_paranoid <= 2  (Debian default=3 блокирует CAP_PERFMON)
 #   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
 #   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
+#
+# Ресурсы (по результатам бенчмарков с catch-all правилом, ~1600 PIDs):
+#   CPU:  ~15% одного ядра (~0.15 core). Деградация начинается при < 0.25 core.
+#   RAM:  ~365 МБ (256 МБ ring buffer + BPF maps + hash tables).
+#         Минимум 512 МБ. OOM при < 256 МБ.
+#   Disk: 0 (все данные в RAM, disk I/O отсутствует).
 
 [Unit]
 Description=Process Metrics Collector (eBPF)
-Documentation=file:/app/process_metrics/process_metrics.conf
+Documentation=file:/etc/process_metrics/process_metrics.conf
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -44,8 +50,8 @@ StartLimitBurst=5
 Type=simple
 
 # --- Непривилегированный пользователь ---
-User=nginx
-Group=nginx
+User=process_metrics
+Group=process_metrics
 
 # --- Capabilities (точечные, без CAP_SYS_ADMIN) ---
 AmbientCapabilities=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
@@ -72,7 +78,7 @@ ExecStartPre=+/bin/sh -c '\
   chmod 0755 /sys/kernel/debug/tracing 2>/dev/null || true'
 
 # --- Запуск ---
-ExecStart=/app/process_metrics/process_metrics -c /app/process_metrics/process_metrics.conf
+ExecStart=/usr/local/bin/process_metrics -c /etc/process_metrics/process_metrics.conf
 
 # --- Перезагрузка конфига по SIGHUP ---
 ExecReload=/bin/kill -HUP $MAINPID
@@ -83,9 +89,12 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-# BPF maps + event buffer + working set ≈ 100-120 MB with all collectors enabled.
-MemoryMax=200M
-CPUQuota=15%
+# Ring buffer 256 МБ + BPF maps + рабочий набор ≈ 365 МБ.
+# 512 МБ — минимум. При < 256 МБ — OOM kill.
+MemoryMax=512M
+# ~15% одного ядра в production. 50% — безопасный запас (3×).
+# Деградация (drops) начинается при < 10%.
+CPUQuota=50%
 
 # --- Hardening ---
 ProtectSystem=strict
@@ -105,13 +114,10 @@ SystemCallArchitectures=native
 PrivateNetwork=no
 PrivateDevices=yes
 
-# Доступ к файловой системе
+# Доступ к файловой системе (только чтение — disk I/O отсутствует)
 ReadOnlyPaths=/proc /sys/fs/cgroup /sys/kernel/btf
-ReadWritePaths=/app/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
-# libbpf ищет tracepoint ID в tracefs. На новых ядрах — /sys/kernel/tracing,
-# на старых — /sys/kernel/debug/tracing через debugfs.
 ReadOnlyPaths=/sys/fs/bpf
 ReadOnlyPaths=-/sys/kernel/debug
 ReadOnlyPaths=-/sys/kernel/debug/tracing

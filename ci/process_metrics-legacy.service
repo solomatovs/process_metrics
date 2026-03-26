@@ -10,8 +10,7 @@
 #   - Убраны ProtectClock (>= 245), ProtectKernelLogs (>= 244),
 #     ProtectHostname (>= 242) — не поддерживаются в systemd 241
 #   - Убран MemoryDenyWriteExecute — конфликтует с JIT-компиляцией BPF
-#     на ядрах, где CAP_SYS_ADMIN нужен для BPF (ядро выполняет JIT в контексте
-#     процесса, W^X-политика блокирует это)
+#     на ядрах, где CAP_SYS_ADMIN нужен для BPF
 #
 # Установка:
 #   sudo useradd -r -s /usr/sbin/nologin process_metrics
@@ -25,16 +24,10 @@
 #   sudo sysctl --system
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now process_metrics
-#
-# Capabilities:
-#   CAP_SYS_ADMIN      — заменяет CAP_BPF + CAP_PERFMON (для ядер/systemd без их поддержки)
-#   CAP_SYS_PTRACE     — чтение /proc/PID/* процессов других пользователей
-#   CAP_KILL           — kill(pid, 0) для проверки liveness чужих процессов
-#   CAP_DAC_READ_SEARCH — чтение /sys/fs/cgroup/*, /proc/*/cgroup, tracefs
 
 [Unit]
 Description=Process Metrics Collector
-Documentation=file:/app/process_metrics/process_metrics.conf
+Documentation=file:/etc/process_metrics/process_metrics.conf
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -43,26 +36,16 @@ StartLimitBurst=5
 Type=simple
 
 # --- Непривилегированный пользователь ---
-User=nginx
-Group=nginx
+User=process_metrics
+Group=process_metrics
 
 # --- Capabilities ---
-# CAP_SYS_ADMIN — необходим для bpf() и perf_event_open() на ядрах, где
-# CAP_BPF/CAP_PERFMON либо не поддерживаются ядром (< 5.8), либо не распознаются
-# данной версией systemd (< 246).
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
 
 NoNewPrivileges=yes
 
 # --- Подготовка (от root: префикс «+») ---
-# tracefs может быть не смонтирован (Astra Linux, hardened-ядра).
-# libbpf читает из него perf event ID для tracepoints.
-# Пробуем оба пути: новый /sys/kernel/tracing и legacy /sys/kernel/debug/tracing.
-# На Astra Linux CE 2.12 tracefs обычно доступен через /sys/kernel/debug/tracing.
-# Монтируем tracefs/debugfs с mode=755 чтобы непривилегированный пользователь
-# мог читать tracepoint ID (libbpf требует доступ к events/*/id).
-# mount -o remount,mode=755 меняет права корневой директории и всех файлов tracefs.
 ExecStartPre=+/bin/sh -c '\
   if mountpoint -q /sys/kernel/tracing 2>/dev/null; then \
     mount -o remount,mode=755 /sys/kernel/tracing 2>/dev/null || true; \
@@ -80,7 +63,7 @@ ExecStartPre=+/bin/sh -c '\
   fi'
 
 # --- Запуск ---
-ExecStart=/app/process_metrics/process_metrics -c /app/process_metrics/process_metrics.conf
+ExecStart=/usr/local/bin/process_metrics -c /etc/process_metrics/process_metrics.conf
 
 # --- Перезагрузка конфига по SIGHUP ---
 ExecReload=/bin/kill -HUP $MAINPID
@@ -91,15 +74,11 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-# BPF maps + event buffer + working set ≈ 100-120 MB with all collectors enabled.
-# MemoryLimit — cgroup v1 аналог MemoryMax (для систем без cgroup v2).
-# Если система на cgroup v2, используйте MemoryMax=200M вместо MemoryLimit.
-MemoryLimit=200M
-CPUQuota=15%
+# MemoryLimit — cgroup v1 аналог MemoryMax.
+MemoryLimit=512M
+CPUQuota=50%
 
 # --- Hardening ---
-# Совместимо с systemd >= 231 (Debian 9+).
-# ProtectClock, ProtectKernelLogs, ProtectHostname убраны — требуют systemd >= 242-245.
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
@@ -113,20 +92,17 @@ SystemCallArchitectures=native
 PrivateNetwork=no
 PrivateDevices=yes
 
-# Доступ к файловой системе
+# Доступ к файловой системе (только чтение — disk I/O отсутствует)
 ReadOnlyPaths=/proc /sys/fs/cgroup
 ReadOnlyPaths=-/sys/kernel/btf
-ReadWritePaths=/app/process_metrics
 
 # BPF требует доступ к /sys/fs/bpf и debugfs/tracefs
-# libbpf ищет tracepoint ID в tracefs. На новых ядрах — /sys/kernel/tracing,
-# на старых (Astra Linux, Debian с ядром < 4.17) — /sys/kernel/debug/tracing.
 ReadOnlyPaths=-/sys/fs/bpf
 ReadOnlyPaths=-/sys/kernel/debug
 ReadOnlyPaths=-/sys/kernel/debug/tracing
 ReadOnlyPaths=-/sys/kernel/tracing
 
-# Syscall фильтр: разрешаем bpf() и perf_event_open()
+# Syscall фильтр
 SystemCallFilter=@system-service
 SystemCallFilter=bpf perf_event_open
 

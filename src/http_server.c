@@ -469,17 +469,24 @@ static void handle_request(int client_fd,
 	}
 
 	if (!parse_format_csv(buf)) {
-		fprintf(stderr, "[WARN] http: unsupported format from %s\n",
-			peer_ip);
-		const char *msg = "Unsupported format (use format=csv)\n";
-		send_response(client_fd, 400, "text/plain",
-			      msg, (int)strlen(msg));
-		return;
+		const char *fmt = strstr(buf, "format=");
+		char fmt_val[32] = "?";
+		if (fmt) {
+			int i = 0;
+			fmt += 7;
+			while (*fmt && *fmt != '&' && *fmt != ' ' &&
+			       *fmt != '\r' && i < 31)
+				fmt_val[i++] = *fmt++;
+			fmt_val[i] = '\0';
+		}
+		fprintf(stderr,
+			"[WARN] http: unknown format=%s from %s, serving csv\n",
+			fmt_val, peer_ip);
 	}
 
 	int do_clear = parse_clear(buf);
-	fprintf(stderr, "[INFO] http: GET /metrics?format=csv%s from %s\n",
-		do_clear ? "&clear=1" : "", peer_ip);
+	fprintf(stderr, "[INFO] http: GET /metrics%s from %s\n",
+		do_clear ? "?clear=1" : "", peer_ip);
 	handle_csv_stream(client_fd, do_clear);
 }
 
