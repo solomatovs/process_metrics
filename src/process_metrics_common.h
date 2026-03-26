@@ -56,6 +56,20 @@
 #define RINGBUF_NET_SIZE   _RINGBUF_POW2(RINGBUF_NET_EVENTS  * _RINGBUF_NET_SLOT)
 
 /*
+ * Счётчики потерь событий в ring buffer'ах.
+ * Инкрементируются в BPF при неудачном bpf_ringbuf_reserve (буфер переполнен).
+ * Читаются из userspace для диагностики.
+ */
+struct ringbuf_stats {
+	__u64 drop_proc;       /* потери в events_proc */
+	__u64 drop_file;       /* потери в events_file */
+	__u64 drop_net;        /* потери в events_net */
+	__u64 total_proc;      /* всего событий proc */
+	__u64 total_file;      /* всего событий file */
+	__u64 total_net;       /* всего событий net */
+};
+
+/*
  * Rate limiting state for exec events.
  * Single-element array map, tracks events per 1-second window.
  */

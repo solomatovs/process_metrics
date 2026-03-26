@@ -87,6 +87,31 @@ struct {
 	__uint(max_entries, RINGBUF_NET_SIZE);
 } events_net SEC(".maps");
 
+/* Статистика ring buffer'ов: потери и общее количество событий */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct ringbuf_stats);
+} ringbuf_stats SEC(".maps");
+
+/* Инкремент счётчика в ringbuf_stats.
+ * field — смещение поля в структуре (offsetof). */
+static __always_inline void rb_stat_inc(__u64 offset)
+{
+	__u32 key = 0;
+	struct ringbuf_stats *s = bpf_map_lookup_elem(&ringbuf_stats, &key);
+	if (s)
+		__sync_fetch_and_add((__u64 *)((char *)s + offset), 1);
+}
+
+#define RB_STAT_TOTAL_PROC()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
+#define RB_STAT_TOTAL_FILE()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
+#define RB_STAT_TOTAL_NET()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_net))
+#define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
+#define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
+#define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -477,24 +502,43 @@ int handle_exec(void *ctx)
 	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
 	/* Отправляем событие EXEC — всегда, для сопоставления правил в пространстве пользователя */
+	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		RB_STAT_DROP_PROC();
 		return 0;
+	}
 
+	/* Обнуляем структуру события (требование BPF-верификатора) */
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_EXEC;
 	e->tgid         = tgid;
 	e->ppid         = ppid;
+	/* UID текущего процесса (младшие 32 бита uid_gid) */
 	e->uid          = (__u32)bpf_get_current_uid_gid();
+	/* Время с момента загрузки системы, включая suspend (нс) */
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	/* ID cgroup v2, в которой работает процесс */
 	e->cgroup_id    = bpf_get_current_cgroup_id();
+	/* Время старта процесса из task_struct (CO-RE) */
 	e->start_ns     = BPF_CORE_READ(task, start_time);
+	/* Имя процесса (comm, до 16 байт) */
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	/* Полная командная строка из mm->arg_start..arg_end (читается из RAM
+	 * процесса через bpf_probe_read_user, без обращения к диску/VFS) */
 	e->cmdline_len  = read_cmdline(task, e->cmdline);
+	/* loginuid, sessionid (audit) и effective UID */
 	read_identity(task, &e->loginuid, &e->sessionid, &e->euid);
+	/* Политика планировщика (SCHED_NORMAL, SCHED_FIFO и т.д.) */
 	e->sched_policy = BPF_CORE_READ(task, policy);
-	read_ns_inums(task, &e->mnt_ns_inum, &e->pid_ns_inum,
-		      &e->net_ns_inum, &e->cgroup_ns_inum);
+	/* Номера inode namespace'ов: mnt, pid, net, cgroup */
+	read_ns_inums(
+		task,
+		&e->mnt_ns_inum,
+		&e->pid_ns_inum,
+		&e->net_ns_inum,
+		&e->cgroup_ns_inum
+	);
 
 	bpf_ringbuf_submit(e, 0);
 
@@ -576,9 +620,12 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	}
 	bpf_map_update_elem(&proc_map, &child_tgid, child_pi, BPF_NOEXIST);
 
+	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		RB_STAT_DROP_PROC();
 		return 0;
+	}
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_FORK;
@@ -693,9 +740,12 @@ int handle_exit(void *ctx)
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
 	/* Отправляем событие EXIT с финальными метриками */
+	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		RB_STAT_DROP_PROC();
 		goto cleanup;
+	}
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_EXIT;
@@ -777,9 +827,12 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 		info->oom_killed = 1;
 
 	/* Отправляем событие OOM_KILL в пространство пользователя */
+	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e)
+	if (!e) {
+		RB_STAT_DROP_PROC();
 		return 0;
+	}
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_OOM_KILL;
@@ -852,9 +905,12 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
 		return 0;
 
+	RB_STAT_TOTAL_NET();
 	struct signal_event *se = bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
-	if (!se)
+	if (!se) {
+		RB_STAT_DROP_NET();
 		return 0;
+	}
 
 	__builtin_memset(se, 0, sizeof(*se));
 	se->type         = EVENT_SIGNAL;
@@ -1098,6 +1154,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	/* Отправляем событие закрытия файла через кольцевой буфер */
+	RB_STAT_TOTAL_FILE();
 	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
 	if (fe) {
 		__builtin_memset(fe, 0, sizeof(*fe));
@@ -1120,6 +1177,8 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->uid  = (__u32)bpf_get_current_uid_gid();
 
 		bpf_ringbuf_submit(fe, 0);
+	} else {
+		RB_STAT_DROP_FILE();
 	}
 
 	bpf_map_delete_elem(&fd_map, &fk);
@@ -1311,9 +1370,12 @@ static __always_inline void read_sock_addrs(struct sock *sk,
 static __always_inline void emit_net_close(struct sock_info *si,
 					   __u64 now_ns)
 {
+	RB_STAT_TOTAL_NET();
 	struct net_event *ne = bpf_ringbuf_reserve(&events_net, sizeof(*ne), 0);
-	if (!ne)
+	if (!ne) {
+		RB_STAT_DROP_NET();
 		return;
+	}
 
 	__builtin_memset(ne, 0, sizeof(*ne));
 	ne->type         = EVENT_NET_CLOSE;
@@ -1660,10 +1722,13 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = const struct sock *sk, args[1] = const struct sk_buff *skb */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
+	RB_STAT_TOTAL_NET();
 	struct retransmit_event *re =
 		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
-	if (!re)
+	if (!re) {
+		RB_STAT_DROP_NET();
 		return 0;
+	}
 
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_TCP_RETRANSMIT;
@@ -1698,10 +1763,13 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	if (!sec_enabled(SEC_SYN_TRACKING))
 		return 0;
 
+	RB_STAT_TOTAL_NET();
 	struct syn_event *se =
 		bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
-	if (!se)
+	if (!se) {
+		RB_STAT_DROP_NET();
 		return 0;
+	}
 
 	__builtin_memset(se, 0, sizeof(*se));
 	se->type = EVENT_SYN_RECV;
@@ -1765,10 +1833,13 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	if (!sk)
 		return 0;
 
+	RB_STAT_TOTAL_NET();
 	struct rst_event *re =
 		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
-	if (!re)
+	if (!re) {
+		RB_STAT_DROP_NET();
 		return 0;
+	}
 
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_RST;
@@ -1801,10 +1872,13 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = struct sock *sk */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
+	RB_STAT_TOTAL_NET();
 	struct rst_event *re =
 		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
-	if (!re)
+	if (!re) {
+		RB_STAT_DROP_NET();
 		return 0;
+	}
 
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_RST;

@@ -2930,6 +2930,32 @@ static void write_snapshot(void)
 	}
 
 	/* snap_count events were streamed directly via ef_append above */
+
+	/* Логируем статистику ring buffer'ов */
+	{
+		__u32 key = 0;
+		struct ringbuf_stats rs = {0};
+		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
+		if (stats_fd >= 0 &&
+		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
+			if (rs.drop_proc || rs.drop_file || rs.drop_net) {
+				log_ts("WARN",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu",
+				       (unsigned long long)rs.drop_proc,
+				       (unsigned long long)rs.total_proc,
+				       (unsigned long long)rs.drop_file,
+				       (unsigned long long)rs.total_file,
+				       (unsigned long long)rs.drop_net,
+				       (unsigned long long)rs.total_net);
+			} else if (cfg_log_level >= 2) {
+				log_ts("DEBUG",
+				       "ringbuf totals: proc=%llu file=%llu net=%llu",
+				       (unsigned long long)rs.total_proc,
+				       (unsigned long long)rs.total_file,
+				       (unsigned long long)rs.total_net);
+			}
+		}
+	}
 }
 
 /* ── signals ──────────────────────────────────────────────────────── */
