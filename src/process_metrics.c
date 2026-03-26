@@ -79,8 +79,7 @@ static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=d
 
 /* HTTP server config */
 static struct http_config g_http_cfg;
-static char cfg_data_file[PATH_MAX_LEN]    = "";
-static long long cfg_max_data_file_size    = 1LL * 1024 * 1024 * 1024; /* 1 GB */
+static long long cfg_max_data_size          = 256LL * 1024 * 1024; /* 256 MB ring buffer */
 
 /* Network tracking config */
 static int cfg_net_tracking_enabled         = 0;
@@ -820,12 +819,9 @@ static int load_config(const char *path)
 		if (config_setting_lookup_string(hs, "bind", &str_val))
 			snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind),
 				 "%s", str_val);
-		if (config_setting_lookup_string(hs, "data_file", &str_val))
-			snprintf(cfg_data_file, sizeof(cfg_data_file),
-				 "%s", str_val);
 		long long ll_val;
-		if (config_setting_lookup_int64(hs, "max_data_file_size", &ll_val))
-			cfg_max_data_file_size = ll_val;
+		if (config_setting_lookup_int64(hs, "max_buffer_size", &ll_val))
+			cfg_max_data_size = ll_val;
 	}
 
 	/* net_tracking settings */
@@ -962,13 +958,6 @@ static int load_config(const char *path)
 						 DISK_PREFIX_MAX, "%s", s);
 			}
 		}
-	}
-
-	/* Default paths when http_server is enabled */
-	if (g_http_cfg.enabled) {
-		if (!cfg_data_file[0])
-			snprintf(cfg_data_file, sizeof(cfg_data_file),
-				 "/tmp/process_metrics_events.dat");
 	}
 
 	config_destroy(&cfg);
@@ -2365,8 +2354,8 @@ static void write_snapshot(void)
 	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
 				+ (__u64)snap_ts.tv_nsec;
 
-	/* Lock batch to prevent ef_swap_fd/ef_snapshot_fd from
-	 * splitting this snapshot across two deliveries */
+	/* Lock batch to prevent ef_read_begin() from seeing
+	 * a partial snapshot across two deliveries */
 	ef_batch_lock();
 
 	/* Collect all keys first to avoid iterator invalidation
@@ -2864,11 +2853,10 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Initialize event file if HTTP server is enabled */
+	/* Initialize in-memory event ring buffer */
 	if (g_http_cfg.enabled) {
-		if (ef_init(cfg_data_file, (__u64)cfg_max_data_file_size) < 0) {
-			fprintf(stderr, "FATAL: event file init failed: %s\n",
-				cfg_data_file);
+		if (ef_init((__u64)cfg_max_data_size) < 0) {
+			fprintf(stderr, "FATAL: event ring buffer init failed\n");
 			return 1;
 		}
 	}
@@ -3054,7 +3042,7 @@ int main(int argc, char *argv[])
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net_tracking=%s%s, file_tracking=%s%s, "
 	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s], "
-	       "disk_tracking=%s, max_data_file_size=%lld",
+	       "disk_tracking=%s, ring_buffer_size=%lld",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
@@ -3071,7 +3059,7 @@ int main(int argc, char *argv[])
 	       cfg_sec_icmp_tracking ? "on" : "off",
 	       cfg_sec_open_conn_count ? "on" : "off",
 	       cfg_disk_tracking_enabled ? "on" : "off",
-	       (long long)cfg_max_data_file_size);
+	       (long long)cfg_max_data_size);
 
 	/* ── Потоки poll: по одному на каждый ring buffer ────────────────
 	 *

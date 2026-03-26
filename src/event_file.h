@@ -1,15 +1,12 @@
 /*
- * event_file.h — thread-safe file-based event buffer
+ * event_file.h — in-memory ring buffer for metric events
  *
- * Accumulates metric_event records in a binary file. On request (ef_swap),
- * atomically renames the file and returns all accumulated events.
- * New events go into a fresh file while the caller processes the old data.
+ * Accumulates metric_event records in a fixed-size ring buffer in memory.
+ * Old records are overwritten when the buffer is full (ring semantics).
  *
- * Two-phase delivery:
- *   ef_swap()   — swap file, return accumulated data (kept as .pending)
- *   ef_commit() — confirm delivery, delete .pending
- *   If ef_commit() is never called, next ef_swap() picks up .pending
- *   and combines it with newly accumulated events.
+ * Two access modes via HTTP:
+ *   GET /metrics              — snapshot: iterate all records (read-only)
+ *   GET /metrics?clear=1      — consume: iterate all records, then clear
  */
 
 #ifndef EVENT_FILE_H
@@ -146,76 +143,63 @@ struct ef_record {
 /* ── public API ──────────────────────────────────────────────────── */
 
 /*
- * Initialize event file at the given path.
- * Creates the file if it doesn't exist.
- * max_size_bytes: maximum file size in bytes (0 = unlimited).
- * When exceeded, the file is truncated and a warning is logged.
+ * Initialize in-memory ring buffer.
+ * max_size_bytes: total memory budget (divided by sizeof(ef_record)
+ * to get capacity). 0 = default (256 MB).
  * Returns 0 on success, -1 on error.
  */
-int ef_init(const char *path, __u64 max_size_bytes);
+int ef_init(__u64 max_size_bytes);
 
 /*
- * Append one event to the file (thread-safe).
+ * Append one event to the ring buffer (thread-safe, lock-free for readers).
+ * If the buffer is full, the oldest record is overwritten.
  */
 void ef_append(const struct metric_event *ev, const char *hostname);
 
 /*
- * Atomically swap the event file and return accumulated events.
+ * Iteration API for reading records from the ring buffer.
  *
- * If a previous ef_swap() was not committed (delivery failed),
- * its data is combined with newly accumulated events.
+ * ef_read_begin() takes a consistent snapshot of head/tail,
+ * returns an opaque iterator and the number of records available.
  *
- * On success, *out points to a malloc'd array of ef_record,
- * *count is the number of records. Caller must free(*out).
- * Caller MUST call ef_commit() after successful delivery.
- * Returns 0 on success, -1 on error.
+ * ef_read_next() returns the next record or NULL when exhausted.
+ *
+ * ef_read_end() releases the snapshot. If clear=1, all records
+ * up to the snapshot point are discarded.
+ *
+ * Usage:
+ *   struct ef_iter iter;
+ *   int n = ef_read_begin(&iter);
+ *   for (int i = 0; i < n; i++) {
+ *       const struct ef_record *r = ef_read_next(&iter);
+ *       // ... format and send r ...
+ *   }
+ *   ef_read_end(&iter, clear);
  */
-int ef_swap(struct ef_record **out, int *count);
+
+struct ef_iter {
+	__u32 pos;       /* current read position in ring */
+	__u32 end;       /* end position (exclusive) */
+	__u32 capacity;  /* ring capacity */
+	int   count;     /* total records to read */
+	int   read;      /* records already read */
+};
+
+int ef_read_begin(struct ef_iter *it);
+const struct ef_record *ef_read_next(struct ef_iter *it);
+void ef_read_end(struct ef_iter *it, int clear);
 
 /*
- * Atomically swap the event file and return an open fd for streaming.
- *
- * Same swap logic as ef_swap(), but instead of reading all records
- * into memory, returns an fd to the .pending file for record-by-record
- * reading. Each read of sizeof(struct ef_record) bytes yields one record.
- *
- * Returns open fd (>= 0) on success, -1 if no data.
- * Caller reads records, then calls ef_commit() on success or
- * close(fd) on failure (.pending preserved for next swap).
- */
-int ef_swap_fd(void);
-
-/*
- * Return an open fd for reading the current event file WITHOUT clearing it.
- *
- * Makes a hard-link snapshot of the current file, opens it for reading,
- * then unlinks the snapshot (fd remains valid on Linux).
- * The original event file is NOT modified — new events keep appending.
- *
- * Returns open fd (>= 0) on success, -1 if no data.
- * Caller must close(fd) when done.
- */
-int ef_snapshot_fd(void);
-
-/*
- * Confirm successful delivery — delete the .pending file.
- * Call this only after the data from ef_swap() has been fully sent.
- */
-void ef_commit(void);
-
-/*
- * Batch lock: prevents ef_swap_fd()/ef_snapshot_fd() from splitting
- * a batch of ef_append() calls across two deliveries.
+ * Batch lock: prevents ef_read_begin() from seeing a partial batch.
  *
  * Usage: call ef_batch_lock() before a series of ef_append() calls
  * (e.g. the snapshot loop) and ef_batch_unlock() after.
- * ef_swap_fd()/ef_snapshot_fd() will block until the batch completes.
  */
 void ef_batch_lock(void);
 void ef_batch_unlock(void);
 
 /*
- * Clean up: close file, destroy mutex.
+ * Clean up: free the ring buffer.
  */
 void ef_cleanup(void);
 

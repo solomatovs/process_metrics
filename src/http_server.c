@@ -319,98 +319,44 @@ static int send_all(int fd, const char *buf, int len)
 }
 
 /*
- * Stream records from data_fd as CSV to client_fd.
- * Returns 1 if all records sent successfully, 0 on send error.
+ * Stream records from ring buffer as CSV to client_fd.
+ * If clear=1, consumed records are discarded after successful delivery.
  */
-static int stream_csv_records(int client_fd, int data_fd)
+static void handle_csv_stream(int client_fd, int clear)
 {
-	struct ef_record rec;
+	struct ef_iter iter;
+	int n = ef_read_begin(&iter);
+
+	/* Send HTTP header (no Content-Length — stream until close) */
+	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
+		ef_read_end(&iter, 0);
+		return;
+	}
+
+	/* Send CSV column header */
+	if (send_all(client_fd, CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
+		ef_read_end(&iter, 0);
+		return;
+	}
+
+	int ok = 1;
 	char row_buf[8192];
+	for (int i = 0; i < n; i++) {
+		const struct ef_record *rec = ef_read_next(&iter);
+		if (!rec)
+			break;
 
-	while (1) {
-		ssize_t r = read(data_fd, &rec, sizeof(rec));
-		if (r == 0)
-			break;  /* EOF */
-		if (r != (ssize_t)sizeof(rec))
-			break;  /* partial record */
-
-		int n = format_csv_row(row_buf, sizeof(row_buf), &rec);
-		if (n <= 0)
+		int len = format_csv_row(row_buf, sizeof(row_buf), rec);
+		if (len <= 0)
 			continue;
 
-		if (send_all(client_fd, row_buf, n) < 0)
-			return 0;
-	}
-	return 1;
-}
-
-/*
- * Stream CSV response WITH clearing (for ClickHouse: ?format=csv&clear=1).
- * Swaps the event file, streams records, then commits (deletes .pending).
- * If delivery fails, .pending is preserved for the next request.
- */
-static void handle_csv_clear(int client_fd)
-{
-	int data_fd = ef_swap_fd();
-
-	if (data_fd < 0) {
-		/* No events — return header only */
-		send_response(client_fd, 200, "text/csv; charset=utf-8",
-			      CSV_HEADER, (int)strlen(CSV_HEADER));
-		ef_commit();
-		return;
+		if (send_all(client_fd, row_buf, len) < 0) {
+			ok = 0;
+			break;
+		}
 	}
 
-	/* Send HTTP header (no Content-Length — stream until close) */
-	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
-		close(data_fd);
-		return; /* .pending preserved */
-	}
-
-	/* Send CSV column header */
-	if (send_all(client_fd, CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
-		close(data_fd);
-		return;
-	}
-
-	int ok = stream_csv_records(client_fd, data_fd);
-	close(data_fd);
-
-	if (ok)
-		ef_commit();
-	/* else: .pending preserved for next request */
-}
-
-/*
- * Stream CSV response WITHOUT clearing (read-only: ?format=csv).
- * Takes a snapshot of the event file and streams it.
- * The original data is NOT modified.
- */
-static void handle_csv_readonly(int client_fd)
-{
-	int data_fd = ef_snapshot_fd();
-
-	if (data_fd < 0) {
-		/* No events — return header only */
-		send_response(client_fd, 200, "text/csv; charset=utf-8",
-			      CSV_HEADER, (int)strlen(CSV_HEADER));
-		return;
-	}
-
-	/* Send HTTP header (no Content-Length — stream until close) */
-	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
-		close(data_fd);
-		return;
-	}
-
-	/* Send CSV column header */
-	if (send_all(client_fd, CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
-		close(data_fd);
-		return;
-	}
-
-	stream_csv_records(client_fd, data_fd);
-	close(data_fd);
+	ef_read_end(&iter, clear && ok);
 }
 
 /* ── HTTP response ───────────────────────────────────────────────── */
@@ -471,17 +417,9 @@ static void handle_request(int client_fd,
 	}
 
 	int do_clear = parse_clear(buf);
-	if (do_clear) {
-		/* CSV + clear: swap + stream + commit (for ClickHouse) */
-		fprintf(stderr, "[INFO] http: GET /metrics?format=csv&clear=1 "
-			"from %s\n", peer_ip);
-		handle_csv_clear(client_fd);
-	} else {
-		/* CSV read-only: snapshot without clearing */
-		fprintf(stderr, "[INFO] http: GET /metrics?format=csv "
-			"from %s (read-only)\n", peer_ip);
-		handle_csv_readonly(client_fd);
-	}
+	fprintf(stderr, "[INFO] http: GET /metrics?format=csv%s from %s\n",
+		do_clear ? "&clear=1" : "", peer_ip);
+	handle_csv_stream(client_fd, do_clear);
 }
 
 /* ── server thread ───────────────────────────────────────────────── */
