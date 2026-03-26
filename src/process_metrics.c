@@ -291,19 +291,65 @@ static const char *tags_lookup(__u32 tgid)
 	return "";
 }
 
+/*
+ * Backward-shift deletion для open addressing с linear probing.
+ *
+ * Простое обнуление слота разрывает цепочки проб: lookup/store
+ * останавливаются на «дырке», не находя элементов за ней.
+ * Со временем при fork/exit таблица деградирует — цепочки удлиняются,
+ * lookup сканирует тысячи слотов.
+ *
+ * Алгоритм: после удаления, сдвигаем элементы из последующих
+ * слотов назад, пока не встретим пустой слот или элемент,
+ * который уже на своём естественном месте.
+ */
 static void tags_remove(__u32 tgid)
 {
 	__u32 idx = tags_hash(tgid);
-	for (int i = 0; i < TAGS_HT_SIZE; i++) {
-		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[slot] == tgid) {
-			tags_tgid[slot] = 0;
-			tags_data[slot][0] = '\0';
-			return;
-		}
+	__u32 slot;
+	int i;
+
+	/* Найти элемент */
+	for (i = 0; i < TAGS_HT_SIZE; i++) {
+		slot = (idx + i) & (TAGS_HT_SIZE - 1);
+		if (tags_tgid[slot] == tgid)
+			goto found;
 		if (tags_tgid[slot] == 0)
-			return;
+			return; /* не найден */
 	}
+	return;
+
+found:
+	/* Backward-shift: заполняем дырку сдвигом последующих элементов */
+	for (;;) {
+		__u32 next = (slot + 1) & (TAGS_HT_SIZE - 1);
+		if (tags_tgid[next] == 0)
+			break; /* цепочка закончилась */
+
+		/* Естественная позиция следующего элемента */
+		__u32 natural = tags_hash(tags_tgid[next]);
+
+		/* Нужно ли сдвигать next в slot?
+		 * Да, если natural позиция next находится до или на slot
+		 * (с учётом кольцевой арифметики).
+		 * Т.е. slot лежит между natural и next (включительно). */
+		__u32 d_natural_to_next = (next - natural) & (TAGS_HT_SIZE - 1);
+		__u32 d_natural_to_slot = (slot - natural) & (TAGS_HT_SIZE - 1);
+
+		if (d_natural_to_slot < d_natural_to_next) {
+			/* Сдвигаем next → slot */
+			tags_tgid[slot] = tags_tgid[next];
+			memcpy(tags_data[slot], tags_data[next], TAGS_MAX_LEN);
+			slot = next;
+		} else {
+			/* next уже на правильной стороне, дырку оставляем */
+			break;
+		}
+	}
+
+	/* Очищаем финальный пустой слот */
+	tags_tgid[slot] = 0;
+	tags_data[slot][0] = '\0';
 }
 
 /*

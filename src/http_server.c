@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -319,7 +320,44 @@ static int send_all(int fd, const char *buf, int len)
 }
 
 /*
+ * Flush send buffer to socket. Returns 0 on success, -1 on error.
+ */
+static int flush_sendbuf(int fd, char *buf, int *used)
+{
+	if (*used <= 0)
+		return 0;
+	int rc = send_all(fd, buf, *used);
+	*used = 0;
+	return rc;
+}
+
+/*
+ * Append data to send buffer, flushing when full.
+ * Returns 0 on success, -1 on send error.
+ */
+static int buf_append(int fd, char *buf, int bufsize, int *used,
+		      const char *data, int len)
+{
+	while (len > 0) {
+		int avail = bufsize - *used;
+		int chunk = len < avail ? len : avail;
+		memcpy(buf + *used, data, chunk);
+		*used += chunk;
+		data += chunk;
+		len -= chunk;
+		if (*used >= bufsize) {
+			if (flush_sendbuf(fd, buf, used) < 0)
+				return -1;
+		}
+	}
+	return 0;
+}
+
+#define SEND_BUF_SIZE (128 * 1024)
+
+/*
  * Stream records from ring buffer as CSV to client_fd.
+ * Uses TCP_CORK + 128 KB userspace buffer to minimize syscalls.
  * If clear=1, consumed records are discarded after successful delivery.
  */
 static void handle_csv_stream(int client_fd, int clear)
@@ -327,16 +365,29 @@ static void handle_csv_stream(int client_fd, int clear)
 	struct ef_iter iter;
 	int n = ef_read_begin(&iter);
 
+	/* TCP_CORK: hold small segments until uncorked or buffer full */
+	int cork = 1;
+	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+
 	/* Send HTTP header (no Content-Length — stream until close) */
 	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
 		ef_read_end(&iter, 0);
-		return;
+		goto uncork;
 	}
 
-	/* Send CSV column header */
-	if (send_all(client_fd, CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
+	char *sendbuf = malloc(SEND_BUF_SIZE);
+	if (!sendbuf) {
 		ef_read_end(&iter, 0);
-		return;
+		goto uncork;
+	}
+	int used = 0;
+
+	/* CSV column header */
+	if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
+		       CSV_HEADER, (int)strlen(CSV_HEADER)) < 0) {
+		ef_read_end(&iter, 0);
+		free(sendbuf);
+		goto uncork;
 	}
 
 	int ok = 1;
@@ -350,13 +401,23 @@ static void handle_csv_stream(int client_fd, int clear)
 		if (len <= 0)
 			continue;
 
-		if (send_all(client_fd, row_buf, len) < 0) {
+		if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
+			       row_buf, len) < 0) {
 			ok = 0;
 			break;
 		}
 	}
 
+	/* Flush remaining data */
+	if (ok && flush_sendbuf(client_fd, sendbuf, &used) < 0)
+		ok = 0;
+
 	ef_read_end(&iter, clear && ok);
+	free(sendbuf);
+
+uncork:
+	cork = 0;
+	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 }
 
 /* ── HTTP response ───────────────────────────────────────────────── */
