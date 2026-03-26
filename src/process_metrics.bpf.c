@@ -497,11 +497,37 @@ int handle_exec(void *ctx)
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
+	/* Если уже отслеживается (унаследовано через fork), обновляем
+	 * cmdline/comm в proc_map и НЕ отправляем event — userspace
+	 * всё равно вернул бы return 0 (already tracked).
+	 * Это экономит место в ring buffer при интенсивном fork+exec. */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info) {
+		bpf_get_current_comm(info->comm, sizeof(info->comm));
+		info->cgroup_id   = bpf_get_current_cgroup_id();
+		info->cmdline_len = read_cmdline(task, info->cmdline);
+		read_identity(
+			task,
+			&info->loginuid,
+			&info->sessionid,
+			&info->euid
+		);
+		info->sched_policy = BPF_CORE_READ(task, policy);
+		read_ns_inums(
+			task,
+			&info->mnt_ns_inum,
+			&info->pid_ns_inum,
+			&info->net_ns_inum,
+			&info->cgroup_ns_inum
+		);
+		return 0;
+	}
+
 	/* ppid */
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
-	/* Отправляем событие EXEC — всегда, для сопоставления правил в пространстве пользователя */
+	/* Новый процесс — отправляем event для сопоставления правил в userspace */
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e) {
@@ -541,21 +567,6 @@ int handle_exec(void *ctx)
 	);
 
 	bpf_ringbuf_submit(e, 0);
-
-	/* Если уже отслеживается (унаследовано через fork), обновляем cmdline/comm */
-	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (info) {
-		bpf_get_current_comm(info->comm, sizeof(info->comm));
-		info->cgroup_id   = bpf_get_current_cgroup_id();
-		info->cmdline_len = read_cmdline(task, info->cmdline);
-		read_identity(task, &info->loginuid, &info->sessionid,
-			      &info->euid);
-		/* tty_nr preserved from userspace */
-		info->sched_policy = BPF_CORE_READ(task, policy);
-		read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
-			      &info->net_ns_inum, &info->cgroup_ns_inum);
-	}
-
 	return 0;
 }
 
@@ -582,7 +593,10 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	/* Создаём tracked_map запись для потомка прямо в BPF,
-	 * чтобы handle_exec мог найти proc_info до обработки в userspace */
+	 * чтобы handle_exec мог найти proc_info до обработки в userspace.
+	 * Без этого возникает гонка: exec потомка может сработать раньше,
+	 * чем userspace прочитает fork-событие из ring buffer и добавит
+	 * запись в tracked_map — тогда exec будет пропущен. */
 	struct track_info child_ti;
 	BPF_ZERO(child_ti);
 	child_ti.root_pid = parent_ti->root_pid;

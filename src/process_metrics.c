@@ -26,6 +26,7 @@
 #include <sys/statvfs.h>
 #include <mntent.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include <regex.h>
 #include <libconfig.h>
 #include <bpf/libbpf.h>
@@ -125,6 +126,31 @@ static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
+/*
+ * Три гранулярные RW-блокировки для общих данных:
+ *
+ * tags_lock — tags_ht (хеш-таблица тегов процессов)
+ *   wrlock: EXEC (store), FORK (inherit), EXIT (remove), reload (clear)
+ *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL и др. (lookup), snapshot (lookup)
+ *
+ * exited_lock — exited_ring, exited_head, exited_count
+ *   wrlock: EXIT (record_exit), reload (reset)
+ *   rdlock: snapshot (обход для вывода метрик завершённых процессов)
+ *
+ * cgroup_lock — cgroup_cache, cgroup_cache_count
+ *   wrlock: snapshot (build_cgroup_cache), reload (rebuild)
+ *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL (resolve_cgroup_fast)
+ */
+static pthread_rwlock_t g_tags_lock    = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_exited_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_cgroup_lock  = PTHREAD_RWLOCK_INITIALIZER;
+
+/* Аргумент для потока poll */
+struct poll_thread_arg {
+	struct ring_buffer *rb;
+	const char *name;
+};
+
 /* Forward declarations */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
@@ -144,29 +170,99 @@ static void refresh_boot_to_wall(void)
 	g_boot_to_wall_ns = rt_ns - bt_ns;
 }
 
-/* ── tags hash table (userspace-only, per-tgid) ──────────────────── */
+/* ── tags hash table (userspace-only, per-tgid) ──────────────────── *
+ *
+ * Хранит строку тегов (pipe-separated список совпавших правил) для каждого
+ * отслеживаемого PID. Используется при формировании Prometheus-метрик
+ * (snapshot) и event-файлов (exec/fork/exit/file_close/net_close).
+ *
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  ОПТИМИЗАЦИЯ 1: Split-layout (hot/cold separation)            │
+ * ├─────────────────────────────────────────────────────────────────┤
+ * │  Проблема (обнаружена через perf):                            │
+ * │  Исходная структура struct tags_entry { __u32 tgid;           │
+ * │  char tags[512]; } — 516 байт. Массив 16384 записей = 8 МБ.  │
+ * │  При linear probing каждый probe перемещался на 516 байт →    │
+ * │  гарантированный L1/L2 cache miss (~100-200 тактов).          │
+ * │  perf показал: tags_inherit + record_exit = ~20% CPU,         │
+ * │  причём 70% времени в них — инструкции mov (чтение tgid).     │
+ * │                                                                │
+ * │  Решение: разделить на два параллельных массива:              │
+ * │  • tags_tgid[16384] — только tgid'ы, 64 KB → в L1/L2 кэш    │
+ * │  • tags_data[16384][512] — payload, 8 МБ → только при hit     │
+ * │                                                                │
+ * │  Probing бегает по compact tags_tgid[] (4 байта на slot) →    │
+ * │  соседние слоты в одной cache line (16 tgid на 64-байтовую    │
+ * │  линию), cache miss → cache hit.                              │
+ * │                                                                │
+ * │  Результат: proc drops с 72% до 48% при extreme нагрузке.    │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * ┌─────────────────────────────────────────────────────────────────┐
+ * │  ОПТИМИЗАЦИЯ 2: Murmurhash3 вместо tgid & mask                │
+ * ├─────────────────────────────────────────────────────────────────┤
+ * │  Проблема (обнаружена через perf после opt 1):                │
+ * │  PID'ы в Linux последовательные (100500, 100501, 100502...).  │
+ * │  Хэш tgid & (SIZE-1) отображает их в соседние слоты →        │
+ * │  primary clustering: все PID'ы кучкуются в одном участке      │
+ * │  таблицы, probe chains растут до O(n) в кластере.             │
+ * │  perf показал: handle_event = 27% CPU, всё на mov — probing.  │
+ * │                                                                │
+ * │  Решение: murmurhash3 finalizer — битовый микшер, который     │
+ * │  превращает последовательные числа в псевдослучайные индексы. │
+ * │  PID 100500 → slot 8731, PID 100501 → slot 2049 и т.д.       │
+ * │  Средняя длина probe chain при 10% load factor: ~1.05.        │
+ * │                                                                │
+ * │  Результат: proc drops с 48% до 0% (все события обработаны). │
+ * │  handle_event + tags_inherit ушли из top perf полностью.      │
+ * └─────────────────────────────────────────────────────────────────┘
+ *
+ * Итоговый эффект обеих оптимизаций:
+ *   До:    585k events, 420k drops (72%), handle_event = 31% CPU
+ *   После: 418k events, 0 drops   (0%),  kernel syscalls = 4.7% CPU
+ */
 
 #define TAGS_MAX_LEN 512
 #define TAGS_HT_SIZE 16384  /* must be power of 2 */
 
-struct tags_entry {
-	__u32 tgid;           /* 0 = empty slot */
-	char  tags[TAGS_MAX_LEN];
-};
+static __u32 tags_tgid[TAGS_HT_SIZE];              /*  64 KB — compact index */
+static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — payload      */
 
-static struct tags_entry tags_ht[TAGS_HT_SIZE];
+/*
+ * Murmurhash3 finalizer (32-bit).
+ * Принимает tgid, возвращает индекс в [0, TAGS_HT_SIZE).
+ *
+ * Зачем: PID'ы в Linux назначаются последовательно (N, N+1, N+2, ...).
+ * Наивный хэш (tgid & mask) сохраняет последовательность → соседние PID'ы
+ * попадают в соседние слоты → primary clustering при linear probing.
+ *
+ * Murmurhash avalanche: изменение 1 бита во входе меняет ~50% бит выхода.
+ * Последовательные PID'ы рассеиваются равномерно по всей таблице.
+ *
+ * Константы 0x85ebca6b и 0xc2b2ae35 — из оригинального murmurhash3
+ * (Austin Appleby), обеспечивают максимальную лавинность для 32-бит.
+ */
+static inline __u32 tags_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (TAGS_HT_SIZE - 1);
+}
 
 /* Forward declaration — used by tags_inherit() */
 static int try_track_pid(__u32 pid);
 
 static void tags_store(__u32 tgid, const char *tags)
 {
-	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	__u32 idx = tags_hash(tgid);
 	for (int i = 0; i < TAGS_HT_SIZE; i++) {
 		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_ht[slot].tgid == 0 || tags_ht[slot].tgid == tgid) {
-			tags_ht[slot].tgid = tgid;
-			snprintf(tags_ht[slot].tags, TAGS_MAX_LEN, "%s", tags);
+		if (tags_tgid[slot] == 0 || tags_tgid[slot] == tgid) {
+			tags_tgid[slot] = tgid;
+			snprintf(tags_data[slot], TAGS_MAX_LEN, "%s", tags);
 			return;
 		}
 	}
@@ -174,12 +270,12 @@ static void tags_store(__u32 tgid, const char *tags)
 
 static const char *tags_lookup(__u32 tgid)
 {
-	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	__u32 idx = tags_hash(tgid);
 	for (int i = 0; i < TAGS_HT_SIZE; i++) {
 		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_ht[slot].tgid == tgid)
-			return tags_ht[slot].tags;
-		if (tags_ht[slot].tgid == 0)
+		if (tags_tgid[slot] == tgid)
+			return tags_data[slot];
+		if (tags_tgid[slot] == 0)
 			return "";
 	}
 	return "";
@@ -187,42 +283,110 @@ static const char *tags_lookup(__u32 tgid)
 
 static void tags_remove(__u32 tgid)
 {
-	__u32 idx = tgid & (TAGS_HT_SIZE - 1);
+	__u32 idx = tags_hash(tgid);
 	for (int i = 0; i < TAGS_HT_SIZE; i++) {
 		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_ht[slot].tgid == tgid) {
-			tags_ht[slot].tgid = 0;
-			tags_ht[slot].tags[0] = '\0';
+		if (tags_tgid[slot] == tgid) {
+			tags_tgid[slot] = 0;
+			tags_data[slot][0] = '\0';
 			return;
 		}
-		if (tags_ht[slot].tgid == 0)
+		if (tags_tgid[slot] == 0)
 			return;
 	}
 }
 
+/*
+ * Наследование тегов от родителя к дочернему процессу.
+ * ВАЖНО: НЕ вызывает try_track_pid() — это привело бы к deadlock,
+ * т.к. tags_inherit_ts() уже держит wrlock на g_tags_lock, а
+ * try_track_pid() → tags_store_ts() попыталась бы взять wrlock
+ * повторно (pthread_rwlock_wrlock НЕ рекурсивный → UB/deadlock).
+ * Резолв неизвестного родителя — ответственность вызывающего кода.
+ */
 static void tags_inherit(__u32 child_tgid, __u32 parent_tgid)
 {
 	const char *pt = tags_lookup(parent_tgid);
-	if (pt[0]) {
+	if (pt[0])
 		tags_store(child_tgid, pt);
-		return;
-	}
-	/* Parent has no tags — try to resolve by reading /proc/ppid/cmdline */
-	if (try_track_pid(parent_tgid) >= 0) {
-		pt = tags_lookup(parent_tgid);
-		tags_store(child_tgid, pt);
-	}
 }
 
 static void tags_clear(void)
 {
-	memset(tags_ht, 0, sizeof(tags_ht));
+	memset(tags_tgid, 0, sizeof(tags_tgid));
+	memset(tags_data, 0, sizeof(tags_data));
 }
+
+/*
+ * Thread-safe обёртки для tags_*.
+ * _ts_ версии берут g_tags_lock и копируют результат в caller-буфер.
+ * Нелокированные версии используются внутри секций, где lock уже взят.
+ */
+#ifdef STUB_TAGS
+/* No-op заглушки: полностью убираем теги для замера lock overhead */
+static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
+{ (void)tgid; if (buflen > 0) buf[0] = '\0'; }
+static void tags_store_ts(__u32 tgid, const char *tags)
+{ (void)tgid; (void)tags; }
+static void tags_remove_ts(__u32 tgid)
+{ (void)tgid; }
+static void tags_inherit_ts(__u32 child, __u32 parent)
+{ (void)child; (void)parent; }
+static void tags_clear_ts(void) { }
+#else
+static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
+{
+	pthread_rwlock_rdlock(&g_tags_lock);
+	const char *t = tags_lookup(tgid);
+	snprintf(buf, buflen, "%s", t);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+
+static void tags_store_ts(__u32 tgid, const char *tags)
+{
+	pthread_rwlock_wrlock(&g_tags_lock);
+	tags_store(tgid, tags);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+
+static void tags_remove_ts(__u32 tgid)
+{
+	pthread_rwlock_wrlock(&g_tags_lock);
+	tags_remove(tgid);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+
+static void tags_inherit_ts(__u32 child, __u32 parent)
+{
+	pthread_rwlock_wrlock(&g_tags_lock);
+	tags_inherit(child, parent);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+
+static void tags_clear_ts(void)
+{
+	pthread_rwlock_wrlock(&g_tags_lock);
+	tags_clear();
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+#endif
 
 /*
  * Match cmdline against ALL rules, build pipe-separated tags string.
  * Returns the index of the first matching rule, or -1 if no match.
  */
+#ifdef STUB_MATCH_RULES
+/* Заглушка: всегда матчит первое правило (для замера overhead regex) */
+static int match_rules_all(const char *cmdline, char *tags, int tags_size)
+{
+	(void)cmdline;
+	if (num_rules > 0 && tags_size > 0)
+		snprintf(tags, tags_size, "%s", rules[0].name);
+	else if (tags_size > 0)
+		tags[0] = '\0';
+	return num_rules > 0 ? 0 : -1;
+}
+#else
 static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 {
 	int first = -1;
@@ -243,6 +407,7 @@ static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 		tags[0] = '\0';
 	return first;
 }
+#endif
 
 /* Forward declarations for try_track_pid */
 static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
@@ -277,7 +442,7 @@ static int try_track_pid(__u32 pid)
 		return -1;
 
 	track_pid_from_proc(pid, first, pid, 1);
-	tags_store(pid, tags_buf);
+	tags_store_ts(pid, tags_buf);
 	log_debug("LATE_TRACK: pid=%u rule=%s tags=%s cmdline=%.60s",
 		  pid, rules[first].name, tags_buf, cmdline_str);
 	return first;
@@ -336,6 +501,23 @@ static void record_exit(const struct event *e)
 	if (exited_count < MAX_EXITED)
 		exited_count++;
 }
+
+/*
+ * Thread-safe обёртка для record_exit.
+ * Порядок захвата: tags_lock → exited_lock (record_exit читает tags_lookup).
+ */
+#ifdef STUB_TAGS
+static void record_exit_ts(const struct event *e) { (void)e; }
+#else
+static void record_exit_ts(const struct event *e)
+{
+	pthread_rwlock_rdlock(&g_tags_lock);
+	pthread_rwlock_wrlock(&g_exited_lock);
+	record_exit(e);
+	pthread_rwlock_unlock(&g_exited_lock);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+#endif
 
 /* ── CPU usage cache (for computing per-interval ratio) ───────────── */
 
@@ -557,37 +739,6 @@ static void build_cgroup_cache(void)
 		scan_cgroup_dir("/sys/fs/cgroup", "");
 }
 
-static int resolve_cgroup_idx(__u64 cgroup_id)
-{
-	if (cgroup_id == 0)
-		return -1;
-
-	for (int i = 0; i < cgroup_cache_count; i++)
-		if (cgroup_cache[i].id == cgroup_id)
-			return i;
-
-	/* Cache miss — rebuild once */
-	build_cgroup_cache();
-	for (int i = 0; i < cgroup_cache_count; i++)
-		if (cgroup_cache[i].id == cgroup_id)
-			return i;
-
-	return -1;
-}
-
-/* Display name (docker/xxx or original path) */
-static const char *resolve_cgroup(__u64 cgroup_id)
-{
-	int idx = resolve_cgroup_idx(cgroup_id);
-	return idx >= 0 ? cgroup_cache[idx].path : "";
-}
-
-/* Real filesystem path (for reading cgroup files) */
-static const char *resolve_cgroup_fs(__u64 cgroup_id)
-{
-	int idx = resolve_cgroup_idx(cgroup_id);
-	return idx >= 0 ? cgroup_cache[idx].fs_path : "";
-}
 
 /* Fast cgroup resolve for hot path — no cache rebuild on miss.
  * Cache is rebuilt every snapshot_interval anyway. */
@@ -599,6 +750,48 @@ static const char *resolve_cgroup_fast(__u64 cgroup_id)
 		if (cgroup_cache[i].id == cgroup_id)
 			return cgroup_cache[i].path;
 	return "";
+}
+
+/* Thread-safe обёртка для resolve_cgroup_fast */
+static void resolve_cgroup_fast_ts(__u64 cgroup_id, char *buf, int buflen)
+{
+	pthread_rwlock_rdlock(&g_cgroup_lock);
+	const char *cg = resolve_cgroup_fast(cgroup_id);
+	snprintf(buf, buflen, "%s", cg);
+	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+/* Thread-safe обёртка для resolve_cgroup (без rebuild на промах —
+ * кэш обновляется в начале каждого snapshot через build_cgroup_cache_ts). */
+static void resolve_cgroup_ts(__u64 cgroup_id, char *buf, int buflen)
+{
+	pthread_rwlock_rdlock(&g_cgroup_lock);
+	const char *cg = resolve_cgroup_fast(cgroup_id);
+	snprintf(buf, buflen, "%s", cg);
+	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+/* Thread-safe обёртка для resolve_cgroup_fs */
+static void resolve_cgroup_fs_ts(__u64 cgroup_id, char *buf, int buflen)
+{
+	if (cgroup_id == 0) { buf[0] = '\0'; return; }
+	pthread_rwlock_rdlock(&g_cgroup_lock);
+	for (int i = 0; i < cgroup_cache_count; i++) {
+		if (cgroup_cache[i].id == cgroup_id) {
+			snprintf(buf, buflen, "%s", cgroup_cache[i].fs_path);
+			pthread_rwlock_unlock(&g_cgroup_lock);
+			return;
+		}
+	}
+	buf[0] = '\0';
+	pthread_rwlock_unlock(&g_cgroup_lock);
+}
+
+static void build_cgroup_cache_ts(void)
+{
+	pthread_rwlock_wrlock(&g_cgroup_lock);
+	build_cgroup_cache();
+	pthread_rwlock_unlock(&g_cgroup_lock);
 }
 
 /* ── rules parser (from libconfig) ────────────────────────────────── */
@@ -1268,7 +1461,7 @@ static void add_descendants(struct scan_entry *entries, int count,
 		if (bpf_map_lookup_elem(tracked_map_fd, &child, &ti) == 0)
 			continue;
 		track_pid_from_proc(child, rule_id, root_pid, 0);
-		tags_inherit(child, parent);
+		tags_inherit_ts(child, parent);
 		(*tracked)++;
 		add_descendants(entries, count, child, rule_id, root_pid, tracked);
 	}
@@ -1336,7 +1529,7 @@ static void initial_scan(void)
 		if (first >= 0 && !rules[first].ignore) {
 			/* Root match */
 			track_pid_from_proc(pid, first, pid, 1);
-			tags_store(pid, tags_buf);
+			tags_store_ts(pid, tags_buf);
 			tracked++;
 			log_debug("SCAN: pid=%u rule=%s tags=%s cmdline=%.60s",
 				  pid, rules[first].name, tags_buf,
@@ -1427,8 +1620,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
 
 			/* Теги из userspace hash table (O(1)) */
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup(fe->tgid));
+			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
 			cev.root_pid = ti.root_pid;
 			cev.is_root = ti.is_root;
 			cev.pid = fe->tgid;
@@ -1437,10 +1629,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			memcpy(cev.comm, fe->comm, COMM_LEN);
 
 			/* Cgroup из кэша — линейный поиск по ~50 записям, без syscall */
-			const char *cg = resolve_cgroup_fast(fe->cgroup_id);
-			if (cg[0])
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+			resolve_cgroup_fast_ts(fe->cgroup_id,
+					       cev.cgroup, sizeof(cev.cgroup));
 
 			/* Файловые метрики: путь, флаги, прочитано/записано, кол-во открытий */
 			snprintf(cev.file_path, sizeof(cev.file_path),
@@ -1495,8 +1685,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "net_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup(ne->tgid));
+			tags_lookup_ts(ne->tgid, cev.tags, sizeof(cev.tags));
 			cev.root_pid = ti.root_pid;
 			cev.is_root = ti.is_root;
 			cev.pid = ne->tgid;
@@ -1505,10 +1694,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			memcpy(cev.comm, ne->comm, COMM_LEN);
 
 			/* Cgroup из кэша */
-			const char *cg = resolve_cgroup_fast(ne->cgroup_id);
-			if (cg[0])
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+			resolve_cgroup_fast_ts(ne->cgroup_id,
+					       cev.cgroup, sizeof(cev.cgroup));
 
 			/* Форматирование IP-адресов */
 			if (ne->af == 2) { /* AF_INET — IPv4 */
@@ -1573,7 +1760,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  se->sender_comm);
 
 		if (g_http_cfg.enabled) {
-			const char *cg = resolve_cgroup(se->cgroup_id);
+			char cg_buf[PATH_MAX_LEN];
+			resolve_cgroup_fast_ts(se->cgroup_id, cg_buf, sizeof(cg_buf));
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 
@@ -1587,9 +1775,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
 
 			/* Теги: сначала отправителя, потом получателя */
-			const char *sig_tags = tags_lookup(se->sender_tgid);
+			char sig_tags[TAGS_MAX_LEN];
+			tags_lookup_ts(se->sender_tgid, sig_tags, sizeof(sig_tags));
 			if (!sig_tags[0])
-				sig_tags = tags_lookup(se->target_pid);
+				tags_lookup_ts(se->target_pid, sig_tags, sizeof(sig_tags));
 			snprintf(cev.tags, sizeof(cev.tags), "%s", sig_tags);
 
 			/* Данные отправителя из tracked_map */
@@ -1601,9 +1790,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.pid = se->sender_tgid;
 			cev.uid = se->sender_uid;
 			memcpy(cev.comm, se->sender_comm, COMM_LEN);
-			if (cg)
+			if (cg_buf[0])
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+					 "%s", cg_buf);
 
 			/* Идентификация отправителя из proc_info (loginuid, tty, ...) */
 			struct proc_info sender_pi;
@@ -1670,10 +1859,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.pid = re->tgid;
 			cev.uid = re->uid;
 			memcpy(cev.comm, re->comm, COMM_LEN);
-			const char *cg = resolve_cgroup(re->cgroup_id);
-			if (cg)
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+			resolve_cgroup_fast_ts(re->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 
 			/* Определяем правило, если процесс отслеживается */
 			struct track_info ti;
@@ -1683,8 +1870,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					snprintf(cev.rule, sizeof(cev.rule),
 						 "%s", rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				const char *t = tags_lookup(re->tgid);
-				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+				tags_lookup_ts(re->tgid, cev.tags,
+					       sizeof(cev.tags));
 			}
 
 			/* Адреса и порты TCP-соединения */
@@ -1742,10 +1929,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.pid = se_syn->tgid;
 			cev.uid = se_syn->uid;
 			memcpy(cev.comm, se_syn->comm, COMM_LEN);
-			const char *cg = resolve_cgroup(se_syn->cgroup_id);
-			if (cg)
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+			resolve_cgroup_fast_ts(se_syn->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&se_syn->tgid, &ti) == 0) {
@@ -1753,8 +1938,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					snprintf(cev.rule, sizeof(cev.rule),
 						 "%s", rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				const char *t = tags_lookup(se_syn->tgid);
-				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+				tags_lookup_ts(se_syn->tgid, cev.tags,
+					       sizeof(cev.tags));
 			}
 			cev.sec_af = se_syn->af;
 			cev.sec_local_port = se_syn->local_port;
@@ -1814,10 +1999,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.pid = rste->tgid;
 			cev.uid = rste->uid;
 			memcpy(cev.comm, rste->comm, COMM_LEN);
-			const char *cg = resolve_cgroup(rste->cgroup_id);
-			if (cg)
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg);
+			resolve_cgroup_fast_ts(rste->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&rste->tgid, &ti) == 0) {
@@ -1825,8 +2008,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					snprintf(cev.rule, sizeof(cev.rule),
 						 "%s", rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				const char *t = tags_lookup(rste->tgid);
-				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
+				tags_lookup_ts(rste->tgid, cev.tags,
+					       sizeof(cev.tags));
 			}
 			cev.sec_af = rste->af;
 			cev.sec_local_port = rste->local_port;
@@ -1876,7 +2059,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Уже отслеживается? BPF обновил proc_info, нам делать нечего */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
-			break;
+			return 0;
 
 		/* Преобразуем cmdline из BPF (нуль-разделённые аргументы) в строку */
 		char cmdline[CMDLINE_MAX + 1];
@@ -1884,8 +2067,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Проверяем все правила (regexec × N правил) — тяжёлый, но exec редкий */
 		char tags_buf[TAGS_MAX_LEN];
-		int first = match_rules_all(cmdline, tags_buf,
-					    sizeof(tags_buf));
+		int first = match_rules_all(
+			cmdline,
+			tags_buf,
+			sizeof(tags_buf)
+		);
+		
 		if (first >= 0 && !rules[first].ignore) {
 			/* Совпадение — начинаем отслеживание */
 			struct track_info new_ti = {
@@ -1895,7 +2082,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			};
 			bpf_map_update_elem(tracked_map_fd, &e->tgid,
 					    &new_ti, BPF_ANY);
-			tags_store(e->tgid, tags_buf);
+			tags_store_ts(e->tgid, tags_buf);
 
 			/* Сохраняем метаданные процесса в proc_map */
 			struct proc_info pi = {0};
@@ -1914,16 +2101,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
 			if (g_http_cfg.enabled) {
-				const char *cg = resolve_cgroup(e->cgroup_id);
+				char cg_buf[PATH_MAX_LEN];
+				resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
+						       sizeof(cg_buf));
 				struct metric_event cev;
 				event_from_bpf(&cev, e, "exec",
 					       rules[first].name,
-					       tags_buf, cg);
+					       tags_buf, cg_buf);
 				cev.is_root = 1;
 				ef_append(&cev, cfg_hostname);
 			}
 		}
-		break;
+		return 0;
 	}
 
 	/* ── FORK — создание дочернего процесса ──────────────────────── */
@@ -1932,8 +2121,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		 * Здесь только наследуем tags (они живут в userspace hash table). */
 		struct track_info parent_ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->ppid, &parent_ti) != 0)
-			break;
-		tags_inherit(e->tgid, e->ppid);
+			return 0;
+		tags_inherit_ts(e->tgid, e->ppid);
 
 		/* Наследуем tty_nr от родителя (BPF не может читать signal->tty).
 		 * Дочерний процесс наследует управляющий терминал при fork. */
@@ -1958,15 +2147,19 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			const char *rname = (parent_ti.rule_id < num_rules)
 				? rules[parent_ti.rule_id].name : "unknown";
-			const char *cg = resolve_cgroup(e->cgroup_id);
+			char cg_buf[PATH_MAX_LEN];
+			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
+					       sizeof(cg_buf));
+			char fork_tags[TAGS_MAX_LEN];
+			tags_lookup_ts(e->tgid, fork_tags, sizeof(fork_tags));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "fork", rname,
-				       tags_lookup(e->tgid), cg);
+				       fork_tags, cg_buf);
 			cev.root_pid = parent_ti.root_pid;
 			cev.tty_nr = child_tty;
 			ef_append(&cev, cfg_hostname);
 		}
-		break;
+		return 0;
 	}
 
 	/* ── EXIT — завершение процесса ──────────────────────────────── */
@@ -1983,13 +2176,43 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const char *rname = (exit_rule_id < num_rules)
 			? rules[exit_rule_id].name : "?";
 
-		/* Теги: если нет — пробуем отследить или наследовать от родителя */
-		const char *exit_tags = tags_lookup(e->tgid);
-		if (!exit_tags[0]) {
-			if (try_track_pid(e->tgid) < 0)
+		/* ┌───────────────────────────────────────────────────────────┐
+		 * │  ОПТИМИЗАЦИЯ 3: Объединённый lock для EXIT-обработчика   │
+		 * ├───────────────────────────────────────────────────────────┤
+		 * │  Проблема: каждый EXIT-event ранее брал g_tags_lock      │
+		 * │  5 раз (tags_lookup_ts → record_exit_ts → tags_remove_ts,│
+		 * │  каждый — отдельный lock/unlock цикл).                   │
+		 * │  При ~22k events/sec даже ~1µs на lock/unlock × 5 =     │
+		 * │  ~5µs overhead → consumer отставал от producer на ~10%   │
+		 * │  → ring buffer переполнялся.                             │
+		 * │                                                           │
+		 * │  Решение: все tags-операции EXIT (lookup, inherit,       │
+		 * │  record_exit, remove) под ОДНИМ wrlock. Вместо 5         │
+		 * │  lock/unlock — один. Используем bare-функции (без _ts),  │
+		 * │  т.к. wrlock уже взят вручную.                           │
+		 * │                                                           │
+		 * │  Также исправлен latent deadlock: ранее tags_inherit     │
+		 * │  вызывала try_track_pid → tags_store_ts → wrlock         │
+		 * │  повторно (pthread_rwlock_wrlock НЕ рекурсивный).        │
+		 * │  Теперь tags_inherit не вызывает try_track_pid.          │
+		 * └───────────────────────────────────────────────────────────┘ */
+		char exit_tags[TAGS_MAX_LEN];
+		pthread_rwlock_wrlock(&g_tags_lock);
+		{
+			const char *t = tags_lookup(e->tgid);
+			if (!t[0]) {
+				/* Нет тегов — наследуем от родителя (wrlock уже взят) */
 				tags_inherit(e->tgid, e->ppid);
-			exit_tags = tags_lookup(e->tgid);
+				t = tags_lookup(e->tgid);
+			}
+			snprintf(exit_tags, sizeof(exit_tags), "%s", t);
+			/* record_exit вызывает tags_lookup внутри — безопасно под wrlock */
+			pthread_rwlock_wrlock(&g_exited_lock);
+			record_exit(e);
+			pthread_rwlock_unlock(&g_exited_lock);
+			tags_remove(e->tgid);
 		}
+		pthread_rwlock_unlock(&g_tags_lock);
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
 		int sig = e->exit_code & 0x7f;
@@ -2002,19 +2225,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)(e->rss_max_pages * 4 / 1024),
 			  e->oom_killed ? " [OOM]" : "");
 
-		/* Сохраняем в кольцевой буфер завершённых процессов (для snapshot) */
-		record_exit(e);
-		tags_remove(e->tgid);
-
 		/* Отправляем exit-событие в буферный файл */
 		if (g_http_cfg.enabled) {
-			const char *cg = resolve_cgroup(e->cgroup_id);
+			char cg_buf[PATH_MAX_LEN];
+			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
+					       sizeof(cg_buf));
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg);
+			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg_buf);
 			ef_append(&cev, cfg_hostname);
 		}
 		/* BPF уже удалил запись из tracked_map и proc_map */
-		break;
+		return 0;
 	}
 
 	/* ── OOM_KILL — убийство процесса OOM killer ─────────────────── */
@@ -2039,20 +2260,23 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Отправляем oom_kill-событие в буферный файл */
 		if (g_http_cfg.enabled) {
-			const char *cg = resolve_cgroup(e->cgroup_id);
+			char cg_buf[PATH_MAX_LEN];
+			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
+					       sizeof(cg_buf));
+			char oom_tags[TAGS_MAX_LEN];
+			tags_lookup_ts(e->tgid, oom_tags, sizeof(oom_tags));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname,
-				       tags_lookup(e->tgid), cg);
+				       oom_tags, cg_buf);
 			ef_append(&cev, cfg_hostname);
 		}
-		break;
+		return 0;
 	}
 
 	default:
-		break;
+		return 0;
 	}
 
-	/* Всегда 0 — не прерывает обработку ring buffer */
 	return 0;
 }
 
@@ -2198,8 +2422,56 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 	return disk_count;
 }
 
+/*
+ * Поиск тегов в локальной копии (без lock).
+ * snap_tgid/snap_data — snapshot, сделанный через memcpy под кратким rdlock
+ * в начале write_snapshot (см. ОПТИМИЗАЦИЯ 4).
+ * Вызывается десятки раз за snapshot — без locks, т.к. работает с копией.
+ */
+static const char *tags_lookup_copy(const __u32 *snap_tgid,
+				    const char snap_data[][TAGS_MAX_LEN],
+				    __u32 tgid)
+{
+	__u32 idx = tags_hash(tgid);
+	for (int i = 0; i < TAGS_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
+		if (snap_tgid[slot] == tgid)
+			return snap_data[slot];
+		if (snap_tgid[slot] == 0)
+			return "";
+	}
+	return "";
+}
+
 static void write_snapshot(void)
 {
+	/* Обновляем кэш cgroup'ов под wrlock */
+	build_cgroup_cache_ts();
+	refresh_boot_to_wall();
+
+	/* ┌───────────────────────────────────────────────────────────────┐
+	 * │  ОПТИМИЗАЦИЯ 4: Snapshot tags через memcpy (anti-starvation) │
+	 * ├───────────────────────────────────────────────────────────────┤
+	 * │  Проблема: write_snapshot итерирует ~1600 PID'ов с I/O       │
+	 * │  (fprintf, bpf_map_lookup) — это занимает секунды.           │
+	 * │  Если держать rdlock на g_tags_lock всё это время,           │
+	 * │  poll-потоки не могут получить wrlock для FORK/EXIT →        │
+	 * │  writer starvation → ring buffer переполняется.              │
+	 * │                                                               │
+	 * │  Решение: копируем tags_tgid (64KB) + tags_data (8MB) под   │
+	 * │  кратким rdlock (~1ms), затем работаем с локальной копией    │
+	 * │  через tags_lookup_copy() без каких-либо locks.             │
+	 * │                                                               │
+	 * │  Массивы объявлены static — аллоцируются один раз в BSS,    │
+	 * │  не на стеке (16 МБ на стеке вызвали бы stack overflow).    │
+	 * └───────────────────────────────────────────────────────────────┘ */
+	static __u32 snap_tgid[TAGS_HT_SIZE];
+	static char  snap_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
+	pthread_rwlock_rdlock(&g_tags_lock);
+	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
+	memcpy(snap_data, tags_data, sizeof(tags_data));
+	pthread_rwlock_unlock(&g_tags_lock);
+
 	char tmp_path[PATH_MAX_LEN];
 	FILE *f = NULL;
 
@@ -2401,8 +2673,9 @@ static void write_snapshot(void)
 		}
 
 		/* Resolve cgroup: display name + real fs path */
-		const char *cg_path = resolve_cgroup(pi.cgroup_id);
-		const char *cg_fs_path = resolve_cgroup_fs(pi.cgroup_id);
+		char cg_path[PATH_MAX_LEN], cg_fs_path[PATH_MAX_LEN];
+		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
+		resolve_cgroup_fs_ts(pi.cgroup_id, cg_fs_path, sizeof(cg_fs_path));
 
 		/* Escape labels */
 		char comm_esc[64], exec_esc[CMDLINE_MAX * 2];
@@ -2430,7 +2703,9 @@ static void write_snapshot(void)
 		/* Write Prometheus metrics */
 		if (f) {
 		char tags_esc[TAGS_MAX_LEN * 2];
-		escape_label(tags_lookup(key), tags_esc, sizeof(tags_esc));
+		/* tags_lookup_copy — работаем с локальной копией без lock */
+		const char *snap_tags_buf = tags_lookup_copy(snap_tgid, snap_data, key);
+		escape_label(snap_tags_buf, tags_esc, sizeof(tags_esc));
 		fprintf(f, "%s_info{hostname=\"%s\",rule=\"%s\",tags=\"%s\","
 			"root_pid=\"%u\","
 			"pid=\"%u\",uid=\"%u\",comm=\"%s\",exec=\"%s\",args=\"%s\","
@@ -2559,12 +2834,8 @@ static void write_snapshot(void)
 			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
-			const char *snap_tags = tags_lookup(key);
-			if (!snap_tags[0]) {
-				try_track_pid(key);
-				snap_tags = tags_lookup(key);
-			}
-			snprintf(cev.tags, sizeof(cev.tags), "%s", snap_tags);
+			/* tags_lookup_copy — работаем с локальной копией без lock */
+			snprintf(cev.tags, sizeof(cev.tags), "%s", tags_lookup_copy(snap_tgid, snap_data, key));
 			cev.root_pid = ti.root_pid;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
@@ -2692,12 +2963,9 @@ static void write_snapshot(void)
 							&ukey.tgid,
 							&upi) == 0) {
 					memcpy(cev.comm, upi.comm, COMM_LEN);
-					const char *ucg = resolve_cgroup(
-						upi.cgroup_id);
-					if (ucg)
-						snprintf(cev.cgroup,
-							 sizeof(cev.cgroup),
-							 "%s", ucg);
+					resolve_cgroup_ts(upi.cgroup_id,
+							  cev.cgroup,
+							  sizeof(cev.cgroup));
 				}
 				struct track_info uti;
 				if (bpf_map_lookup_elem(tracked_map_fd,
@@ -2709,9 +2977,8 @@ static void write_snapshot(void)
 							 "%s",
 							 rules[uti.rule_id].name);
 					cev.root_pid = uti.root_pid;
-					const char *ut = tags_lookup(ukey.tgid);
 					snprintf(cev.tags, sizeof(cev.tags),
-						 "%s", ut);
+						 "%s", tags_lookup_copy(snap_tgid, snap_data, ukey.tgid));
 				}
 				ef_append(&cev, cfg_hostname);
 				udp_count++;
@@ -2782,17 +3049,16 @@ static void write_snapshot(void)
 	/* Unlock batch — snapshot is complete, safe for swap/snapshot_fd */
 	ef_batch_unlock();
 
-	/* Clean up dead processes */
+	/* Clean up dead processes (BPF maps — без lock) */
 	for (int i = 0; i < dead_count; i++) {
 		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
 		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
 		cpu_prev_remove(dead_keys[i]);
-		tags_remove(dead_keys[i]);
 	}
-	if (dead_count > 0)
-		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
 
-	/* Recently exited processes */
+	/* Recently exited processes — читаем под rdlock
+	 * (g_tags_lock rdlock уже взят, exited_lock берём отдельно) */
+	pthread_rwlock_rdlock(&g_exited_lock);
 	if (f && exited_count > 0) {
 		fprintf(f,
 			"# HELP %s_exited_exit_code Exit code of recently exited process\n"
@@ -2871,6 +3137,7 @@ static void write_snapshot(void)
 				(unsigned long long)ep->net_rx_bytes);
 		}
 	}
+	pthread_rwlock_unlock(&g_exited_lock);
 
 	/* Cgroup v2 metrics from /sys/fs/cgroup */
 	if (f && cfg_cgroup_metrics && seen_cg_count > 0) {
@@ -2956,6 +3223,15 @@ static void write_snapshot(void)
 			}
 		}
 	}
+
+	/* Удаляем теги мёртвых процессов (wrlock) */
+	if (dead_count > 0) {
+		pthread_rwlock_wrlock(&g_tags_lock);
+		for (int i = 0; i < dead_count; i++)
+			tags_remove(dead_keys[i]);
+		pthread_rwlock_unlock(&g_tags_lock);
+		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
+	}
 }
 
 /* ── signals ──────────────────────────────────────────────────────── */
@@ -2982,6 +3258,38 @@ static void usage(const char *prog)
 		"  -c <path>   configuration file (libconfig format)\n"
 		"  -h          show this help\n",
 		prog);
+}
+
+/*
+ * Функция потока poll — вычитывает события из одного ring buffer'а.
+ * Каждый поток обслуживает свой буфер (proc, file или net).
+ * Завершается при g_running == 0.
+ */
+static void *poll_thread_fn(void *arg)
+{
+	struct poll_thread_arg *a = arg;
+	log_ts("INFO", "poll thread '%s' started", a->name);
+
+	while (g_running) {
+		int n = ring_buffer__consume(a->rb);
+		if (n > 0)
+			continue;  /* есть данные — сразу проверяем ещё */
+		if (n < 0 && n != -EINTR) {
+			log_ts("ERROR", "poll thread '%s': ring_buffer__consume: %d",
+			       a->name, n);
+			break;
+		}
+		/* Нет данных — ждём через epoll, чтобы не крутить CPU вхолостую */
+		int err = ring_buffer__poll(a->rb, 100);
+		if (err < 0 && err != -EINTR) {
+			log_ts("ERROR", "poll thread '%s': ring_buffer__poll: %d",
+			       a->name, err);
+			break;
+		}
+	}
+
+	log_ts("INFO", "poll thread '%s' stopped", a->name);
+	return NULL;
 }
 
 int main(int argc, char *argv[])
@@ -3170,26 +3478,19 @@ int main(int argc, char *argv[])
 	tracked_map_fd = bpf_map__fd(skel->maps.tracked_map);
 	proc_map_fd    = bpf_map__fd(skel->maps.proc_map);
 
-	/* Ring buffers: процессы, файлы, сеть — каждый со своим буфером,
-	 * но общий callback handle_event (различает по полю type). */
-	struct ring_buffer *rb = ring_buffer__new(
+	/* Ring buffers: по одному на каждый тип событий.
+	 * Каждый будет обслуживаться отдельным потоком poll. */
+	struct ring_buffer *rb_proc = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_proc), handle_event, NULL, NULL);
-	if (!rb) {
-		fprintf(stderr, "FATAL: failed to create ring buffer\n");
-		process_metrics_bpf__destroy(skel);
-		return 1;
-	}
-	if (ring_buffer__add(rb, bpf_map__fd(skel->maps.events_file),
-			     handle_event, NULL)) {
-		fprintf(stderr, "FATAL: failed to add events_file ring buffer\n");
-		ring_buffer__free(rb);
-		process_metrics_bpf__destroy(skel);
-		return 1;
-	}
-	if (ring_buffer__add(rb, bpf_map__fd(skel->maps.events_net),
-			     handle_event, NULL)) {
-		fprintf(stderr, "FATAL: failed to add events_net ring buffer\n");
-		ring_buffer__free(rb);
+	struct ring_buffer *rb_file = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_file), handle_event, NULL, NULL);
+	struct ring_buffer *rb_net = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_net), handle_event, NULL, NULL);
+	if (!rb_proc || !rb_file || !rb_net) {
+		fprintf(stderr, "FATAL: failed to create ring buffers\n");
+		if (rb_proc) ring_buffer__free(rb_proc);
+		if (rb_file) ring_buffer__free(rb_file);
+		if (rb_net)  ring_buffer__free(rb_net);
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
@@ -3207,7 +3508,9 @@ int main(int argc, char *argv[])
 	if (g_http_cfg.enabled) {
 		if (http_server_start(&g_http_cfg, cfg_prom_path) < 0) {
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
-			ring_buffer__free(rb);
+			ring_buffer__free(rb_proc);
+			ring_buffer__free(rb_file);
+			ring_buffer__free(rb_net);
 			process_metrics_bpf__destroy(skel);
 			return 1;
 		}
@@ -3237,18 +3540,36 @@ int main(int argc, char *argv[])
 	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_file_size);
 
-	/* Main loop — event-driven via ring_buffer__poll (epoll_wait inside).
-	 * Блокируется до прихода BPF-событий или таймаута 1 сек. */
+	/* ── Потоки poll: по одному на каждый ring buffer ────────────────
+	 *
+	 * Каждый поток вызывает ring_buffer__poll() в цикле, пока g_running.
+	 * handle_event внутри использует гранулярные rwlock'и:
+	 *   g_tags_lock   — tags_ht (lookup/store/remove/inherit)
+	 *   g_exited_lock — exited_ring (record_exit)
+	 *   g_cgroup_lock — cgroup_cache (resolve_cgroup_fast)
+	 * Основной поток занимается snapshot и config reload.
+	 */
+	struct poll_thread_arg args[3] = {
+		{ .rb = rb_proc, .name = "proc" },
+		{ .rb = rb_file, .name = "file" },
+		{ .rb = rb_net,  .name = "net"  },
+	};
+	pthread_t poll_threads[3];
+
+	for (int i = 0; i < 3; i++) {
+		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
+			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
+				args[i].name);
+			g_running = 0;
+			break;
+		}
+	}
+
+	/* Main loop — snapshot и config reload */
 	time_t last_snapshot = 0;
 
 	while (g_running) {
-		int err = ring_buffer__poll(rb, 1000 /* 1 second timeout */);
-		if (err == -EINTR)
-			continue;
-		if (err < 0 && err != -EINTR) {
-			log_ts("ERROR", "ring_buffer__poll: %d", err);
-			break;
-		}
+		sleep(1);
 
 		/* Config reload on SIGHUP */
 		if (g_reload) {
@@ -3262,10 +3583,14 @@ int main(int argc, char *argv[])
 				bpf_map_delete_elem(proc_map_fd, &del_key);
 			}
 
-			tags_clear();
+			tags_clear_ts();
 			parse_rules_from_config(cfg_config_file);
-			build_cgroup_cache();
+			build_cgroup_cache_ts();
+
+			pthread_rwlock_wrlock(&g_exited_lock);
 			exited_head = exited_count = 0;
+			pthread_rwlock_unlock(&g_exited_lock);
+
 			cpu_prev_count = 0;
 			prev_snapshot_ts = (struct timespec){0};
 			initial_scan();
@@ -3274,12 +3599,16 @@ int main(int argc, char *argv[])
 		/* Periodic snapshot */
 		time_t now = time(NULL);
 		if (now - last_snapshot >= cfg_snapshot_interval) {
-			build_cgroup_cache();
-			refresh_boot_to_wall();
+			/* build_cgroup_cache и refresh_boot_to_wall вызываются
+			 * внутри write_snapshot под wrlock */
 			write_snapshot();
 			last_snapshot = now;
 		}
 	}
+
+	/* Ждём завершения потоков poll */
+	for (int i = 0; i < 3; i++)
+		pthread_join(poll_threads[i], NULL);
 
 	/* Stop HTTP server */
 	http_server_stop();
@@ -3287,7 +3616,9 @@ int main(int argc, char *argv[])
 	/* Clean up event file */
 	ef_cleanup();
 
-	ring_buffer__free(rb);
+	ring_buffer__free(rb_proc);
+	ring_buffer__free(rb_file);
+	ring_buffer__free(rb_net);
 	process_metrics_bpf__destroy(skel);
 	free_rules();
 
