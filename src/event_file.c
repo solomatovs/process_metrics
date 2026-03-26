@@ -29,6 +29,7 @@ static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int           g_initialized;
 static __u64         g_max_size;           /* 0 = unlimited */
+static __u64         g_cur_size;           /* tracked size, avoids lseek */
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -40,6 +41,8 @@ static int open_append(void)
 			g_path, strerror(errno));
 		return -1;
 	}
+	off_t pos = lseek(g_fd, 0, SEEK_END);
+	g_cur_size = (pos > 0) ? (__u64)pos : 0;
 	return 0;
 }
 
@@ -152,22 +155,21 @@ void ef_append(const struct metric_event *ev, const char *hostname)
 
 	pthread_mutex_lock(&g_mutex);
 	if (g_fd >= 0) {
-		/* Check file size limit before writing */
-		if (g_max_size > 0) {
-			off_t pos = lseek(g_fd, 0, SEEK_END);
-			if (pos != (off_t)-1 &&
-			    (__u64)pos + sizeof(rec) > g_max_size) {
-				fprintf(stderr,
-					"WARN: event file %s reached size"
-					" limit (%llu bytes), truncating\n",
-					g_path,
-					(unsigned long long)g_max_size);
-				ftruncate(g_fd, 0);
-				lseek(g_fd, 0, SEEK_SET);
-			}
+		/* Check file size limit (tracked, no lseek per call) */
+		if (g_max_size > 0 &&
+		    g_cur_size + sizeof(rec) > g_max_size) {
+			fprintf(stderr,
+				"WARN: event file %s reached size"
+				" limit (%llu bytes), truncating\n",
+				g_path,
+				(unsigned long long)g_max_size);
+			ftruncate(g_fd, 0);
+			lseek(g_fd, 0, SEEK_SET);
+			g_cur_size = 0;
 		}
 		ssize_t n = write(g_fd, &rec, sizeof(rec));
-		(void)n; /* best-effort */
+		if (n > 0)
+			g_cur_size += (__u64)n;
 	}
 	pthread_mutex_unlock(&g_mutex);
 }

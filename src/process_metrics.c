@@ -129,6 +129,21 @@ static int tracked_map_fd, proc_map_fd;
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
 
+/* Boot-time to wall-clock offset (computed once at startup,
+ * refreshed each snapshot). BPF sends bpf_ktime_get_boot_ns(),
+ * wall_ns = boot_ns + g_boot_to_wall_ns. */
+static __s64 g_boot_to_wall_ns;
+
+static void refresh_boot_to_wall(void)
+{
+	struct timespec rt, bt;
+	clock_gettime(CLOCK_REALTIME, &rt);
+	clock_gettime(CLOCK_BOOTTIME, &bt);
+	__s64 rt_ns = (__s64)rt.tv_sec * 1000000000LL + rt.tv_nsec;
+	__s64 bt_ns = (__s64)bt.tv_sec * 1000000000LL + bt.tv_nsec;
+	g_boot_to_wall_ns = rt_ns - bt_ns;
+}
+
 /* ── tags hash table (userspace-only, per-tgid) ──────────────────── */
 
 #define TAGS_MAX_LEN 512
@@ -572,6 +587,18 @@ static const char *resolve_cgroup_fs(__u64 cgroup_id)
 {
 	int idx = resolve_cgroup_idx(cgroup_id);
 	return idx >= 0 ? cgroup_cache[idx].fs_path : "";
+}
+
+/* Fast cgroup resolve for hot path — no cache rebuild on miss.
+ * Cache is rebuilt every snapshot_interval anyway. */
+static const char *resolve_cgroup_fast(__u64 cgroup_id)
+{
+	if (cgroup_id == 0)
+		return "";
+	for (int i = 0; i < cgroup_cache_count; i++)
+		if (cgroup_cache[i].id == cgroup_id)
+			return cgroup_cache[i].path;
+	return "";
 }
 
 /* ── rules parser (from libconfig) ────────────────────────────────── */
@@ -1327,33 +1354,58 @@ static void initial_scan(void)
 
 /* ── ring buffer event handler ────────────────────────────────────── */
 
+/*
+ * handle_event — callback для каждого BPF-события из ring buffer.
+ *
+ * Вызывается из ring_buffer__poll() → ringbuf_process_ring().
+ * Всегда возвращает 0, чтобы не прерывать обработку очереди.
+ *
+ * Типы событий:
+ *   FILE_CLOSE       — закрытие отслеживаемого файла (~115/сек, самый частый)
+ *   NET_CLOSE        — закрытие TCP-соединения (~9/сек)
+ *   SIGNAL           — доставка сигнала (редкий)
+ *   TCP_RETRANSMIT   — повторная передача TCP-сегмента (редкий)
+ *   SYN_RECV         — входящий SYN-запрос (редкий)
+ *   RST              — отправка/получение TCP RST (редкий)
+ *   EXEC             — вызов exec (~4/сек)
+ *   FORK             — создание процесса (~4/сек)
+ *   EXIT             — завершение процесса (~4/сек)
+ *   OOM_KILL         — убийство процесса OOM killer (редкий)
+ */
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	(void)ctx;
 
-	/* Both struct event and struct file_event have __u32 type at offset 0 */
+	/* Все структуры событий имеют __u32 type по смещению 0 */
 	if (size < sizeof(__u32))
 		return 0;
 	__u32 type = *(const __u32 *)data;
 
-	/* Handle file_close events separately */
+	/* ── FILE_CLOSE — закрытие отслеживаемого файла ──────────────────
+	 *
+	 * Самое частое событие (~115/сек). Оптимизирован для минимума syscall:
+	 *   1× bpf_map_lookup_elem — проверка, что процесс всё ещё отслеживается
+	 *   1× write()            — запись в буферный файл (ef_append)
+	 *
+	 * BPF-сторона (openat) уже фильтрует по tracked_map, поэтому сюда
+	 * приходят только события от отслеживаемых процессов.
+	 * Временная метка берётся из BPF (boot_ns) + g_boot_to_wall_ns,
+	 * без вызова clock_gettime.
+	 * Cgroup резолвится из кэша (resolve_cgroup_fast), без обхода /sys.
+	 */
 	if (type == EVENT_FILE_CLOSE) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
 
+		/* Единственный lookup — пропускаем, если процесс умер между open и close */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
-			try_track_pid(fe->tgid);
-		const char *rname = "?";
-		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) == 0)
-			rname = (ti.rule_id < num_rules)
-				? rules[ti.rule_id].name : "?";
-		if (rname[0] == '?' && rname[1] == '\0') {
-			if (bpf_map_lookup_elem(tracked_map_fd, &fe->ppid, &ti) == 0)
-				rname = (ti.rule_id < num_rules)
-					? rules[ti.rule_id].name : "?";
-		}
+			return 0;
+
+		/* Имя правила по rule_id из track_info (O(1)) */
+		const char *rname = (ti.rule_id < num_rules)
+			? rules[ti.rule_id].name : "?";
 
 		log_debug("FILE_CLOSE: pid=%u rule=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
@@ -1362,67 +1414,69 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)fe->write_bytes,
 			  fe->open_count);
 
-		/* Send file_close event to event file */
 		if (g_http_cfg.enabled) {
-			const char *cg = resolve_cgroup(fe->cgroup_id);
+			/* Формирование metric_event для записи в буфер */
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			/* Use wall-clock time (boot_ns → epoch conversion) */
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
-					 + (__u64)ts_now.tv_nsec;
+
+			/* Время: BPF boot_ns → wall clock через предвычисленное смещение */
+			cev.timestamp_ns = fe->timestamp_ns
+					 + (__u64)g_boot_to_wall_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "file_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
-			const char *file_tags = tags_lookup(fe->tgid);
-			if (!file_tags[0])
-				tags_inherit(fe->tgid, fe->ppid);
-			file_tags = tags_lookup(fe->tgid);
-			snprintf(cev.tags, sizeof(cev.tags), "%s", file_tags);
-			if (bpf_map_lookup_elem(tracked_map_fd,
-						&fe->tgid, &ti) == 0) {
-				cev.root_pid = ti.root_pid;
-				cev.is_root = ti.is_root;
-			}
+
+			/* Теги из userspace hash table (O(1)) */
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup(fe->tgid));
+			cev.root_pid = ti.root_pid;
+			cev.is_root = ti.is_root;
 			cev.pid = fe->tgid;
 			cev.ppid = fe->ppid;
 			cev.uid = fe->uid;
 			memcpy(cev.comm, fe->comm, COMM_LEN);
-			if (cg)
+
+			/* Cgroup из кэша — линейный поиск по ~50 записям, без syscall */
+			const char *cg = resolve_cgroup_fast(fe->cgroup_id);
+			if (cg[0])
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
 					 "%s", cg);
-			/* Dedicated file tracking fields */
+
+			/* Файловые метрики: путь, флаги, прочитано/записано, кол-во открытий */
 			snprintf(cev.file_path, sizeof(cev.file_path),
 				 "%s", fe->path);
 			cev.file_flags = (__u32)fe->flags;
 			cev.file_read_bytes = fe->read_bytes;
 			cev.file_write_bytes = fe->write_bytes;
 			cev.file_open_count = fe->open_count;
+
+			/* Запись в буферный файл (1× write syscall) */
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
 
-	/* Handle net_close events separately */
+	/* ── NET_CLOSE — закрытие TCP-соединения ─────────────────────────
+	 *
+	 * Второе по частоте событие (~9/сек). Оптимизирован аналогично FILE_CLOSE.
+	 *
+	 * ВАЖНО: BPF-сторона (tcp_connect/accept) НЕ фильтрует по tracked_map —
+	 * события приходят для ВСЕХ процессов на хосте. Фильтрация выполняется
+	 * здесь одним bpf_map_lookup_elem: если PID не в tracked_map — пропускаем.
+	 */
 	if (type == EVENT_NET_CLOSE) {
 		if (size < sizeof(struct net_event))
 			return 0;
 		const struct net_event *ne = data;
 
+		/* Единственный lookup — пропускаем неотслеживаемые процессы */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) != 0)
-			try_track_pid(ne->tgid);
-		const char *rname = "?";
-		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) == 0)
-			rname = (ti.rule_id < num_rules)
-				? rules[ti.rule_id].name : "?";
-		/* Fallback: inherit rule from parent */
-		if (rname[0] == '?' && rname[1] == '\0') {
-			if (bpf_map_lookup_elem(tracked_map_fd, &ne->ppid, &ti) == 0)
-				rname = (ti.rule_id < num_rules)
-					? rules[ti.rule_id].name : "?";
-		}
+			return 0;
+
+		/* Имя правила по rule_id (O(1)) */
+		const char *rname = (ti.rule_id < num_rules)
+			? rules[ti.rule_id].name : "?";
 
 		log_debug("NET_CLOSE: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
@@ -1432,35 +1486,32 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)(ne->duration_ns / 1000000));
 
 		if (g_http_cfg.enabled) {
-			const char *cg = resolve_cgroup(ne->cgroup_id);
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
-					 + (__u64)ts_now.tv_nsec;
+
+			/* Время: BPF boot_ns → wall clock */
+			cev.timestamp_ns = ne->timestamp_ns
+					 + (__u64)g_boot_to_wall_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "net_close");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
-				const char *net_tags = tags_lookup(ne->tgid);
-			if (!net_tags[0])
-				tags_inherit(ne->tgid, ne->ppid);
-			net_tags = tags_lookup(ne->tgid);
-			snprintf(cev.tags, sizeof(cev.tags), "%s", net_tags);
-			if (bpf_map_lookup_elem(tracked_map_fd,
-						&ne->tgid, &ti) == 0) {
-				cev.root_pid = ti.root_pid;
-				cev.is_root = ti.is_root;
-			}
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup(ne->tgid));
+			cev.root_pid = ti.root_pid;
+			cev.is_root = ti.is_root;
 			cev.pid = ne->tgid;
 			cev.ppid = ne->ppid;
 			cev.uid = ne->uid;
 			memcpy(cev.comm, ne->comm, COMM_LEN);
-			if (cg)
+
+			/* Cgroup из кэша */
+			const char *cg = resolve_cgroup_fast(ne->cgroup_id);
+			if (cg[0])
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
 					 "%s", cg);
-			/* Format IP addresses */
-			if (ne->af == 2) { /* AF_INET */
+
+			/* Форматирование IP-адресов */
+			if (ne->af == 2) { /* AF_INET — IPv4 */
 				snprintf(cev.net_local_addr,
 					 sizeof(cev.net_local_addr),
 					 "%u.%u.%u.%u",
@@ -1471,7 +1522,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					 "%u.%u.%u.%u",
 					 ne->remote_addr[0], ne->remote_addr[1],
 					 ne->remote_addr[2], ne->remote_addr[3]);
-			} else if (ne->af == 10) { /* AF_INET6 */
+			} else if (ne->af == 10) { /* AF_INET6 — IPv6 */
 				inet_ntop(AF_INET6, ne->local_addr,
 					  cev.net_local_addr,
 					  sizeof(cev.net_local_addr));
@@ -1479,23 +1530,31 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.net_remote_addr,
 					  sizeof(cev.net_remote_addr));
 			}
+
+			/* Сетевые метрики: порты, байты, длительность */
 			cev.net_local_port = ne->local_port;
 			cev.net_remote_port = ne->remote_port;
 			cev.net_conn_tx_bytes = ne->tx_bytes;
 			cev.net_conn_rx_bytes = ne->rx_bytes;
 			cev.net_duration_ms = ne->duration_ns / 1000000;
+
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
 
-	/* Handle signal events separately */
+	/* ── SIGNAL — доставка сигнала ───────────────────────────────────
+	 *
+	 * Редкое событие. Захватывает все сигналы (SIGTERM, SIGKILL, и т.д.).
+	 * Правило определяется сначала по отправителю, затем по получателю.
+	 * Имя процесса-получателя читается из /proc/<pid>/comm.
+	 */
 	if (type == EVENT_SIGNAL) {
 		if (size < sizeof(struct signal_event))
 			return 0;
 		const struct signal_event *se = data;
 
-		/* Resolve rule name from sender or target */
+		/* Определяем правило: сначала по отправителю, потом по получателю */
 		struct track_info ti;
 		const char *rname = "?";
 		if (bpf_map_lookup_elem(tracked_map_fd, &se->sender_tgid, &ti) == 0)
@@ -1517,6 +1576,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			const char *cg = resolve_cgroup(se->cgroup_id);
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+
+			/* Время: clock_gettime (сигналы редкие, допустим syscall) */
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
@@ -1525,12 +1586,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 				 "signal");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
 
-			/* Tags: try sender first, then target */
+			/* Теги: сначала отправителя, потом получателя */
 			const char *sig_tags = tags_lookup(se->sender_tgid);
 			if (!sig_tags[0])
 				sig_tags = tags_lookup(se->target_pid);
 			snprintf(cev.tags, sizeof(cev.tags), "%s", sig_tags);
 
+			/* Данные отправителя из tracked_map */
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&se->sender_tgid, &ti) == 0) {
 				cev.root_pid = ti.root_pid;
@@ -1543,7 +1605,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
 					 "%s", cg);
 
-			/* Sender identity from proc_info */
+			/* Идентификация отправителя из proc_info (loginuid, tty, ...) */
 			struct proc_info sender_pi;
 			if (bpf_map_lookup_elem(proc_map_fd,
 						&se->sender_tgid,
@@ -1554,13 +1616,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cev.tty_nr = sender_pi.tty_nr;
 			}
 
-			/* Signal-specific fields */
+			/* Поля сигнала: номер, PID получателя, код, результат */
 			cev.sig_num = (__u32)se->sig;
 			cev.sig_target_pid = se->target_pid;
 			cev.sig_code = se->sig_code;
 			cev.sig_result = se->sig_result;
 
-			/* Read target comm from /proc */
+			/* Чтение имени процесса-получателя из /proc/<pid>/comm */
 			char tcomm_path[64], tcomm_buf[COMM_LEN + 2];
 			snprintf(tcomm_path, sizeof(tcomm_path),
 				 "/proc/%u/comm", se->target_pid);
@@ -1580,7 +1642,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
-	/* Handle TCP retransmit events */
+	/* ── TCP_RETRANSMIT — повторная передача TCP-сегмента ────────────
+	 *
+	 * Редкое событие. Симптом потери пакетов, перегрузки сети или DDoS.
+	 * НЕ фильтруется по tracked_map — захватывает ВСЕ соединения на хосте.
+	 */
 	if (type == EVENT_TCP_RETRANSMIT) {
 		if (size < sizeof(struct retransmit_event))
 			return 0;
@@ -1593,6 +1659,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+
+			/* Время: clock_gettime (ретрансмиты редкие) */
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
@@ -1606,7 +1674,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			if (cg)
 				snprintf(cev.cgroup, sizeof(cev.cgroup),
 					 "%s", cg);
-			/* Resolve rule */
+
+			/* Определяем правило, если процесс отслеживается */
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&re->tgid, &ti) == 0) {
@@ -1617,7 +1686,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 				const char *t = tags_lookup(re->tgid);
 				snprintf(cev.tags, sizeof(cev.tags), "%s", t);
 			}
-			/* Address fields */
+
+			/* Адреса и порты TCP-соединения */
 			cev.sec_af = re->af;
 			cev.sec_local_port = re->local_port;
 			cev.sec_remote_port = re->remote_port;
@@ -1646,7 +1716,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
-	/* Handle SYN recv events */
+	/* ── SYN_RECV — входящий SYN-запрос (полу-открытое соединение) ───
+	 *
+	 * Редкое событие. Полезно для обнаружения SYN flood атак.
+	 * НЕ фильтруется по tracked_map — захватывает ВСЕ входящие SYN.
+	 */
 	if (type == EVENT_SYN_RECV) {
 		if (size < sizeof(struct syn_event))
 			return 0;
@@ -1713,7 +1787,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
-	/* Handle RST events */
+	/* ── RST — отправка/получение TCP RST пакета ────────────────────
+	 *
+	 * Редкое событие. Много RST = сканирование портов или обрыв соединений.
+	 * НЕ фильтруется по tracked_map — захватывает ВСЕ RST на хосте.
+	 * Поле direction: 0 = отправлен (sent), 1 = получен (recv).
+	 */
 	if (type == EVENT_RST) {
 		if (size < sizeof(struct rst_event))
 			return 0;
@@ -1781,27 +1860,34 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
+	/* ── Основные события жизненного цикла процесса ─────────────────
+	 *
+	 * Общая структура struct event (содержит cmdline, proc info и т.д.).
+	 * EXEC, FORK, EXIT — по ~4/сек каждый, OOM_KILL — крайне редкий.
+	 */
 	const struct event *e = data;
 	if (size < sizeof(*e))
 		return 0;
 
 	switch (e->type) {
+
+	/* ── EXEC — вызов exec (запуск нового процесса) ──────────────── */
 	case EVENT_EXEC: {
-		/* Already tracked? Just update proc_info (BPF did it too) */
+		/* Уже отслеживается? BPF обновил proc_info, нам делать нечего */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
 			break;
 
-		/* Convert cmdline for regex matching */
+		/* Преобразуем cmdline из BPF (нуль-разделённые аргументы) в строку */
 		char cmdline[CMDLINE_MAX + 1];
 		cmdline_to_str(e->cmdline, e->cmdline_len, cmdline, sizeof(cmdline));
 
-		/* Match against all rules */
+		/* Проверяем все правила (regexec × N правил) — тяжёлый, но exec редкий */
 		char tags_buf[TAGS_MAX_LEN];
 		int first = match_rules_all(cmdline, tags_buf,
 					    sizeof(tags_buf));
 		if (first >= 0 && !rules[first].ignore) {
-			/* Match — start tracking */
+			/* Совпадение — начинаем отслеживание */
 			struct track_info new_ti = {
 				.root_pid = e->tgid,
 				.rule_id  = (__u16)first,
@@ -1811,6 +1897,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					    &new_ti, BPF_ANY);
 			tags_store(e->tgid, tags_buf);
 
+			/* Сохраняем метаданные процесса в proc_map */
 			struct proc_info pi = {0};
 			pi.tgid      = e->tgid;
 			pi.ppid      = e->ppid;
@@ -1825,7 +1912,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  e->tgid, rules[first].name, tags_buf,
 				  e->comm);
 
-			/* Send exec event to ClickHouse / event file */
+			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
 			if (g_http_cfg.enabled) {
 				const char *cg = resolve_cgroup(e->cgroup_id);
 				struct metric_event cev;
@@ -1839,6 +1926,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		break;
 	}
 
+	/* ── FORK — создание дочернего процесса ──────────────────────── */
 	case EVENT_FORK: {
 		/* BPF handle_fork уже создал tracked_map и proc_info записи.
 		 * Здесь только наследуем tags (они живут в userspace hash table). */
@@ -1847,14 +1935,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 			break;
 		tags_inherit(e->tgid, e->ppid);
 
-		/* Inherit tty_nr from parent proc_info (BPF can't read signal->tty).
-		 * Child inherits parent's controlling terminal on fork. */
+		/* Наследуем tty_nr от родителя (BPF не может читать signal->tty).
+		 * Дочерний процесс наследует управляющий терминал при fork. */
 		__u32 child_tty = 0;
 		{
 			struct proc_info parent_pi;
 			if (bpf_map_lookup_elem(proc_map_fd, &e->ppid, &parent_pi) == 0)
 				child_tty = parent_pi.tty_nr;
 		}
+		/* Если у родителя нет tty — читаем из /proc */
 		if (!child_tty)
 			child_tty = read_proc_tty_nr(e->tgid);
 		if (child_tty) {
@@ -1865,7 +1954,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 		}
 
-		/* Send fork event to ClickHouse / event file */
+		/* Отправляем fork-событие в буферный файл */
 		if (g_http_cfg.enabled) {
 			const char *rname = (parent_ti.rule_id < num_rules)
 				? rules[parent_ti.rule_id].name : "unknown";
@@ -1880,7 +1969,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		break;
 	}
 
+	/* ── EXIT — завершение процесса ──────────────────────────────── */
 	case EVENT_EXIT: {
+		/* Определяем rule_id — BPF передаёт его в event, но может быть невалидным */
 		__u32 exit_rule_id = e->rule_id;
 		if (exit_rule_id >= num_rules) {
 			struct track_info ti;
@@ -1891,12 +1982,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 		}
 		const char *rname = (exit_rule_id < num_rules)
 			? rules[exit_rule_id].name : "?";
+
+		/* Теги: если нет — пробуем отследить или наследовать от родителя */
 		const char *exit_tags = tags_lookup(e->tgid);
 		if (!exit_tags[0]) {
 			if (try_track_pid(e->tgid) < 0)
 				tags_inherit(e->tgid, e->ppid);
 			exit_tags = tags_lookup(e->tgid);
 		}
+
+		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
 		int sig = e->exit_code & 0x7f;
 		int status = (e->exit_code >> 8) & 0xff;
 
@@ -1907,21 +2002,24 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)(e->rss_max_pages * 4 / 1024),
 			  e->oom_killed ? " [OOM]" : "");
 
+		/* Сохраняем в кольцевой буфер завершённых процессов (для snapshot) */
 		record_exit(e);
 		tags_remove(e->tgid);
 
-		/* Send exit event to ClickHouse / event file */
+		/* Отправляем exit-событие в буферный файл */
 		if (g_http_cfg.enabled) {
 			const char *cg = resolve_cgroup(e->cgroup_id);
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg);
 			ef_append(&cev, cfg_hostname);
 		}
-		/* BPF already deleted from maps */
+		/* BPF уже удалил запись из tracked_map и proc_map */
 		break;
 	}
 
+	/* ── OOM_KILL — убийство процесса OOM killer ─────────────────── */
 	case EVENT_OOM_KILL: {
+		/* Пробуем определить правило: сначала по PID, потом по родителю */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) != 0)
 			try_track_pid(e->tgid);
@@ -1939,7 +2037,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		       e->tgid, rname, e->comm,
 		       (unsigned long long)(e->rss_pages * 4 / 1024));
 
-		/* Send oom_kill event to ClickHouse / event file */
+		/* Отправляем oom_kill-событие в буферный файл */
 		if (g_http_cfg.enabled) {
 			const char *cg = resolve_cgroup(e->cgroup_id);
 			struct metric_event cev;
@@ -1954,6 +2052,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		break;
 	}
 
+	/* Всегда 0 — не прерывает обработку ring buffer */
 	return 0;
 }
 
@@ -3061,6 +3160,7 @@ int main(int argc, char *argv[])
 
 	/* One-time startup scan: find already-running processes */
 	initial_scan();
+	refresh_boot_to_wall();
 
 	/* Start HTTP server if enabled */
 	if (g_http_cfg.enabled) {
@@ -3134,6 +3234,7 @@ int main(int argc, char *argv[])
 		time_t now = time(NULL);
 		if (now - last_snapshot >= cfg_snapshot_interval) {
 			build_cgroup_cache();
+			refresh_boot_to_wall();
 			write_snapshot();
 			last_snapshot = now;
 		}

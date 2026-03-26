@@ -107,13 +107,22 @@ static __always_inline int exec_rate_check(void)
 	if (!max_exec_events_per_sec)
 		return 1;
 
+	/* Поиск состояния rate limiter в BPF-карте по ключу.
+	 * Состояние (rate_state) хранит:
+	 *   window_ns — начало текущего секундного окна,
+	 *   count     — количество exec-событий в этом окне.
+	 * Возвращает указатель на значение или NULL если ключ не найден. */
 	rs = bpf_map_lookup_elem(&exec_rate, &key);
 	if (!rs)
 		return 1;
 
+	/* Монотонное время ядра в наносекундах (с момента загрузки).
+	 * Не зависит от смены системного времени (NTP, settimeofday). */
 	__u64 now = bpf_ktime_get_ns();
 
-	/* Новое 1-секундное окно — сброс счётчика */
+	/* Прошла ли 1 секунда (10⁹ нс) с начала текущего окна?
+	 * Если да — начинаем новое окно: сбрасываем счётчик,
+	 * текущее событие считается первым, пропускаем его. */
 	if (now - rs->window_ns >= 1000000000ULL) {
 		rs->window_ns = now;
 		rs->count = 1;
@@ -171,17 +180,32 @@ static __always_inline __u64 read_cpu_ns(struct task_struct *task)
 	return u + s;
 }
 
+/*
+ * Виртуальная память процесса в страницах.
+ * Читает mm->total_vm — общий размер адресного пространства.
+ * Для ядерных потоков (mm == NULL) возвращает 0.
+ */
 static __always_inline __u64 read_vsize_pages(struct task_struct *task)
 {
 	struct mm_struct *mm = BPF_CORE_READ(task, mm);
 	return mm ? (__u64)BPF_CORE_READ(mm, total_vm) : 0;
 }
 
+/*
+ * Количество потоков в группе (процессе).
+ * signal->nr_threads учитывает все живые потоки,
+ * включая group_leader.
+ */
 static __always_inline __u32 read_nr_threads(struct task_struct *task)
 {
 	return (__u32)BPF_CORE_READ(task, signal, nr_threads);
 }
 
+/*
+ * Корректировка OOM-score процесса (-1000..1000).
+ * Влияет на приоритет уничтожения при нехватке памяти:
+ * чем выше значение, тем вероятнее процесс будет убит OOM killer.
+ */
 static __always_inline __s16 read_oom_score_adj(struct task_struct *task)
 {
 	return (__s16)BPF_CORE_READ(task, signal, oom_score_adj);
@@ -192,8 +216,7 @@ static __always_inline __s16 read_oom_score_adj(struct task_struct *task)
  * task->ioac накапливается по всем потокам через signal->ioac при завершении,
  * но для живых потоков читаем из group_leader + signal.
  */
-static __always_inline void read_io_bytes(struct task_struct *task,
-					  __u64 *r, __u64 *w)
+static __always_inline void read_io_bytes(struct task_struct *task, __u64 *r, __u64 *w)
 {
 	/* signal->ioac накапливает IO завершённых потоков */
 	*r = BPF_CORE_READ(task, signal, ioac.read_bytes);
@@ -208,7 +231,19 @@ static __always_inline void read_io_bytes(struct task_struct *task,
 }
 
 /*
- * Страничные отказы: signal накапливает завершённые потоки, добавляем счётчики leader.
+ * Страничные отказы (page faults) — события, когда процесс обращается
+ * к странице памяти, которой нет в физической RAM.
+ *
+ * minor fault — страница найдена в page cache (например, уже загружена
+ *               другим процессом), копирование без обращения к диску.
+ * major fault — страница отсутствует, требуется чтение с диска (swap,
+ *               mmap-файл и т.д.), поэтому значительно медленнее.
+ *
+ * signal->cmaj_flt/cmin_flt — суммарные faults завершившихся потоков
+ *                              и дочерних процессов.
+ * leader->maj_flt/min_flt   — faults живого главного потока.
+ *
+ * Faults остальных живых потоков не учтены (ограничение BPF).
  */
 static __always_inline void read_faults(struct task_struct *task,
 					__u64 *maj, __u64 *min)
@@ -224,7 +259,16 @@ static __always_inline void read_faults(struct task_struct *task,
 }
 
 /*
- * Переключения контекста: signal накапливает завершённые потоки, добавляем счётчики leader.
+ * Переключения контекста (context switches) — события смены процесса на CPU.
+ *
+ * voluntary (nvcsw)   — поток сам отдал CPU: ждёт I/O, sleep, мьютекс.
+ *                       Нормальное поведение для I/O-bound задач.
+ * involuntary (nivcsw) — ядро принудительно сняло поток с CPU: истёк квант
+ *                        времени или появился более приоритетный поток.
+ *                        Много involuntary = нехватка CPU.
+ *
+ * signal накапливает завершённые потоки, добавляем счётчики leader.
+ * Живые рабочие потоки (кроме leader) не учтены (ограничение BPF).
  */
 static __always_inline void read_ctxsw(struct task_struct *task,
 					__u64 *vol, __u64 *invol)
@@ -240,8 +284,15 @@ static __always_inline void read_ctxsw(struct task_struct *task,
 }
 
 /*
- * I/O accounting: rchar/wchar/syscr/syscw (includes page cache, not just disk).
- * Same signal + leader pattern as read_io_bytes.
+ * Учёт ввода-вывода на уровне системных вызовов.
+ *
+ * rchar — байты, прочитанные через read/pread (включая page cache, не только диск).
+ * wchar — байты, записанные через write/pwrite (включая page cache).
+ * syscr — количество системных вызовов чтения (read, pread и т.д.).
+ * syscw — количество системных вызовов записи (write, pwrite и т.д.).
+ *
+ * signal накапливает завершённые потоки, добавляем счётчики leader.
+ * Живые рабочие потоки (кроме leader) не учтены (ограничение BPF).
  */
 static __always_inline void read_io_accounting(struct task_struct *task,
 					       __u64 *rchar, __u64 *wchar,
@@ -262,7 +313,11 @@ static __always_inline void read_io_accounting(struct task_struct *task,
 }
 
 /*
- * Read identity fields: loginuid, sessionid, euid.
+ * Идентификация процесса:
+ * loginuid   — UID пользователя, выполнившего вход (устанавливается PAM при логине,
+ *              не меняется при su/sudo). -1 (AUDIT_UID_UNSET) если не установлен.
+ * sessionid  — идентификатор сессии аудита (audit session).
+ * euid       — effective UID, определяющий права доступа процесса.
  */
 static __always_inline void read_identity(struct task_struct *task,
 					  __u32 *loginuid, __u32 *sessionid,
@@ -274,9 +329,11 @@ static __always_inline void read_identity(struct task_struct *task,
 }
 
 /*
- * Read controlling terminal device number.
- * Encodes as (major << 8 | (minor_start + index)), matching /proc/PID/stat tty_nr.
- * Returns 0 if no controlling tty.
+ * Номер управляющего терминала процесса (tty).
+ * Кодируется как (major << 8 | (minor_start + index)),
+ * совпадает с tty_nr из /proc/PID/stat.
+ * Возвращает 0, если у процесса нет управляющего терминала
+ * (демоны, сервисы, контейнерные процессы).
  */
 static __always_inline __u32 read_tty_nr(struct task_struct *task)
 {
@@ -296,7 +353,15 @@ static __always_inline __u32 read_tty_nr(struct task_struct *task)
 }
 
 /*
- * Read namespace inode numbers. nsproxy can be NULL during exit.
+ * Номера inode пространств имён (namespaces) процесса.
+ * Позволяют определить, в каком контейнере/изоляции работает процесс.
+ *
+ * mnt_ns    — пространство монтирования (изоляция файловой системы).
+ * pid_ns    — пространство PID (процесс видит свои PID'ы).
+ * net_ns    — сетевое пространство (изоляция сетевых интерфейсов).
+ * cgroup_ns — пространство cgroup (изоляция групп ресурсов).
+ *
+ * nsproxy может быть NULL во время завершения процесса.
  */
 static __always_inline void read_ns_inums(struct task_struct *task,
 					  __u32 *mnt_ns, __u32 *pid_ns,
@@ -348,8 +413,7 @@ static __always_inline __u8 state_to_char(long state)
  * Чтение cmdline из mm->arg_start..arg_end текущего процесса
  * в dst[CMDLINE_MAX]. Возвращает длину прочитанного.
  */
-static __always_inline __u16 read_cmdline(struct task_struct *task,
-					  char *dst)
+static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
 {
 	struct mm_struct *mm = BPF_CORE_READ(task, mm);
 	if (!mm)
@@ -372,6 +436,13 @@ static __always_inline __u16 read_cmdline(struct task_struct *task,
 
 /* ── EXEC ─────────────────────────────────────────────────────────── */
 
+/*
+ * Tracepoint sched_process_exec — срабатывает при вызове execve/execveat,
+ * когда процесс заменяет свой образ новой программой.
+ * В этот момент PID уже существует (создан через fork), но загружается
+ * новый бинарник — обновляются comm, cmdline, mm и другие метаданные.
+ * Используем для перечитывания информации о процессе после exec.
+ */
 SEC("tracepoint/sched/sched_process_exec")
 int handle_exec(void *ctx)
 {

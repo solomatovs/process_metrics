@@ -13,7 +13,28 @@
 #define COMM_LEN        16
 #define CMDLINE_MAX     256   /* must be power of 2 */
 #define MAX_PROCS       65536
-#define RINGBUF_SIZE    (1 << 20)  /* 1 MB */
+/*
+ * Размер кольцевого буфера для передачи событий из BPF в userspace.
+ * RINGBUF_EVENTS — желаемое количество событий (struct event) в буфере.
+ * Можно переопределить при компиляции: -DRINGBUF_EVENTS=4096
+ *
+ * Итоговый размер округляется вверх до степени двойки (требование ядра).
+ * Каждое событие занимает sizeof(struct event) + 8 байт заголовка ring buffer.
+ */
+#ifndef RINGBUF_EVENTS
+#define RINGBUF_EVENTS  2048
+#endif
+
+/* Вычисление ближайшей степени двойки >= x (compile-time, до 2^30) */
+#define _RINGBUF_POW2(x) \
+	((x) <= 1 ? 1 : \
+	 1U << (32 - __builtin_clz((unsigned)((x) - 1))))
+
+/* sizeof(struct event) ещё не известен здесь, используем оценку сверху.
+ * struct event ~= 448 байт, + 8 байт BPF_RINGBUF_HDR_SZ = 456, округляем до 512. */
+#define _RINGBUF_EVENT_SLOT  512
+
+#define RINGBUF_SIZE  _RINGBUF_POW2(RINGBUF_EVENTS * _RINGBUF_EVENT_SLOT)
 
 /*
  * Rate limiting state for exec events.
