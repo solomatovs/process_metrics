@@ -1361,7 +1361,7 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	/* open_conn_count: decrement */
 	__u32 tgid = si->tgid;
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
-	if (cnt && *cnt > 0) __sync_fetch_and_sub(cnt, 1);
+	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
 
 	emit_net_close(si, bpf_ktime_get_boot_ns());
 	bpf_map_delete_elem(&sock_map, &sk_ptr);
