@@ -39,6 +39,7 @@
 --       колонкой ключа, и без индекса ClickHouse сканировал бы все гранулы
 --       в пределах префикса (hostname, event_type, rule).
 
+DROP TABLE IF EXISTS process_metrics;
 CREATE TABLE IF NOT EXISTS process_metrics (
     -- ── идентификация ─────────────────────────────────────────────
     timestamp              DateTime64(3)               CODEC(Delta, ZSTD(1)),
@@ -202,6 +203,7 @@ SETTINGS
 -- RANDOMIZE FOR — при ошибке (например, перезапуск process_metrics)
 -- ClickHouse сдвигает следующий refresh на случайный интервал,
 -- чтобы избежать зависания планировщика.
+DROP VIEW IF EXISTS process_metrics_pull_server1;
 CREATE OR REPLACE MATERIALIZED VIEW process_metrics_pull_server1
 REFRESH EVERY 3 SECOND RANDOMIZE FOR 1 SECOND APPEND
 TO process_metrics
