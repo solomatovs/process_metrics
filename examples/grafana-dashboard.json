@@ -19,11 +19,11 @@
         "enable": true,
         "iconColor": "red",
         "name": "OOM Kill",
-        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp",
+        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp",
         "target": {
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp"
+          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp"
         }
       },
       {
@@ -34,11 +34,11 @@
         "enable": false,
         "iconColor": "orange",
         "name": "Non-Zero Exit",
-        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255)\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp",
+        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255)\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp",
         "target": {
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255)\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp"
+          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255)\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp"
         }
       }
     ]
@@ -371,7 +371,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count() AS events FROM default.process_metrics WHERE event_type IN ('fork','exec','exit','oom_kill') AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count() AS events FROM default.process_metrics WHERE event_type IN ('fork','exec','exit','oom_kill') AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -430,7 +430,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count() AS oom_kills FROM default.process_metrics WHERE event_type='oom_kill' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count() AS oom_kills FROM default.process_metrics WHERE event_type='oom_kill' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -521,7 +521,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND cpu_usage_ratio BETWEEN 0 AND 128\n  GROUP BY comm\n  ORDER BY avg(cpu_usage_ratio) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(cpu_usage_ratio) / countDistinct(timestamp) AS cpu_cores\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND cpu_usage_ratio BETWEEN 0 AND 128\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND cpu_usage_ratio BETWEEN 0 AND 128\n  GROUP BY comm\n  ORDER BY avg(cpu_usage_ratio) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(cpu_usage_ratio) / countDistinct(timestamp) AS cpu_cores\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND cpu_usage_ratio BETWEEN 0 AND 128\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -599,7 +599,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n  GROUP BY comm\n  ORDER BY avg(rss_bytes) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(rss_bytes) / countDistinct(timestamp) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "WITH top5 AS (\n  SELECT comm\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n  GROUP BY comm\n  ORDER BY avg(rss_bytes) DESC\n  LIMIT 5\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 3 SECOND) AS time,\n  if(comm IN (SELECT comm FROM top5), comm, 'other') AS process,\n  sum(rss_bytes) / countDistinct(timestamp) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1024,7 +1024,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) AS mem_current\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nHAVING max(cgroup_memory_current) > 10485760\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) AS mem_current\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nHAVING max(cgroup_memory_current) > 10485760\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1104,7 +1104,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) / max(cgroup_memory_max) AS usage_pct\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_max > 0\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  cgroup,\n  max(cgroup_memory_current) / max(cgroup_memory_max) AS usage_pct\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_memory_max > 0\n  AND cgroup_memory_current > 0\nGROUP BY time, cgroup\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1300,7 +1300,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(cpu_usage_ratio) AS cpu\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND cpu_usage_ratio > 0.001\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(cpu_usage_ratio) AS cpu\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND cpu_usage_ratio > 0.001\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1359,7 +1359,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(rss_bytes) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND rss_bytes > 1048576\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(rss_bytes) AS rss\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND rss_bytes > 1048576\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1418,7 +1418,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_read_bytes) AS io_read\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_read_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_read_bytes) AS io_read\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_read_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1477,7 +1477,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_write_bytes) AS io_write\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_write_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  max(io_write_bytes) AS io_write\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND io_write_bytes > 0\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1672,7 +1672,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  event_type,\n  count() AS cnt\nFROM default.process_metrics\nWHERE event_type IN ('fork','exec','exit','oom_kill')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  event_type,\n  count() AS cnt\nFROM default.process_metrics\nWHERE event_type IN ('fork','exec','exit','oom_kill')\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1728,7 +1728,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp,\n  event_type,\n  pid,\n  comm,\n  exec,\n  rule,\n  exit_code\nFROM default.process_metrics\nWHERE event_type IN ('exec','exit','oom_kill')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 50",
+          "rawSql": "SELECT\n  timestamp,\n  event_type,\n  pid,\n  comm,\n  exec,\n  rule,\n  exit_code\nFROM default.process_metrics\nWHERE event_type IN ('exec','exit','oom_kill')\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 50",
           "refId": "A"
         }
       ],
@@ -1798,7 +1798,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  count() AS connections\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nHAVING connections > 1\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  count() AS connections\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nHAVING connections > 1\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1859,7 +1859,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] TX') AS series,\n  sum(net_conn_tx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_tx_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] TX') AS series,\n  sum(net_conn_tx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_tx_bytes > 0\nGROUP BY time, series\nORDER BY time",
           "refId": "TX"
         },
         {
@@ -1869,7 +1869,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] RX') AS series,\n  sum(net_conn_rx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_rx_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] RX') AS series,\n  sum(net_conn_rx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND net_conn_rx_bytes > 0\nGROUP BY time, series\nORDER BY time",
           "refId": "RX"
         }
       ],
@@ -2078,7 +2078,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT *,\n  (connections / nullIf(max(connections) OVER (), 0)\n + io_total / nullIf(max(io_total) OVER (), 0)\n + avg_duration_ms / nullIf(max(avg_duration_ms) OVER (), 0)) AS rating\nFROM (\n  SELECT\n    comm,\n    concat(net_local_addr, ':', toString(net_local_port)) AS local,\n    concat(net_remote_addr, ':', toString(net_remote_port)) AS remote,\n    count() AS connections,\n    sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes) AS io_total,\n    if(sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes) > 0, sum(net_conn_tx_bytes) / (sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes)), 0) AS io_rw,\n    avg(net_duration_ms) AS avg_duration_ms\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND comm != 'process_metr'\n  GROUP BY comm, net_local_addr, net_local_port, net_remote_addr, net_remote_port\n)\nORDER BY rating DESC\nLIMIT 100",
+          "rawSql": "SELECT *,\n  (connections / nullIf(max(connections) OVER (), 0)\n + io_total / nullIf(max(io_total) OVER (), 0)\n + avg_duration_ms / nullIf(max(avg_duration_ms) OVER (), 0)) AS rating\nFROM (\n  SELECT\n    comm,\n    concat(net_local_addr, ':', toString(net_local_port)) AS local,\n    concat(net_remote_addr, ':', toString(net_remote_port)) AS remote,\n    count() AS connections,\n    sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes) AS io_total,\n    if(sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes) > 0, sum(net_conn_tx_bytes) / (sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes)), 0) AS io_rw,\n    avg(net_duration_ms) AS avg_duration_ms\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND comm != 'process_metr'\n  GROUP BY comm, net_local_addr, net_local_port, net_remote_addr, net_remote_port\n)\nORDER BY rating DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -2247,7 +2247,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  net_local_addr,\n  net_local_port,\n  net_remote_addr,\n  net_remote_port,\n  net_conn_tx_bytes + net_conn_rx_bytes AS io_total,\n  if(net_conn_tx_bytes + net_conn_rx_bytes > 0, net_conn_tx_bytes / (net_conn_tx_bytes + net_conn_rx_bytes), 0) AS io_rw,\n  net_duration_ms AS duration_ms\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR comm ILIKE '%${process_search}%')\nORDER BY timestamp DESC\nLIMIT 100",
+          "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  net_local_addr,\n  net_local_port,\n  net_remote_addr,\n  net_remote_port,\n  net_conn_tx_bytes + net_conn_rx_bytes AS io_total,\n  if(net_conn_tx_bytes + net_conn_rx_bytes > 0, net_conn_tx_bytes / (net_conn_tx_bytes + net_conn_rx_bytes), 0) AS io_rw,\n  net_duration_ms AS duration_ms\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND (length('${process_search}') = 0 OR comm ILIKE '%${process_search}%')\nORDER BY timestamp DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -2317,7 +2317,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  count() AS file_ops\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nHAVING file_ops > 1\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), ']') AS process,\n  count() AS file_ops\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nGROUP BY time, process\nHAVING file_ops > 1\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -2378,7 +2378,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] write') AS series,\n  sum(file_write_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_write_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] write') AS series,\n  sum(file_write_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_write_bytes > 0\nGROUP BY time, series\nORDER BY time",
           "refId": "W"
         },
         {
@@ -2388,7 +2388,7 @@
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] read') AS series,\n  sum(file_read_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_read_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  concat(comm, ' [', toString(pid), '] read') AS series,\n  sum(file_read_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_read_bytes > 0\nGROUP BY time, series\nORDER BY time",
           "refId": "R"
         }
       ],
@@ -2526,7 +2526,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  file_path,\n  count() AS open_count,\n  groupUniqArray(comm) AS processes,\n  sum(file_read_bytes) + sum(file_write_bytes) AS io_total,\n  if(sum(file_read_bytes) + sum(file_write_bytes) > 0, sum(file_write_bytes) / (sum(file_read_bytes) + sum(file_write_bytes)), 0) AS io_rw\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nGROUP BY file_path\nORDER BY open_count DESC\nLIMIT 100",
+          "rawSql": "SELECT\n  file_path,\n  count() AS open_count,\n  groupUniqArray(comm) AS processes,\n  sum(file_read_bytes) + sum(file_write_bytes) AS io_total,\n  if(sum(file_read_bytes) + sum(file_write_bytes) > 0, sum(file_write_bytes) / (sum(file_read_bytes) + sum(file_write_bytes)), 0) AS io_rw\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nGROUP BY file_path\nORDER BY open_count DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -2664,7 +2664,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  file_path,\n  file_read_bytes + file_write_bytes AS io_total,\n  if(file_read_bytes + file_write_bytes > 0, file_write_bytes / (file_read_bytes + file_write_bytes), 0) AS io_rw,\n  file_open_count\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 100",
+          "rawSql": "SELECT\n  timestamp,\n  pid,\n  comm,\n  file_path,\n  file_read_bytes + file_write_bytes AS io_total,\n  if(file_read_bytes + file_write_bytes > 0, file_write_bytes / (file_read_bytes + file_write_bytes), 0) AS io_rw,\n  file_open_count\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\n  AND file_path != ''\n  AND (length('${process_search}') = 0 OR (file_path ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%'))\nORDER BY timestamp DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -2717,7 +2717,7 @@
           },
           "format": 2,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    'uid=', toString(loginuid),\n    ' tty=pts/', toString(tty_nr - 34816),\n    ' rc=', toString(exit_code),\n    ' | ',\n    exec,\n    if(args != '', concat(' ', args), '')\n  ) AS body,\n  if(exit_code = 0, 'info', 'error') AS level,\n  toString(loginuid) AS uid,\n  concat('pts/', toString(tty_nr - 34816)) AS tty,\n  comm,\n  toString(exit_code) AS rc\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND tty_nr >= 34816\n  AND loginuid != 4294967295\n  AND loginuid > 0\n  AND exec NOT LIKE '%shellIntegration%'\n  AND exec NOT LIKE '%-bash%'\n  AND exec NOT LIKE '%/bash'\n  AND exec NOT LIKE '%/zsh'\n  AND comm NOT IN ('bash', 'zsh', 'sh', 'fish')\n  AND comm NOT IN ('mesg', 'dircolors', 'tput', 'lesspipe', 'lessfile', 'basename', 'dirname')\n  AND NOT (comm = 'id' AND args IN ('-u', '-un', '-g', '-gn'))\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    'uid=', toString(loginuid),\n    ' tty=pts/', toString(tty_nr - 34816),\n    ' rc=', toString(exit_code),\n    ' | ',\n    exec,\n    if(args != '', concat(' ', args), '')\n  ) AS body,\n  if(exit_code = 0, 'info', 'error') AS level,\n  toString(loginuid) AS uid,\n  concat('pts/', toString(tty_nr - 34816)) AS tty,\n  comm,\n  toString(exit_code) AS rc\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND tty_nr >= 34816\n  AND loginuid != 4294967295\n  AND loginuid > 0\n  AND exec NOT LIKE '%shellIntegration%'\n  AND exec NOT LIKE '%-bash%'\n  AND exec NOT LIKE '%/bash'\n  AND exec NOT LIKE '%/zsh'\n  AND comm NOT IN ('bash', 'zsh', 'sh', 'fish')\n  AND comm NOT IN ('mesg', 'dircolors', 'tput', 'lesspipe', 'lessfile', 'basename', 'dirname')\n  AND NOT (comm = 'id' AND args IN ('-u', '-un', '-g', '-gn'))\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -2766,7 +2766,7 @@
           },
           "format": 2,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    comm,\n    '[', toString(pid), ']',\n    ' → ',\n    'SIG', CASE sig_num\n      WHEN 1 THEN 'HUP'\n      WHEN 2 THEN 'INT'\n      WHEN 3 THEN 'QUIT'\n      WHEN 6 THEN 'ABRT'\n      WHEN 9 THEN 'KILL'\n      WHEN 10 THEN 'USR1'\n      WHEN 12 THEN 'USR2'\n      WHEN 13 THEN 'PIPE'\n      WHEN 14 THEN 'ALRM'\n      WHEN 15 THEN 'TERM'\n      WHEN 17 THEN 'CHLD'\n      WHEN 19 THEN 'STOP'\n      WHEN 20 THEN 'TSTP'\n      ELSE toString(sig_num)\n    END,\n    ' → ',\n    sig_target_comm,\n    '[', toString(sig_target_pid), ']',\n    if(sig_result != 0, concat(' FAILED(', toString(sig_result), ')'), '')\n  ) AS body,\n  if(sig_result = 0, if(sig_num = 9, 'error', 'info'), 'warning') AS level,\n  comm AS sender,\n  toString(pid) AS sender_pid,\n  sig_target_comm AS target,\n  toString(sig_target_pid) AS target_pid,\n  toString(sig_num) AS signal,\n  rule\nFROM default.process_metrics\nWHERE event_type = 'signal'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    comm,\n    '[', toString(pid), ']',\n    ' → ',\n    'SIG', CASE sig_num\n      WHEN 1 THEN 'HUP'\n      WHEN 2 THEN 'INT'\n      WHEN 3 THEN 'QUIT'\n      WHEN 6 THEN 'ABRT'\n      WHEN 9 THEN 'KILL'\n      WHEN 10 THEN 'USR1'\n      WHEN 12 THEN 'USR2'\n      WHEN 13 THEN 'PIPE'\n      WHEN 14 THEN 'ALRM'\n      WHEN 15 THEN 'TERM'\n      WHEN 17 THEN 'CHLD'\n      WHEN 19 THEN 'STOP'\n      WHEN 20 THEN 'TSTP'\n      ELSE toString(sig_num)\n    END,\n    ' → ',\n    sig_target_comm,\n    '[', toString(sig_target_pid), ']',\n    if(sig_result != 0, concat(' FAILED(', toString(sig_result), ')'), '')\n  ) AS body,\n  if(sig_result = 0, if(sig_num = 9, 'error', 'info'), 'warning') AS level,\n  comm AS sender,\n  toString(pid) AS sender_pid,\n  sig_target_comm AS target,\n  toString(sig_target_pid) AS target_pid,\n  toString(sig_num) AS signal,\n  rule\nFROM default.process_metrics\nWHERE event_type = 'signal'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -2819,7 +2819,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    if(event_type = 'oom_kill', '🔴 OOM KILL', concat('⚠️ EXIT rc=', toString(exit_code))),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), ''),\n    if(event_type = 'oom_kill', concat(' | RSS max: ', formatReadableSize(rss_max_bytes)), '')\n  ) AS body,\n  if(event_type = 'oom_kill', 'critical', 'error') AS level,\n  event_type,\n  comm,\n  toString(pid) AS pid,\n  toString(exit_code) AS rc,\n  rule,\n  cgroup\nFROM default.process_metrics\nWHERE (\n    ('${error_filter}' = 'all' AND (event_type = 'oom_kill' OR (event_type = 'exit' AND exit_code != 0\n      AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255))))\n    OR ('${error_filter}' = 'oom_kill' AND event_type = 'oom_kill')\n    OR ('${error_filter}' = 'exit' AND event_type = 'exit' AND exit_code != 0\n      AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255))\n  )\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    if(event_type = 'oom_kill', '🔴 OOM KILL', concat('⚠️ EXIT rc=', toString(exit_code))),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), ''),\n    if(event_type = 'oom_kill', concat(' | RSS max: ', formatReadableSize(rss_max_bytes)), '')\n  ) AS body,\n  if(event_type = 'oom_kill', 'critical', 'error') AS level,\n  event_type,\n  comm,\n  toString(pid) AS pid,\n  toString(exit_code) AS rc,\n  rule,\n  cgroup\nFROM default.process_metrics\nWHERE (\n    ('${error_filter}' = 'all' AND (event_type = 'oom_kill' OR (event_type = 'exit' AND exit_code != 0\n      AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255))))\n    OR ('${error_filter}' = 'oom_kill' AND event_type = 'oom_kill')\n    OR ('${error_filter}' = 'exit' AND event_type = 'exit' AND exit_code != 0\n      AND NOT (comm IN ('grep', 'kafka-run-class', 'ls', 'runc', 'runc:[2:INIT]', 'bash', 'iptables') AND exit_code IN (1, 2))\n    AND NOT (comm = 'sshd' AND exit_code = 255))\n  )\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND rule IN (${rule:sqlstring})\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -3002,7 +3002,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_used_bytes) / avg(disk_total_bytes) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_used_bytes) / avg(disk_total_bytes) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -3059,7 +3059,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_avail_bytes) AS available\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time,\n  concat(comm, ' (', file_path, ')') AS disk,\n  avg(disk_avail_bytes) AS available\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND disk_total_bytes > 0\nGROUP BY time, disk\nORDER BY time",
           "refId": "A"
         }
       ],

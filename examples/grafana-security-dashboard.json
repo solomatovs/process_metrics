@@ -130,7 +130,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count() AS retransmits FROM default.process_metrics WHERE event_type = 'tcp_retrans' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count() AS retransmits FROM default.process_metrics WHERE event_type = 'tcp_retrans' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -193,7 +193,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count() AS syn_packets FROM default.process_metrics WHERE event_type = 'syn_recv' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count() AS syn_packets FROM default.process_metrics WHERE event_type = 'syn_recv' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -256,7 +256,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count() AS rst_packets FROM default.process_metrics WHERE event_type IN ('rst_sent', 'rst_recv') AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count() AS rst_packets FROM default.process_metrics WHERE event_type IN ('rst_sent', 'rst_recv') AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -319,7 +319,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT sum(file_read_bytes + file_write_bytes) AS udp_packets FROM default.process_metrics WHERE event_type = 'udp_agg' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT sum(file_read_bytes + file_write_bytes) AS udp_packets FROM default.process_metrics WHERE event_type = 'udp_agg' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -382,7 +382,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT sum(open_tcp_conns) AS icmp_packets FROM default.process_metrics WHERE event_type = 'icmp_agg' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT sum(open_tcp_conns) AS icmp_packets FROM default.process_metrics WHERE event_type = 'icmp_agg' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -445,7 +445,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT count(DISTINCT sec_remote_addr) AS unique_ips FROM default.process_metrics WHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv') AND sec_remote_addr != '' AND $__timeFilter(timestamp) AND hostname IN (${hostname:sqlstring})",
+          "rawSql": "SELECT count(DISTINCT sec_remote_addr) AS unique_ips FROM default.process_metrics WHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv') AND sec_remote_addr != '' AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3) AND hostname IN (${hostname:sqlstring})",
           "refId": "A"
         }
       ],
@@ -515,7 +515,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  event_type,\n  CASE\n    WHEN event_type = 'udp_agg' THEN sum(file_read_bytes + file_write_bytes)\n    WHEN event_type = 'icmp_agg' THEN sum(open_tcp_conns)\n    ELSE count()\n  END AS events\nFROM default.process_metrics\nWHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv', 'udp_agg', 'icmp_agg')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  event_type,\n  CASE\n    WHEN event_type = 'udp_agg' THEN sum(file_read_bytes + file_write_bytes)\n    WHEN event_type = 'icmp_agg' THEN sum(open_tcp_conns)\n    ELSE count()\n  END AS events\nFROM default.process_metrics\nWHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv', 'udp_agg', 'icmp_agg')\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -585,7 +585,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  event_type,\n  count() AS events\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  event_type,\n  count() AS events\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, event_type\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -625,7 +625,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  count() AS total_events,\n  uniq(sec_local_port) AS unique_ports,\n  groupUniqArrayIf(10)(toString(sec_local_port), sec_local_port > 0) AS scanned_ports,\n  min(timestamp) AS first_seen,\n  max(timestamp) AS last_seen\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr\nORDER BY unique_ports DESC, total_events DESC\nLIMIT 50",
+          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  count() AS total_events,\n  uniq(sec_local_port) AS unique_ports,\n  groupUniqArrayIf(10)(toString(sec_local_port), sec_local_port > 0) AS scanned_ports,\n  min(timestamp) AS first_seen,\n  max(timestamp) AS last_seen\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr\nORDER BY unique_ports DESC, total_events DESC\nLIMIT 50",
           "refId": "A"
         }
       ],
@@ -665,7 +665,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  sec_local_port AS port,\n  countIf(event_type = 'syn_recv') AS syn_count,\n  countIf(event_type = 'rst_sent') AS rst_sent,\n  countIf(event_type = 'rst_recv') AS rst_recv,\n  uniq(sec_remote_addr) AS unique_sources\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND sec_local_port > 0\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_local_port\nORDER BY syn_count DESC\nLIMIT 30",
+          "rawSql": "SELECT\n  sec_local_port AS port,\n  countIf(event_type = 'syn_recv') AS syn_count,\n  countIf(event_type = 'rst_sent') AS rst_sent,\n  countIf(event_type = 'rst_recv') AS rst_recv,\n  uniq(sec_remote_addr) AS unique_sources\nFROM default.process_metrics\nWHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv')\n  AND sec_local_port > 0\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_local_port\nORDER BY syn_count DESC\nLIMIT 30",
           "refId": "A"
         }
       ],
@@ -720,7 +720,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sec_remote_addr AS source,\n  count() AS events\nFROM default.process_metrics\nWHERE event_type = 'syn_recv'\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'syn_recv'\n      AND $__timeFilter(timestamp)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY count() DESC\n    LIMIT 10\n  )\nGROUP BY time, source\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sec_remote_addr AS source,\n  count() AS events\nFROM default.process_metrics\nWHERE event_type = 'syn_recv'\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'syn_recv'\n      AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY count() DESC\n    LIMIT 10\n  )\nGROUP BY time, source\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -790,7 +790,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  count() AS retransmits\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  count() AS retransmits\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -830,7 +830,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  sec_remote_port AS remote_port,\n  count() AS retransmits,\n  uniq(pid) AS processes,\n  groupUniqArray(5)(comm) AS commands,\n  any(sec_tcp_state) AS tcp_state\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr, sec_remote_port\nORDER BY retransmits DESC\nLIMIT 30",
+          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  sec_remote_port AS remote_port,\n  count() AS retransmits,\n  uniq(pid) AS processes,\n  groupUniqArray(5)(comm) AS commands,\n  any(sec_tcp_state) AS tcp_state\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr, sec_remote_port\nORDER BY retransmits DESC\nLIMIT 30",
           "refId": "A"
         }
       ],
@@ -885,7 +885,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  concat(sec_remote_addr, ':', toString(sec_remote_port)) AS destination,\n  count() AS retransmits\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'tcp_retrans'\n      AND $__timeFilter(timestamp)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY count() DESC\n    LIMIT 10\n  )\nGROUP BY time, destination\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  concat(sec_remote_addr, ':', toString(sec_remote_port)) AS destination,\n  count() AS retransmits\nFROM default.process_metrics\nWHERE event_type = 'tcp_retrans'\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'tcp_retrans'\n      AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY count() DESC\n    LIMIT 10\n  )\nGROUP BY time, destination\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -954,7 +954,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(file_read_bytes) AS rx_packets,\n  sum(file_write_bytes) AS tx_packets\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(file_read_bytes) AS rx_packets,\n  sum(file_write_bytes) AS tx_packets\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1011,7 +1011,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(net_rx_bytes) AS rx_bytes,\n  sum(net_tx_bytes) AS tx_bytes\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(net_rx_bytes) AS rx_bytes,\n  sum(net_tx_bytes) AS tx_bytes\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1051,7 +1051,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  sec_remote_port AS remote_port,\n  sum(file_read_bytes + file_write_bytes) AS total_packets,\n  sum(net_rx_bytes + net_tx_bytes) AS total_bytes,\n  sum(file_read_bytes) AS rx_packets,\n  sum(file_write_bytes) AS tx_packets,\n  groupUniqArray(5)(comm) AS processes\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr, sec_remote_port\nORDER BY total_packets DESC\nLIMIT 30",
+          "rawSql": "SELECT\n  sec_remote_addr AS remote_ip,\n  sec_remote_port AS remote_port,\n  sum(file_read_bytes + file_write_bytes) AS total_packets,\n  sum(net_rx_bytes + net_tx_bytes) AS total_bytes,\n  sum(file_read_bytes) AS rx_packets,\n  sum(file_write_bytes) AS tx_packets,\n  groupUniqArray(5)(comm) AS processes\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_remote_addr, sec_remote_port\nORDER BY total_packets DESC\nLIMIT 30",
           "refId": "A"
         }
       ],
@@ -1106,7 +1106,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  concat(sec_remote_addr, ':', toString(sec_remote_port)) AS destination,\n  sum(file_read_bytes + file_write_bytes) AS packets\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND sec_remote_addr != ''\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'udp_agg'\n      AND $__timeFilter(timestamp)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY sum(file_read_bytes + file_write_bytes) DESC\n    LIMIT 10\n  )\nGROUP BY time, destination\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  concat(sec_remote_addr, ':', toString(sec_remote_port)) AS destination,\n  sum(file_read_bytes + file_write_bytes) AS packets\nFROM default.process_metrics\nWHERE event_type = 'udp_agg'\n  AND sec_remote_addr != ''\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_remote_addr IN (\n    SELECT sec_remote_addr\n    FROM default.process_metrics\n    WHERE event_type = 'udp_agg'\n      AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_remote_addr\n    ORDER BY sum(file_read_bytes + file_write_bytes) DESC\n    LIMIT 10\n  )\nGROUP BY time, destination\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1174,7 +1174,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  CASE sec_tcp_state\n    WHEN 0 THEN 'Echo Reply'\n    WHEN 3 THEN 'Dest Unreachable'\n    WHEN 8 THEN 'Echo Request'\n    WHEN 11 THEN 'Time Exceeded'\n    ELSE concat('type=', toString(sec_tcp_state))\n  END AS icmp_type,\n  sum(open_tcp_conns) AS packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, icmp_type\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  CASE sec_tcp_state\n    WHEN 0 THEN 'Echo Reply'\n    WHEN 3 THEN 'Dest Unreachable'\n    WHEN 8 THEN 'Echo Request'\n    WHEN 11 THEN 'Time Exceeded'\n    ELSE concat('type=', toString(sec_tcp_state))\n  END AS icmp_type,\n  sum(open_tcp_conns) AS packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, icmp_type\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1214,7 +1214,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  sec_local_addr AS source_ip,\n  CASE sec_tcp_state\n    WHEN 0 THEN 'Echo Reply'\n    WHEN 3 THEN 'Dest Unreachable'\n    WHEN 8 THEN 'Echo Request'\n    WHEN 11 THEN 'Time Exceeded'\n    ELSE concat('type=', toString(sec_tcp_state))\n  END AS icmp_type,\n  sec_direction AS icmp_code,\n  sum(open_tcp_conns) AS total_packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_local_addr, sec_tcp_state, sec_direction\nORDER BY total_packets DESC\nLIMIT 30",
+          "rawSql": "SELECT\n  sec_local_addr AS source_ip,\n  CASE sec_tcp_state\n    WHEN 0 THEN 'Echo Reply'\n    WHEN 3 THEN 'Dest Unreachable'\n    WHEN 8 THEN 'Echo Request'\n    WHEN 11 THEN 'Time Exceeded'\n    ELSE concat('type=', toString(sec_tcp_state))\n  END AS icmp_type,\n  sec_direction AS icmp_code,\n  sum(open_tcp_conns) AS total_packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY sec_local_addr, sec_tcp_state, sec_direction\nORDER BY total_packets DESC\nLIMIT 30",
           "refId": "A"
         }
       ],
@@ -1269,7 +1269,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sec_local_addr AS source,\n  sum(open_tcp_conns) AS packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_local_addr IN (\n    SELECT sec_local_addr\n    FROM default.process_metrics\n    WHERE event_type = 'icmp_agg'\n      AND $__timeFilter(timestamp)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_local_addr\n    ORDER BY sum(open_tcp_conns) DESC\n    LIMIT 10\n  )\nGROUP BY time, source\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sec_local_addr AS source,\n  sum(open_tcp_conns) AS packets\nFROM default.process_metrics\nWHERE event_type = 'icmp_agg'\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\n  AND sec_local_addr IN (\n    SELECT sec_local_addr\n    FROM default.process_metrics\n    WHERE event_type = 'icmp_agg'\n      AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n      AND hostname IN (${hostname:sqlstring})\n    GROUP BY sec_local_addr\n    ORDER BY sum(open_tcp_conns) DESC\n    LIMIT 10\n  )\nGROUP BY time, source\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1337,7 +1337,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  comm AS process,\n  max(open_tcp_conns) AS connections\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, comm\nHAVING connections > 0\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  comm AS process,\n  max(open_tcp_conns) AS connections\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time, comm\nHAVING connections > 0\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1377,7 +1377,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  comm AS process,\n  pid,\n  max(open_tcp_conns) AS max_conns,\n  avg(open_tcp_conns) AS avg_conns,\n  exec AS executable\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY comm, pid, exec\nORDER BY max_conns DESC\nLIMIT 30",
+          "rawSql": "SELECT\n  comm AS process,\n  pid,\n  max(open_tcp_conns) AS max_conns,\n  avg(open_tcp_conns) AS avg_conns,\n  exec AS executable\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY comm, pid, exec\nORDER BY max_conns DESC\nLIMIT 30",
           "refId": "A"
         }
       ],
@@ -1433,7 +1433,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(open_tcp_conns) AS total_connections\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${agg_interval} MINUTE) AS time,\n  sum(open_tcp_conns) AS total_connections\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND open_tcp_conns > 0\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -1485,7 +1485,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "WITH per_ip AS (\n  SELECT\n    sec_remote_addr AS ip,\n    countIf(event_type = 'syn_recv') AS syns,\n    countIf(event_type IN ('rst_sent', 'rst_recv')) AS rsts,\n    countIf(event_type = 'tcp_retrans') AS retrans,\n    uniqIf(sec_local_port, event_type = 'syn_recv') AS unique_ports_scanned,\n    min(timestamp) AS first_seen,\n    max(timestamp) AS last_seen\n  FROM default.process_metrics\n  WHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv', 'tcp_retrans')\n    AND sec_remote_addr != ''\n    AND $__timeFilter(timestamp)\n    AND hostname IN (${hostname:sqlstring})\n  GROUP BY sec_remote_addr\n)\nSELECT\n  ip,\n  syns,\n  rsts,\n  retrans,\n  unique_ports_scanned,\n  first_seen,\n  last_seen,\n  round(\n    syns * 1.0 +\n    rsts * 0.5 +\n    retrans * 0.3 +\n    unique_ports_scanned * 5.0\n  , 1) AS anomaly_score,\n  multiIf(\n    unique_ports_scanned >= 10, 'PORT SCAN',\n    syns >= 100, 'SYN FLOOD',\n    rsts >= 50, 'RST FLOOD',\n    retrans >= 200, 'HIGH RETRANSMIT',\n    'NORMAL'\n  ) AS verdict\nFROM per_ip\nWHERE syns + rsts + retrans > 0\nORDER BY anomaly_score DESC\nLIMIT 50",
+          "rawSql": "WITH per_ip AS (\n  SELECT\n    sec_remote_addr AS ip,\n    countIf(event_type = 'syn_recv') AS syns,\n    countIf(event_type IN ('rst_sent', 'rst_recv')) AS rsts,\n    countIf(event_type = 'tcp_retrans') AS retrans,\n    uniqIf(sec_local_port, event_type = 'syn_recv') AS unique_ports_scanned,\n    min(timestamp) AS first_seen,\n    max(timestamp) AS last_seen\n  FROM default.process_metrics\n  WHERE event_type IN ('syn_recv', 'rst_sent', 'rst_recv', 'tcp_retrans')\n    AND sec_remote_addr != ''\n    AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n    AND hostname IN (${hostname:sqlstring})\n  GROUP BY sec_remote_addr\n)\nSELECT\n  ip,\n  syns,\n  rsts,\n  retrans,\n  unique_ports_scanned,\n  first_seen,\n  last_seen,\n  round(\n    syns * 1.0 +\n    rsts * 0.5 +\n    retrans * 0.3 +\n    unique_ports_scanned * 5.0\n  , 1) AS anomaly_score,\n  multiIf(\n    unique_ports_scanned >= 10, 'PORT SCAN',\n    syns >= 100, 'SYN FLOOD',\n    rsts >= 50, 'RST FLOOD',\n    retrans >= 200, 'HIGH RETRANSMIT',\n    'NORMAL'\n  ) AS verdict\nFROM per_ip\nWHERE syns + rsts + retrans > 0\nORDER BY anomaly_score DESC\nLIMIT 50",
           "refId": "A"
         }
       ],
@@ -1525,7 +1525,7 @@
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp,\n  event_type,\n  sec_local_addr AS local_addr,\n  sec_local_port AS local_port,\n  sec_remote_addr AS remote_addr,\n  sec_remote_port AS remote_port,\n  comm,\n  pid,\n  CASE sec_af WHEN 2 THEN 'IPv4' WHEN 10 THEN 'IPv6' ELSE toString(sec_af) END AS af,\n  sec_tcp_state AS tcp_state,\n  sec_direction AS direction\nFROM default.process_metrics\nWHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv')\n  AND $__timeFilter(timestamp)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 200",
+          "rawSql": "SELECT\n  timestamp,\n  event_type,\n  sec_local_addr AS local_addr,\n  sec_local_port AS local_port,\n  sec_remote_addr AS remote_addr,\n  sec_remote_port AS remote_port,\n  comm,\n  pid,\n  CASE sec_af WHEN 2 THEN 'IPv4' WHEN 10 THEN 'IPv6' ELSE toString(sec_af) END AS af,\n  sec_tcp_state AS tcp_state,\n  sec_direction AS direction\nFROM default.process_metrics\nWHERE event_type IN ('tcp_retrans', 'syn_recv', 'rst_sent', 'rst_recv')\n  AND timestamp >= toDateTime64($__from / 1000, 3) AND timestamp <= toDateTime64($__to / 1000, 3)\n  AND hostname IN (${hostname:sqlstring})\nORDER BY timestamp DESC\nLIMIT 200",
           "refId": "A"
         }
       ],
