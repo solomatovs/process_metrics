@@ -204,7 +204,7 @@ SETTINGS
 -- ClickHouse сдвигает следующий refresh на случайный интервал,
 -- чтобы избежать зависания планировщика.
 DROP VIEW IF EXISTS process_metrics_pull_server1;
-CREATE OR REPLACE MATERIALIZED VIEW process_metrics_pull_server1
+CREATE MATERIALIZED VIEW process_metrics_pull_server1
 REFRESH EVERY 3 SECOND RANDOMIZE FOR 1 SECOND APPEND
 TO process_metrics
 AS
@@ -212,7 +212,7 @@ SELECT * REPLACE (if(tags = '', [], splitByChar('|', tags)) AS tags)
 FROM url(
     'http://server1:10003/metrics?format=csv&clear=1',
     'CSVWithNames',
-    'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
+    'timestamp DateTime64(3, 'UTC'), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
      loginuid UInt32, sessionid UInt32, euid UInt32, tty_nr UInt32,
      comm String, exec String, args String, cgroup String, pwd String,
@@ -251,7 +251,7 @@ INSERT INTO process_metrics
 SELECT * FROM url(
     'http://server1:10003/metrics?format=csv&clear=1',
     'CSVWithNames',
-    'timestamp DateTime64(3), hostname String, event_type String, rule String, tags String,
+    'timestamp DateTime64(3, 'UTC'), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32,
      loginuid UInt32, sessionid UInt32, euid UInt32, tty_nr UInt32,
      comm String, exec String, args String, cgroup String, pwd String,

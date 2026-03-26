@@ -3078,7 +3078,15 @@
   "templating": {
     "list": [
       {
-        "current": {},
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
           "uid": "${DS_CLICKHOUSE}"
@@ -3089,9 +3097,15 @@
         "label": "Server",
         "multi": true,
         "name": "hostname",
-        "options": [],
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          }
+        ],
         "query": "SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY ORDER BY hostname",
-        "refresh": 2,
+        "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
         "sort": 1,
