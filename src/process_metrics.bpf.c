@@ -28,25 +28,11 @@
 /*
  * BPF_ZERO(var) — обнуляет ВСЕ байты структуры на стеке, включая padding.
  *
- * Ядро 5.x: верификатор требует инициализации каждого байта стековых
- * переменных, передаваемых в bpf_map_update_elem / bpf_ringbuf_output.
- * Designated initializers ({.field = val}) обнуляют только поля,
- * но не padding-байты между ними — verifier отвергает программу.
- *
- * Ядро >= 6.0: верификатор допускает неинициализированный padding,
- * поэтому memset не нужен — обычные инициализаторы работают корректно.
- *
- * KERN_VER_MAJOR передаётся из Makefile через -D.
+ * Необходимо ВСЕГДА обнулять структуры перед bpf_map_update_elem /
+ * bpf_ringbuf_submit, иначе поля, не заданные явно (например tx_bytes,
+ * rx_bytes в sock_info), будут содержать мусор со стека BPF.
  */
-#ifndef KERN_VER_MAJOR
-#define KERN_VER_MAJOR 6
-#endif
-
-#if KERN_VER_MAJOR < 6
 #define BPF_ZERO(var) __builtin_memset(&(var), 0, sizeof(var))
-#else
-#define BPF_ZERO(var) do {} while(0)
-#endif
 
 /* ── rodata (настраивается из пространства пользователя перед загрузкой) ── */
 
