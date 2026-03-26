@@ -28,6 +28,7 @@ static int           g_fd = -1;
 static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int           g_initialized;
+static __u64         g_max_size;           /* 0 = unlimited */
 
 /* ── helpers ─────────────────────────────────────────────────────── */
 
@@ -124,11 +125,13 @@ static int write_records(const char *path,
 
 /* ── public API ──────────────────────────────────────────────────── */
 
-int ef_init(const char *path)
+int ef_init(const char *path, __u64 max_size_bytes)
 {
 	snprintf(g_path, sizeof(g_path), "%s", path);
 	snprintf(g_tmp_path, sizeof(g_tmp_path), "%s.tmp", path);
 	snprintf(g_pending_path, sizeof(g_pending_path), "%s.pending", path);
+
+	g_max_size = max_size_bytes;
 
 	if (open_append() < 0)
 		return -1;
@@ -149,6 +152,20 @@ void ef_append(const struct metric_event *ev, const char *hostname)
 
 	pthread_mutex_lock(&g_mutex);
 	if (g_fd >= 0) {
+		/* Check file size limit before writing */
+		if (g_max_size > 0) {
+			off_t pos = lseek(g_fd, 0, SEEK_END);
+			if (pos != (off_t)-1 &&
+			    (__u64)pos + sizeof(rec) > g_max_size) {
+				fprintf(stderr,
+					"WARN: event file %s reached size"
+					" limit (%llu bytes), truncating\n",
+					g_path,
+					(unsigned long long)g_max_size);
+				ftruncate(g_fd, 0);
+				lseek(g_fd, 0, SEEK_SET);
+			}
+		}
 		ssize_t n = write(g_fd, &rec, sizeof(rec));
 		(void)n; /* best-effort */
 	}
@@ -290,6 +307,19 @@ int ef_swap_fd(void)
 	/* Step 2: Merge .tmp into .pending */
 	struct stat st;
 	int has_pending = (stat(g_pending_path, &st) == 0 && st.st_size > 0);
+
+	/* Drop stale .pending if it exceeds the size limit
+	 * (delivery keeps failing → don't let disk fill up) */
+	if (has_pending && g_max_size > 0 && (__u64)st.st_size > g_max_size) {
+		fprintf(stderr,
+			"WARN: pending file %s exceeded limit "
+			"(%llu > %llu), discarding stale data\n",
+			g_pending_path,
+			(unsigned long long)st.st_size,
+			(unsigned long long)g_max_size);
+		unlink(g_pending_path);
+		has_pending = 0;
+	}
 
 	if (has_new && has_pending) {
 		/* Append new data to existing pending */

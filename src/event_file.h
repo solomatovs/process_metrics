@@ -143,9 +143,11 @@ struct ef_record {
 /*
  * Initialize event file at the given path.
  * Creates the file if it doesn't exist.
+ * max_size_bytes: maximum file size in bytes (0 = unlimited).
+ * When exceeded, the file is truncated and a warning is logged.
  * Returns 0 on success, -1 on error.
  */
-int ef_init(const char *path);
+int ef_init(const char *path, __u64 max_size_bytes);
 
 /*
  * Append one event to the file (thread-safe).

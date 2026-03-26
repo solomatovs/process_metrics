@@ -78,6 +78,7 @@ static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=d
 static struct http_config g_http_cfg;
 static char cfg_data_file[PATH_MAX_LEN]    = "";
 static char cfg_prom_path[PATH_MAX_LEN]    = "";  /* internal prom file for HTTP */
+static long long cfg_max_data_file_size    = 1LL * 1024 * 1024 * 1024; /* 1 GB */
 
 /* Network tracking config */
 static int cfg_net_tracking_enabled         = 0;
@@ -670,6 +671,9 @@ static int load_config(const char *path)
 		if (config_setting_lookup_string(hs, "data_file", &str_val))
 			snprintf(cfg_data_file, sizeof(cfg_data_file),
 				 "%s", str_val);
+		long long ll_val;
+		if (config_setting_lookup_int64(hs, "max_data_file_size", &ll_val))
+			cfg_max_data_file_size = ll_val;
 	}
 
 	/* net_tracking settings */
@@ -2690,7 +2694,7 @@ int main(int argc, char *argv[])
 
 	/* Initialize event file if HTTP server is enabled */
 	if (g_http_cfg.enabled) {
-		if (ef_init(cfg_data_file) < 0) {
+		if (ef_init(cfg_data_file, (__u64)cfg_max_data_file_size) < 0) {
 			fprintf(stderr, "FATAL: event file init failed: %s\n",
 				cfg_data_file);
 			return 1;
@@ -2866,7 +2870,8 @@ int main(int argc, char *argv[])
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net_tracking=%s%s, file_tracking=%s%s, "
-	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s]",
+	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s], "
+	       "max_data_file_size=%lld",
 	       num_rules, cfg_snapshot_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
@@ -2881,7 +2886,8 @@ int main(int argc, char *argv[])
 	       cfg_sec_rst_tracking ? "on" : "off",
 	       cfg_sec_udp_tracking ? "on" : "off",
 	       cfg_sec_icmp_tracking ? "on" : "off",
-	       cfg_sec_open_conn_count ? "on" : "off");
+	       cfg_sec_open_conn_count ? "on" : "off",
+	       (long long)cfg_max_data_file_size);
 
 	/* Main loop */
 	time_t last_snapshot = 0;
