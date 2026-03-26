@@ -25,7 +25,6 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <mntent.h>
-#include <poll.h>
 #include <arpa/inet.h>
 #include <regex.h>
 #include <libconfig.h>
@@ -3116,14 +3115,13 @@ int main(int argc, char *argv[])
 
 	/* Main loop
 	 *
-	 * ring_buffer__consume в libbpf имеет do...while(got_new_data) цикл
-	 * (ringbuf.c:215-243), который не возвращает управление при постоянном
-	 * потоке BPF-событий. handle_event прерывает consume (return -1),
-	 * когда наступает время snapshot. cons_pos уже обновлён к этому
-	 * моменту (ringbuf.c:227), поэтому событие не переобрабатывается.
+	 * ring_buffer__poll/ring_buffer__consume в libbpf имеет
+	 * do...while(got_new_data) цикл (ringbuf.c:215-243), который не
+	 * возвращает управление при постоянном потоке BPF-событий.
+	 * handle_event прерывает consume (return -EAGAIN), когда наступает
+	 * время snapshot. cons_pos уже обновлён к этому моменту
+	 * (ringbuf.c:227), поэтому событие не переобрабатывается.
 	 */
-	int rb_fd = ring_buffer__epoll_fd(rb);
-	log_ts("INFO", "ring_buffer epoll_fd=%d", rb_fd);
 	g_last_snapshot = 0;
 	long long loop_iter = 0;
 
@@ -3138,23 +3136,19 @@ int main(int argc, char *argv[])
 		int timeout_ms = until_snap * 1000;
 		if (timeout_ms > 1000) timeout_ms = 1000;
 
-		/* Ждём событий или timeout */
-		struct pollfd pfd = { .fd = rb_fd, .events = POLLIN };
-		int poll_rc = poll(&pfd, 1, timeout_ms);
-
-		/* Обрабатываем доступные события.
-		 * handle_event прерывает consume (return -EAGAIN) когда пора snapshot. */
+		/* ring_buffer__poll = epoll_wait + ringbuf_process_ring.
+		 * handle_event прерывает цикл (return -EAGAIN) когда пора snapshot. */
 		long long before = g_events_total;
-		int err = ring_buffer__consume(rb);
+		int err = ring_buffer__poll(rb, timeout_ms);
 		long long consumed = g_events_total - before;
 
-		log_debug("LOOP[%lld]: poll=%d(revents=0x%x,timeout=%d) "
-			  "consume=%d events=%lld total=%lld",
-			  loop_iter, poll_rc, pfd.revents, timeout_ms,
-			  err, consumed, g_events_total);
+		log_debug("LOOP[%lld]: poll=%d timeout=%d "
+			  "events=%lld total=%lld",
+			  loop_iter, err, timeout_ms,
+			  consumed, g_events_total);
 
 		if (err < 0 && err != -EINTR && err != -EAGAIN) {
-			log_ts("ERROR", "ring_buffer__consume: %d", err);
+			log_ts("ERROR", "ring_buffer__poll: %d", err);
 			break;
 		}
 
