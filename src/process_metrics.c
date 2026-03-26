@@ -125,10 +125,6 @@ static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
 static int tracked_map_fd, proc_map_fd;
 
-/* Snapshot timer — глобальный, чтобы handle_event мог прервать
- * ring_buffer__consume когда пора делать snapshot. */
-static time_t g_last_snapshot;
-
 /* Forward declarations */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
@@ -1331,15 +1327,9 @@ static void initial_scan(void)
 
 /* ── ring buffer event handler ────────────────────────────────────── */
 
-/* Счётчики событий для диагностики main loop */
-static long long g_events_total;
-static long long g_events_since_snap;
-
 static int handle_event(void *ctx, void *data, size_t size)
 {
 	(void)ctx;
-	g_events_total++;
-	g_events_since_snap++;
 
 	/* Both struct event and struct file_event have __u32 type at offset 0 */
 	if (size < sizeof(__u32))
@@ -1964,13 +1954,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 		break;
 	}
 
-	/* Прерываем ring_buffer__consume когда пора делать snapshot.
-	 * На libbpf 0.7 ringbuf_process_ring имеет do...while(got_new_data)
-	 * цикл, который не возвращает управление при постоянном потоке событий.
-	 * return < 0 из callback прерывает этот цикл. cons_pos уже обновлён
-	 * (ringbuf.c:227), поэтому событие НЕ переобрабатывается. */
-	if (time(NULL) - g_last_snapshot >= cfg_snapshot_interval)
-		return -EAGAIN;
 	return 0;
 }
 
@@ -3113,41 +3096,15 @@ int main(int argc, char *argv[])
 	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_file_size);
 
-	/* Main loop
-	 *
-	 * ring_buffer__poll/ring_buffer__consume в libbpf имеет
-	 * do...while(got_new_data) цикл (ringbuf.c:215-243), который не
-	 * возвращает управление при постоянном потоке BPF-событий.
-	 * handle_event прерывает consume (return -EAGAIN), когда наступает
-	 * время snapshot. cons_pos уже обновлён к этому моменту
-	 * (ringbuf.c:227), поэтому событие не переобрабатывается.
-	 */
-	g_last_snapshot = 0;
-	long long loop_iter = 0;
+	/* Main loop — event-driven via ring_buffer__poll (epoll_wait inside).
+	 * Блокируется до прихода BPF-событий или таймаута 1 сек. */
+	time_t last_snapshot = 0;
 
 	while (g_running) {
-		loop_iter++;
-
-		/* Вычисляем timeout до следующего snapshot */
-		time_t now = time(NULL);
-		int until_snap = (int)(cfg_snapshot_interval -
-				       (now - g_last_snapshot));
-		if (until_snap < 0) until_snap = 0;
-		int timeout_ms = until_snap * 1000;
-		if (timeout_ms > 1000) timeout_ms = 1000;
-
-		/* ring_buffer__poll = epoll_wait + ringbuf_process_ring.
-		 * handle_event прерывает цикл (return -EAGAIN) когда пора snapshot. */
-		long long before = g_events_total;
-		int err = ring_buffer__poll(rb, timeout_ms);
-		long long consumed = g_events_total - before;
-
-		log_debug("LOOP[%lld]: poll=%d timeout=%d "
-			  "events=%lld total=%lld",
-			  loop_iter, err, timeout_ms,
-			  consumed, g_events_total);
-
-		if (err < 0 && err != -EINTR && err != -EAGAIN) {
+		int err = ring_buffer__poll(rb, 1000 /* 1 second timeout */);
+		if (err == -EINTR)
+			continue;
+		if (err < 0 && err != -EINTR) {
 			log_ts("ERROR", "ring_buffer__poll: %d", err);
 			break;
 		}
@@ -3174,16 +3131,11 @@ int main(int argc, char *argv[])
 		}
 
 		/* Periodic snapshot */
-		now = time(NULL);
-		if (now - g_last_snapshot >= cfg_snapshot_interval) {
-			log_ts("INFO", "snapshot trigger: %lld events since last, "
-			       "loop_iter=%lld, elapsed=%ds",
-			       g_events_since_snap, loop_iter,
-			       (int)(now - g_last_snapshot));
+		time_t now = time(NULL);
+		if (now - last_snapshot >= cfg_snapshot_interval) {
 			build_cgroup_cache();
 			write_snapshot();
-			g_last_snapshot = now;
-			g_events_since_snap = 0;
+			last_snapshot = now;
 		}
 	}
 
