@@ -25,10 +25,11 @@ BUILDDIR := build
 
 # Исходные файлы
 BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
-USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c
+USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c $(SRCDIR)/csv_format.c
 COMMON_H   := $(SRCDIR)/process_metrics_common.h
 EF_H       := $(SRCDIR)/event_file.h
 HS_H       := $(SRCDIR)/http_server.h
+CSV_H      := $(SRCDIR)/csv_format.h
 VMLINUX_H  := $(SRCDIR)/vmlinux.h
 
 # Артефакты сборки
@@ -196,7 +197,7 @@ $(SKEL_H): $(BPF_OBJ) $(BPFTOOL_BIN)
 
 binary: $(BINARY)
 
-$(BINARY): $(USER_SRCS) $(COMMON_H) $(EF_H) $(HS_H) $(SKEL_H)
+$(BINARY): $(USER_SRCS) $(COMMON_H) $(EF_H) $(HS_H) $(CSV_H) $(SKEL_H)
 	$(CC) $(CFLAGS) -o $@ $(USER_SRCS) $(LDFLAGS)
 
 $(BUILDDIR):

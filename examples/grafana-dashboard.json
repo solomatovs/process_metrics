@@ -1628,12 +1628,83 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "line"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.thresholdsStyle",
+                "value": {
+                  "mode": "dashed"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.02
+                    },
+                    {
+                      "color": "orange",
+                      "value": 0.05
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.1
+                    }
+                  ]
+                }
+              }
+            ]
           }
         ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 16,
+        "w": 24,
         "x": 0,
         "y": 51
       },
@@ -1642,6 +1713,7 @@
         "legend": {
           "calcs": [
             "sum",
+            "mean",
             "max"
           ],
           "displayMode": "table",
@@ -1664,80 +1736,7 @@
           "queryType": "sql",
           "rawSql": "WITH owners AS (\n  SELECT net_remote_addr AS remote_addr, any(comm) AS owner\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND net_remote_addr != ''\n  GROUP BY net_remote_addr\n),\nresolved AS (\n  SELECT r.timestamp,\n    if(o.owner != '', o.owner, r.comm) AS process,\n    r.sec_remote_addr AS remote_addr\n  FROM default.process_metrics r\n  LEFT JOIN owners o ON r.sec_remote_addr = o.remote_addr\n  WHERE r.event_type = 'tcp_retrans'\n    AND r.timestamp >= $__fromTime AND r.timestamp <= $__toTime\n    AND r.hostname IN (${hostname:sqlstring})\n    AND r.rule IN (${rule:sqlstring})\n),\nlabels AS (\n  SELECT\n    process,\n    concat(process, ': [', arrayStringConcat(arraySlice(groupUniqArray(remote_addr), 1, 5), ', '),\n      if(length(groupUniqArray(remote_addr)) > 5, ', ...', ''), ']') AS label,\n    count() AS cnt\n  FROM resolved\n  GROUP BY process\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(r.timestamp, INTERVAL 60 SECOND) AS time,\n  coalesce(l.label, 'other') AS process,\n  count() AS retransmits\nFROM resolved r\nLEFT JOIN labels l ON r.process = l.process\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
-        }
-      ],
-      "title": "TCP Retransmits per Minute",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "grafana-clickhouse-datasource",
-        "uid": "P7E099F39B84EA795"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "lineWidth": 2,
-            "pointSize": 3,
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none"
-            }
-          },
-          "custom.thresholdsStyle": {
-            "mode": "dashed"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.02
-              },
-              {
-                "color": "orange",
-                "value": 0.05
-              },
-              {
-                "color": "red",
-                "value": 0.1
-              }
-            ]
-          },
-          "unit": "percentunit"
-        }
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 51
-      },
-      "id": 302,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
@@ -1746,10 +1745,10 @@
           "format": 0,
           "queryType": "sql",
           "rawSql": "SELECT\n  time,\n  retrans / nullIf(closes, 0) AS retransmit_ratio\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    countIf(event_type = 'tcp_retrans') AS retrans,\n    countIf(event_type = 'net_close') AS closes\n  FROM default.process_metrics\n  WHERE event_type IN ('tcp_retrans', 'net_close')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n  GROUP BY time\n)\nWHERE closes > 0\nORDER BY time",
-          "refId": "A"
+          "refId": "B"
         }
       ],
-      "title": "Retransmit Ratio (retrans / connections)",
+      "title": "TCP Retransmits per Minute & Retransmit Ratio",
       "type": "timeseries"
     },
     {
@@ -1758,10 +1757,23 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 59
+        "y": 51
       },
       "id": 306,
       "title": "CPU Throttling",
+      "type": "row"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "id": 307,
+      "panels": [],
+      "title": "CPU Preemption",
       "type": "row"
     },
     {
@@ -1776,103 +1788,7 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 20,
-            "lineWidth": 1,
-            "pointSize": 3,
-            "spanNulls": true,
-            "stacking": {
-              "mode": "none"
-            }
-          },
-          "decimals": 1,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 0.2
-              },
-              {
-                "color": "red",
-                "value": 0.5
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "other"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#cccccc",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 60
-      },
-      "id": 304,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "sortBy": "Mean",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-clickhouse-datasource",
-            "uid": "P7E099F39B84EA795"
-          },
-          "format": 0,
-          "queryType": "sql",
-          "rawSql": "WITH top AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND cgroup_cpu_nr_throttled > 0\n  GROUP BY cgroup\n  ORDER BY max(cgroup_cpu_nr_throttled) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, cgroup, throttle_rate FROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top), cgroup, 'other') AS cgroup,\n    sum(cgroup_cpu_nr_throttled) / nullIf(sum(cgroup_cpu_nr_periods), 0) AS throttle_rate\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND cgroup_cpu_nr_periods > 0\n  GROUP BY time, cgroup\n)\nWHERE throttle_rate > 0\nORDER BY time",
-          "refId": "A"
-        }
-      ],
-      "title": "CPU Throttle Rate by Cgroup (throttled/periods)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "grafana-clickhouse-datasource",
-        "uid": "P7E099F39B84EA795"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 20,
+            "fillOpacity": 30,
             "lineWidth": 1,
             "pointSize": 3,
             "spanNulls": true,
@@ -1898,20 +1814,88 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 2
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "none"
+                }
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "line"
+              },
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.thresholdsStyle",
+                "value": {
+                  "mode": "dashed"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.2
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.5
+                    }
+                  ]
+                }
+              }
+            ]
           }
         ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 16,
+        "w": 24,
         "x": 12,
-        "y": 60
+        "y": 52
       },
       "id": 305,
       "options": {
         "legend": {
           "calcs": [
             "sum",
+            "mean",
             "max"
           ],
           "displayMode": "table",
@@ -1934,23 +1918,20 @@
           "queryType": "sql",
           "rawSql": "WITH top AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY cgroup\n  ORDER BY max(cgroup_cpu_throttled_usec) DESC\n  LIMIT ${topn:raw}\n),\ndata AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top), cgroup, 'other') AS cgroup,\n    max(cgroup_cpu_throttled_usec) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY time, cgroup\n)\nSELECT time, cgroup, throttled_usec\nFROM (\n  SELECT\n    time, cgroup,\n    val - lagInFrame(val, 1, 0) OVER (PARTITION BY cgroup ORDER BY time) AS throttled_usec\n  FROM data\n)\nWHERE throttled_usec > 0\nORDER BY time",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "P7E099F39B84EA795"
+          },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  sum(cgroup_cpu_nr_throttled) / nullIf(sum(cgroup_cpu_nr_periods), 0) AS throttle_ratio\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND hostname IN (${hostname:sqlstring})\n  AND cgroup_cpu_nr_periods > 0\nGROUP BY time\nHAVING throttle_ratio > 0\nORDER BY time",
+          "refId": "B"
         }
       ],
-      "title": "CPU Throttled Time by Cgroup (µs/min)",
+      "title": "CPU Throttled Time by Cgroup & Overall Throttle Ratio",
       "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 68
-      },
-      "id": 307,
-      "panels": [],
-      "title": "CPU Preemption",
-      "type": "row"
     },
     {
       "datasource": {
@@ -1963,20 +1944,55 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "fillOpacity": 15,
-            "lineWidth": 1,
+            "fillOpacity": 0,
+            "lineWidth": 2,
             "showPoints": "never",
             "stacking": {
-              "mode": "normal"
+              "mode": "none"
             }
           },
           "unit": "short"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "preemptions"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 30
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              },
+              {
+                "id": "custom.stacking",
+                "value": {
+                  "mode": "normal"
+                }
+              },
+              {
+                "id": "custom.drawStyle",
+                "value": "line"
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 16,
+        "w": 24,
         "x": 0,
         "y": 69
       },
@@ -1984,6 +2000,7 @@
       "options": {
         "legend": {
           "calcs": [
+            "sum",
             "mean",
             "max"
           ],
@@ -2002,57 +2019,9 @@
             "uid": "P7E099F39B84EA795"
           },
           "format": 0,
-          "rawSql": "WITH top AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND nivcsw > 0\n  GROUP BY process\n  ORDER BY max(nivcsw) - min(nivcsw) DESC\n  LIMIT ${topn:raw}\n),\ndata AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top),\n       concat(comm, ' [', toString(pid), ']'), 'other') AS process,\n    pid,\n    max(nivcsw) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND nivcsw > 0\n  GROUP BY time, pid, process\n),\nagg AS (\n  SELECT time, process, sum(val) AS val FROM data GROUP BY time, process\n)\nSELECT time, process, delta AS nivcsw\nFROM (\n  SELECT time, process,\n    val - lagInFrame(val, 1, 0) OVER (PARTITION BY process ORDER BY time) AS delta\n  FROM agg\n)\nWHERE delta > 0\nORDER BY time",
+          "rawSql": "WITH data AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    pid,\n    max(nivcsw) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND nivcsw > 0\n  GROUP BY time, pid\n),\nagg AS (\n  SELECT time, sum(val) AS val FROM data GROUP BY time\n)\nSELECT time, delta AS nivcsw\nFROM (\n  SELECT time,\n    val - lagInFrame(val, 1, 0) OVER (ORDER BY time) AS delta\n  FROM agg\n)\nWHERE delta > 0\nORDER BY time",
           "refId": "A"
-        }
-      ],
-      "title": "Involuntary Context Switches per Minute",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "grafana-clickhouse-datasource",
-        "uid": "P7E099F39B84EA795"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "fillOpacity": 15,
-            "lineWidth": 1,
-            "showPoints": "never",
-            "stacking": {
-              "mode": "normal"
-            }
-          },
-          "unit": "short"
         },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 69
-      },
-      "id": 309,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
@@ -2060,10 +2029,10 @@
           },
           "format": 0,
           "rawSql": "WITH filtered AS (\n  SELECT\n    timestamp,\n    preempted_by_comm AS preemptor,\n    comm AS victim\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND hostname IN (${hostname:sqlstring})\n    AND rule IN (${rule:sqlstring})\n    AND preempted_by_comm != ''\n    AND preempted_by_comm NOT LIKE 'kworker%'\n    AND preempted_by_comm NOT LIKE 'ksoftirqd%'\n    AND preempted_by_comm NOT LIKE 'migration%'\n    AND preempted_by_comm NOT LIKE 'watchdog%'\n    AND preempted_by_comm NOT IN ('rcu_preempt', 'rcu_sched', 'idle')\n),\nlabels AS (\n  SELECT preemptor,\n    concat(preemptor, ': [',\n      arrayStringConcat(arraySlice(groupUniqArray(victim), 1, 5), ', '),\n      if(length(groupUniqArray(victim)) > 5, ', ...', ''),\n    ']') AS label,\n    count() AS cnt\n  FROM filtered\n  GROUP BY preemptor\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(f.timestamp, INTERVAL 60 SECOND) AS time,\n  coalesce(l.label, 'other') AS preemptor,\n  count() AS preemptions\nFROM filtered f\nLEFT JOIN labels l ON f.preemptor = l.preemptor\nGROUP BY time, preemptor\nORDER BY time",
-          "refId": "A"
+          "refId": "B"
         }
       ],
-      "title": "Top Preemptors (who preempts others)",
+      "title": "Involuntary Context Switches & Top Preemptors",
       "type": "timeseries"
     },
     {
@@ -2072,7 +2041,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 77
+        "y": 69
       },
       "id": 300,
       "title": "Cgroup Memory",
@@ -2122,7 +2091,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 78
+        "y": 70
       },
       "id": 20,
       "options": {
@@ -2219,7 +2188,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 78
+        "y": 70
       },
       "id": 21,
       "options": {
@@ -2346,7 +2315,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 78
       },
       "id": 22,
       "options": {
@@ -2379,7 +2348,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 94
+        "y": 86
       },
       "id": 80,
       "title": "User Audit Log (bash_history)",
@@ -2398,7 +2367,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 95
+        "y": 87
       },
       "id": 81,
       "options": {
@@ -2432,7 +2401,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 109
+        "y": 101
       },
       "id": 82,
       "title": "Signal Events",
@@ -2447,7 +2416,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 110
+        "y": 102
       },
       "id": 83,
       "options": {
@@ -2481,7 +2450,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 122
+        "y": 114
       },
       "id": 84,
       "title": "Error Events",
@@ -2500,7 +2469,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 123
+        "y": 115
       },
       "id": 85,
       "options": {

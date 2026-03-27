@@ -2727,33 +2727,59 @@ static void write_snapshot(void)
 	 * a partial snapshot across two deliveries */
 	ef_batch_lock();
 
-	/* Collect all keys first to avoid iterator invalidation
-	 * from concurrent BPF map modifications (fork/exit events) */
+	/*
+	 * Batch lookup: read all proc_map entries in one syscall.
+	 * Falls back to per-key iteration if batch is not supported.
+	 */
 	__u32 *all_keys = NULL;
+	struct proc_info *all_values = NULL;
 	int all_keys_count = 0;
-	int all_keys_cap = 4096;
-	all_keys = malloc(all_keys_cap * sizeof(__u32));
-	if (all_keys) {
-		__u32 iter_key;
-		int err2 = bpf_map_get_next_key(proc_map_fd, NULL, &iter_key);
-		while (err2 == 0) {
-			if (all_keys_count >= all_keys_cap) {
-				all_keys_cap *= 2;
-				__u32 *tmp = realloc(all_keys,
-						     all_keys_cap * sizeof(__u32));
-				if (!tmp) break;
-				all_keys = tmp;
+
+	{
+		__u32 batch_count = MAX_PROCS;
+		all_keys = malloc(batch_count * sizeof(__u32));
+		all_values = malloc(batch_count * sizeof(struct proc_info));
+
+		if (all_keys && all_values) {
+			DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts,
+				.elem_flags = 0,
+				.flags = 0,
+			);
+			__u32 out_batch = 0;
+			int ret = bpf_map_lookup_batch(proc_map_fd,
+				NULL, &out_batch,
+				all_keys, all_values, &batch_count, &opts);
+			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
+				/* ENOENT means "last batch" — all entries read */
+				all_keys_count = (int)batch_count;
+			} else {
+				/* Batch not supported — fall back to iteration */
+				all_keys_count = 0;
+				__u32 iter_key;
+				int err2 = bpf_map_get_next_key(proc_map_fd,
+							NULL, &iter_key);
+				while (err2 == 0 && all_keys_count < (int)MAX_PROCS) {
+					all_keys[all_keys_count++] = iter_key;
+					err2 = bpf_map_get_next_key(proc_map_fd,
+							&iter_key, &iter_key);
+				}
+				/* Values not filled — will lookup per-key below */
+				free(all_values);
+				all_values = NULL;
 			}
-			all_keys[all_keys_count++] = iter_key;
-			err2 = bpf_map_get_next_key(proc_map_fd, &iter_key,
-						     &iter_key);
 		}
 	}
 
 	for (int ki = 0; ki < all_keys_count; ki++) {
 		key = all_keys[ki];
-		if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) != 0)
-			continue;
+
+		/* Use batch-fetched value if available, otherwise per-key lookup */
+		if (all_values) {
+			pi = all_values[ki];
+		} else {
+			if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) != 0)
+				continue;
+		}
 
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
@@ -2961,6 +2987,7 @@ static void write_snapshot(void)
 		pid_count++;
 	}
 	free(all_keys);
+	free(all_values);
 
 	/* Flush UDP aggregation map before unlocking batch */
 	if (cfg_sec_udp_tracking && g_http_cfg.enabled) {
