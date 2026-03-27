@@ -65,7 +65,7 @@ CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 ifdef NO_TAGS
 CFLAGS += -DNO_TAGS
 endif
-LDFLAGS    := -static -lbpf -lelf -lz -lconfig -lpthread
+LDFLAGS    := -Wl,-Bstatic -lbpf -lelf -lz -lconfig -Wl,-Bdynamic -lpthread -lc
 
 # Пакеты зависимостей
 APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm libconfig-dev
