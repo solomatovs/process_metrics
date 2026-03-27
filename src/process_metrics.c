@@ -2446,6 +2446,64 @@ static long long read_cgroup_value(const char *cg_path, const char *file)
 }
 
 /*
+ * Read cpu.max: "$MAX $PERIOD" or "max $PERIOD".
+ * Sets *quota (usec, 0 if "max") and *period (usec).
+ */
+static void read_cgroup_cpu_max(const char *cg_path,
+				long long *quota, long long *period)
+{
+	*quota = -1;
+	*period = -1;
+	char path[PATH_MAX_LEN];
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cpu.max", cg_path);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	char buf[64];
+	if (fgets(buf, sizeof(buf), f)) {
+		if (strncmp(buf, "max", 3) == 0) {
+			*quota = 0;  /* unlimited */
+			if (sscanf(buf + 3, " %lld", period) != 1)
+				*period = 100000;
+		} else {
+			if (sscanf(buf, "%lld %lld", quota, period) != 2) {
+				*quota = -1;
+				*period = -1;
+			}
+		}
+	}
+	fclose(f);
+}
+
+/*
+ * Read cpu.stat: parse nr_periods, nr_throttled, throttled_usec.
+ */
+static void read_cgroup_cpu_stat(const char *cg_path,
+				 long long *nr_periods,
+				 long long *nr_throttled,
+				 long long *throttled_usec)
+{
+	*nr_periods = -1;
+	*nr_throttled = -1;
+	*throttled_usec = -1;
+	char path[PATH_MAX_LEN];
+	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cpu.stat", cg_path);
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return;
+	char line[128];
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "nr_periods ", 11) == 0)
+			*nr_periods = strtoll(line + 11, NULL, 10);
+		else if (strncmp(line, "nr_throttled ", 13) == 0)
+			*nr_throttled = strtoll(line + 13, NULL, 10);
+		else if (strncmp(line, "throttled_usec ", 15) == 0)
+			*throttled_usec = strtoll(line + 15, NULL, 10);
+	}
+	fclose(f);
+}
+
+/*
  * Emit disk_usage events for each unique real filesystem.
  * Reads /proc/mounts, applies fs_type/include/exclude filters,
  * deduplicates by device, calls statvfs().
@@ -2645,6 +2703,8 @@ static void write_snapshot(void)
 	struct {
 		char path[EV_CGROUP_LEN];
 		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
+		long long cpu_max, cpu_max_period;
+		long long cpu_nr_periods, cpu_nr_throttled, cpu_throttled_usec;
 		int read;  /* 1 = values read from /sys/fs/cgroup */
 	} seen_cg[MAX_CGROUPS];
 	int seen_cg_count = 0;
@@ -2782,6 +2842,13 @@ static void write_snapshot(void)
 						read_cgroup_value(cg_fs_path, "memory.swap.current");
 					seen_cg[cg_idx].cpu_weight =
 						read_cgroup_value(cg_fs_path, "cpu.weight");
+					read_cgroup_cpu_max(cg_fs_path,
+						&seen_cg[cg_idx].cpu_max,
+						&seen_cg[cg_idx].cpu_max_period);
+					read_cgroup_cpu_stat(cg_fs_path,
+						&seen_cg[cg_idx].cpu_nr_periods,
+						&seen_cg[cg_idx].cpu_nr_throttled,
+						&seen_cg[cg_idx].cpu_throttled_usec);
 					seen_cg[cg_idx].pids_cur =
 						read_cgroup_value(cg_fs_path, "pids.current");
 					seen_cg[cg_idx].read = 1;
@@ -2865,6 +2932,11 @@ static void write_snapshot(void)
 				cev.cgroup_memory_current = seen_cg[cg_idx].mem_cur;
 				cev.cgroup_swap_current = seen_cg[cg_idx].swap_cur;
 				cev.cgroup_cpu_weight = seen_cg[cg_idx].cpu_weight;
+				cev.cgroup_cpu_max = seen_cg[cg_idx].cpu_max;
+				cev.cgroup_cpu_max_period = seen_cg[cg_idx].cpu_max_period;
+				cev.cgroup_cpu_nr_periods = seen_cg[cg_idx].cpu_nr_periods;
+				cev.cgroup_cpu_nr_throttled = seen_cg[cg_idx].cpu_nr_throttled;
+				cev.cgroup_cpu_throttled_usec = seen_cg[cg_idx].cpu_throttled_usec;
 				cev.cgroup_pids_current = seen_cg[cg_idx].pids_cur;
 			}
 

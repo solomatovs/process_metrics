@@ -61,7 +61,10 @@ static const char *CSV_HEADER =
 	"mnt_ns,pid_ns,net_ns,cgroup_ns,"
 	/* cgroup v2 */
 	"cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
-	"cgroup_cpu_weight,cgroup_pids_current,"
+	"cgroup_cpu_weight,"
+	"cgroup_cpu_max,cgroup_cpu_max_period,"
+	"cgroup_cpu_nr_periods,cgroup_cpu_nr_throttled,cgroup_cpu_throttled_usec,"
+	"cgroup_pids_current,"
 	/* файловый трекинг */
 	"file_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
 	/* сетевой трекинг */
@@ -173,7 +176,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* пространства имён */
 		"%u,%u,%u,%u,"
 		/* cgroup v2 */
-		"%lld,%lld,%lld,%lld,%lld,"
+		"%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,"
 		/* файловый трекинг */
 		"%s,%u,%llu,%llu,%u,"
 		/* сетевой трекинг */
@@ -230,6 +233,11 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		(long long)ev->cgroup_memory_current,
 		(long long)ev->cgroup_swap_current,
 		(long long)ev->cgroup_cpu_weight,
+		(long long)ev->cgroup_cpu_max,
+		(long long)ev->cgroup_cpu_max_period,
+		(long long)ev->cgroup_cpu_nr_periods,
+		(long long)ev->cgroup_cpu_nr_throttled,
+		(long long)ev->cgroup_cpu_throttled_usec,
 		(long long)ev->cgroup_pids_current,
 		/* файловый трекинг */
 		file_path_esc, ev->file_flags,

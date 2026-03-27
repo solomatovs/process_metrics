@@ -78,6 +78,11 @@ struct metric_event {
 	__s64 cgroup_memory_current;
 	__s64 cgroup_swap_current;
 	__s64 cgroup_cpu_weight;
+	__s64 cgroup_cpu_max;           /* quota per period (usec), 0 = "max" (unlimited) */
+	__s64 cgroup_cpu_max_period;    /* period (usec), typically 100000 */
+	__s64 cgroup_cpu_nr_periods;    /* total scheduling periods */
+	__s64 cgroup_cpu_nr_throttled;  /* periods where throttling occurred */
+	__s64 cgroup_cpu_throttled_usec; /* total throttled time (usec) */
 	__s64 cgroup_pids_current;
 
 	/* ── file tracking metrics (EVENT_FILE_CLOSE only) ─────────── */
