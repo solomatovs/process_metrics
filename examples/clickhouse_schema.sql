@@ -110,6 +110,10 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     net_ns                 UInt32                      CODEC(T64, ZSTD(1)),
     cgroup_ns              UInt32                      CODEC(T64, ZSTD(1)),
 
+    -- ── preemption tracking (snapshot only) ─────────────────────
+    preempted_by_pid       UInt32                      CODEC(T64, ZSTD(1)),
+    preempted_by_comm      LowCardinality(String)      CODEC(ZSTD(1)),
+
     -- ── метрики cgroup v2 (заполняются в snapshot, -1 = недоступно) ─
     cgroup_memory_max      Int64                       CODEC(T64, ZSTD(1)),
     cgroup_memory_current  Int64                       CODEC(Delta, ZSTD(1)),
@@ -232,6 +236,7 @@ FROM url(
      net_tx_bytes UInt64, net_rx_bytes UInt64,
      start_time_ns UInt64, uptime_seconds UInt64,
      mnt_ns UInt32, pid_ns UInt32, net_ns UInt32, cgroup_ns UInt32,
+     preempted_by_pid UInt32, preempted_by_comm String,
      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
      cgroup_cpu_weight Int64, cgroup_cpu_max Int64, cgroup_cpu_max_period Int64,
      cgroup_cpu_nr_periods Int64, cgroup_cpu_nr_throttled Int64, cgroup_cpu_throttled_usec Int64,
@@ -273,6 +278,7 @@ SELECT * FROM url(
      net_tx_bytes UInt64, net_rx_bytes UInt64,
      start_time_ns UInt64, uptime_seconds UInt64,
      mnt_ns UInt32, pid_ns UInt32, net_ns UInt32, cgroup_ns UInt32,
+     preempted_by_pid UInt32, preempted_by_comm String,
      cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
      cgroup_cpu_weight Int64, cgroup_cpu_max Int64, cgroup_cpu_max_period Int64,
      cgroup_cpu_nr_periods Int64, cgroup_cpu_nr_throttled Int64, cgroup_cpu_throttled_usec Int64,

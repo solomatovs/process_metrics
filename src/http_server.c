@@ -59,6 +59,8 @@ static const char *CSV_HEADER =
 	"start_time_ns,uptime_seconds,"
 	/* пространства имён */
 	"mnt_ns,pid_ns,net_ns,cgroup_ns,"
+	/* preemption */
+	"preempted_by_pid,preempted_by_comm,"
 	/* cgroup v2 */
 	"cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
 	"cgroup_cpu_weight,"
@@ -133,6 +135,9 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(ev->pwd, pwd_esc, sizeof(pwd_esc));
 	csv_escape_field(ev->sig_target_comm, sig_target_comm_esc,
 			 sizeof(sig_target_comm_esc));
+	char preempted_by_comm_esc[EV_ESC_SIZE(COMM_LEN)];
+	csv_escape_field(ev->preempted_by_comm, preempted_by_comm_esc,
+			 sizeof(preempted_by_comm_esc));
 	csv_escape_field(ev->sec_local_addr, sec_local_esc,
 			 sizeof(sec_local_esc));
 	csv_escape_field(ev->sec_remote_addr, sec_remote_esc,
@@ -175,6 +180,8 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		"%llu,%llu,"
 		/* пространства имён */
 		"%u,%u,%u,%u,"
+		/* preemption */
+		"%u,%s,"
 		/* cgroup v2 */
 		"%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,"
 		/* файловый трекинг */
@@ -228,6 +235,8 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 		/* пространства имён */
 		ev->mnt_ns_inum, ev->pid_ns_inum,
 		ev->net_ns_inum, ev->cgroup_ns_inum,
+		/* preemption */
+		ev->preempted_by_pid, preempted_by_comm_esc,
 		/* cgroup v2 */
 		(long long)ev->cgroup_memory_max,
 		(long long)ev->cgroup_memory_current,

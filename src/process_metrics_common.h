@@ -273,6 +273,22 @@ struct proc_info {
 	__u32 pid_ns_inum;       /* PID namespace */
 	__u32 net_ns_inum;       /* network namespace */
 	__u32 cgroup_ns_inum;    /* cgroup namespace */
+
+	/* ── preemption tracking ─────────────────────────────────── */
+	__u32 preempted_by_pid;  /* tgid of last preemptor (involuntary switch) */
+	char  preempted_by_comm[COMM_LEN]; /* comm of last preemptor (resolved to main thread) */
+	__u64 preempted_by_cgroup_id;      /* cgroup of last preemptor */
+};
+
+/*
+ * TID → TGID+comm mapping for preemption resolution.
+ * Allows resolving thread names (ThreadPool, Worker-N, etc.)
+ * to their parent process comm (clickhouse-serv, java, etc.).
+ * Compatible with kernel 5.x (no bpf_task_from_pid needed).
+ */
+struct tid_info {
+	__u32 tgid;
+	char  comm[COMM_LEN];    /* comm of the main thread (group leader) */
 };
 
 /*

@@ -2915,6 +2915,11 @@ static void write_snapshot(void)
 			cev.net_ns_inum    = pi.net_ns_inum;
 			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
 
+			/* Preemption: last process that involuntarily preempted us */
+			cev.preempted_by_pid = pi.preempted_by_pid;
+			memcpy(cev.preempted_by_comm,
+			       pi.preempted_by_comm, COMM_LEN);
+
 			/* pwd via readlink /proc/PID/cwd (userspace only) */
 			{
 				char cwd_path[64];

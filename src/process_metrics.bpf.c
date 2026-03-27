@@ -91,6 +91,23 @@ struct {
 	__type(value, __u64);         /* last seen utime+stime */
 } thread_cpu_map SEC(".maps");
 
+/*
+ * tid_tgid_map: TID → {TGID, comm} mapping для резолвинга имён потоков
+ * в имена основных процессов при preemption tracking.
+ *
+ * Заполняется в sched_switch для ВСЕХ процессов (до проверки tracked_map),
+ * позволяя определить реального владельца потока-вытеснителя.
+ * Например: ThreadPool(TID) → clickhouse-serv(TGID).
+ *
+ * Совместимо с ядром 5.x (не требует bpf_task_from_pid).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, __u32);           /* tid (thread id) */
+	__type(value, struct tid_info);
+} tid_tgid_map SEC(".maps");
+
 /* Статистика ring buffer'ов: потери и общее количество событий */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -648,11 +665,66 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 /* ── SCHED_SWITCH — горячий путь, обновление метрик для отслеживаемых PID ── */
 
+/*
+ * sched_switch tracepoint context layout (from /sys/kernel/tracing/events/sched/sched_switch/format):
+ *   offset  0: common_type (u16), common_flags (u8), common_preempt_count (u8), common_pid (s32)
+ *   offset  8: prev_comm[16]
+ *   offset 24: prev_pid (s32)
+ *   offset 28: prev_prio (s32)
+ *   offset 32: prev_state (s64)
+ *   offset 40: next_comm[16]
+ *   offset 56: next_pid (s32)
+ *   offset 60: next_prio (s32)
+ */
+struct sched_switch_args {
+	/* first 8 bytes: common fields (type, flags, preempt_count, pid) */
+	__u64 __pad;
+	char  prev_comm[16];
+	__s32 prev_pid;
+	__s32 prev_prio;
+	long  prev_state;
+	char  next_comm[16];
+	__s32 next_pid;
+	__s32 next_prio;
+};
+
 SEC("tracepoint/sched/sched_switch")
-int handle_sched_switch(void *ctx)
+int handle_sched_switch(struct sched_switch_args *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tid  = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/*
+	 * Обновляем tid_tgid_map для текущего (prev) процесса ДО проверки
+	 * tracked_map: нужно знать TGID+comm всех процессов в системе,
+	 * чтобы резолвить имена потоков-вытеснителей.
+	 *
+	 * Обновляем только если TID != TGID (т.е. это дочерний поток),
+	 * потому что для главного потока comm совпадает с preempted_by_comm.
+	 */
+	if (tid != tgid) {
+		struct tid_info *existing = bpf_map_lookup_elem(&tid_tgid_map,
+								&tid);
+		if (!existing) {
+			struct task_struct *leader;
+			struct task_struct *curr =
+				(struct task_struct *)bpf_get_current_task();
+			struct tid_info ti = { .tgid = tgid };
+
+			leader = BPF_CORE_READ(curr, group_leader);
+			if (leader)
+				bpf_probe_read_kernel_str(ti.comm,
+							  sizeof(ti.comm),
+							  &leader->comm);
+			else
+				__builtin_memcpy(ti.comm, ctx->prev_comm,
+						 COMM_LEN);
+			ti.comm[COMM_LEN - 1] = '\0';
+			bpf_map_update_elem(&tid_tgid_map, &tid,
+					    &ti, BPF_NOEXIST);
+		}
+	}
 
 	/* Быстрый выход для неотслеживаемых PID */
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
@@ -744,6 +816,37 @@ int handle_sched_switch(void *ctx)
 	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
 		      &info->net_ns_inum, &info->cgroup_ns_inum);
 
+	/*
+	 * Preemption tracking: prev_state == 0 means TASK_RUNNING,
+	 * i.e. this process was involuntarily preempted by `next`.
+	 * Record who preempted us (the "noisy neighbor").
+	 */
+	if (ctx->prev_state == 0 && ctx->next_pid > 0) {
+		__u32 next_tid = (__u32)ctx->next_pid;
+
+		/*
+		 * Резолвим TID вытеснителя в TGID + comm основного процесса
+		 * через tid_tgid_map. Если TID — дочерний поток (ThreadPool,
+		 * Worker-N и т.д.), получим comm главного процесса
+		 * (clickhouse-serv, java и т.д.).
+		 * Если записи нет — это главный поток, берём данные из
+		 * tracepoint args как есть.
+		 */
+		struct tid_info *ti = bpf_map_lookup_elem(&tid_tgid_map,
+							  &next_tid);
+		if (ti) {
+			info->preempted_by_pid = ti->tgid;
+			__builtin_memcpy(info->preempted_by_comm,
+					 ti->comm, COMM_LEN);
+		} else {
+			info->preempted_by_pid = next_tid;
+			__builtin_memcpy(info->preempted_by_comm,
+					 ctx->next_comm, COMM_LEN);
+		}
+		info->preempted_by_comm[COMM_LEN - 1] = '\0';
+		info->preempted_by_cgroup_id = 0;
+	}
+
 	return 0;
 }
 
@@ -755,6 +858,10 @@ int handle_exit(void *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 pid  = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Cleanup tid_tgid_map для завершающегося потока (до проверки tracked) */
+	if (pid != tgid)
+		bpf_map_delete_elem(&tid_tgid_map, &pid);
 
 	/* Только для отслеживаемых процессов */
 	struct track_info *ti = bpf_map_lookup_elem(&tracked_map, &tgid);

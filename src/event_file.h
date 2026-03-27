@@ -122,6 +122,10 @@ struct metric_event {
 	__u32 net_ns_inum;          /* network namespace */
 	__u32 cgroup_ns_inum;       /* cgroup namespace */
 
+	/* ── preemption tracking (snapshot only) ─────────────────── */
+	__u32 preempted_by_pid;     /* tgid of last preemptor */
+	char  preempted_by_comm[COMM_LEN]; /* comm of last preemptor */
+
 	/* ── filesystem ───────────────────────────────────────────── */
 	char  pwd[EV_PWD_LEN];      /* current working directory */
 
