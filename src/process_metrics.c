@@ -2677,6 +2677,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 
 		struct metric_event cev;
 		memset(&cev, 0, sizeof(cev));
+		snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 		cev.timestamp_ns = timestamp_ns;
 		snprintf(cev.event_type, sizeof(cev.event_type), "disk_usage");
 
