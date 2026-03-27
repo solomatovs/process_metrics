@@ -121,7 +121,9 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 	csv_escape_field(ev->comm, comm_esc, sizeof(comm_esc));
 	csv_escape_field(ev->exec_path, exec_esc, sizeof(exec_esc));
 	csv_escape_field(ev->args, args_esc, sizeof(args_esc));
-	csv_escape_field(ev->cgroup, cgroup_esc, sizeof(cgroup_esc));
+	char cgroup_resolved[EV_CGROUP_LEN];
+	http_resolve_cgroup(ev->cgroup, cgroup_resolved, sizeof(cgroup_resolved));
+	csv_escape_field(cgroup_resolved, cgroup_esc, sizeof(cgroup_esc));
 	csv_escape_field(ev->file_path, file_path_esc, sizeof(file_path_esc));
 	csv_escape_field(ev->net_local_addr, net_local_esc, sizeof(net_local_esc));
 	csv_escape_field(ev->net_remote_addr, net_remote_esc, sizeof(net_remote_esc));

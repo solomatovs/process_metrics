@@ -17,6 +17,14 @@ struct http_config {
 };
 
 /*
+ * Resolve cgroup path for display.
+ * If docker resolve is enabled and cgroup contains docker-<hash>.scope,
+ * replaces it with docker/<container_name>.
+ * buf must be at least EV_CGROUP_LEN bytes.
+ */
+void http_resolve_cgroup(const char *raw, char *buf, int buflen);
+
+/*
  * Start the HTTP server in a background thread.
  * Returns 0 on success, -1 on error.
  */

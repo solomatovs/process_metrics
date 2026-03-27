@@ -90,6 +90,7 @@ static int cfg_file_tracking_enabled        = 0;
 static int cfg_file_track_bytes             = 0;
 
 /* Docker resolve config */
+static int cfg_docker_resolve_names         = 0;  /* resolve docker-<hash>.scope → container name */
 static char cfg_docker_data_root[PATH_MAX_LEN] = "";
 static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
 
@@ -612,27 +613,53 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 	if (!f)
 		return 0;
 
+	/* config.v2.json can be large (>40KB if State section is big),
+	 * so read in chunks searching for "Name":" pattern */
+	char *q1 = NULL, *q2 = NULL;
 	char buf[4096];
-	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-	fclose(f);
-	buf[n] = '\0';
+	char overlap[256] = "";  /* overlap from previous chunk */
+	int found = 0;
 
-	/* Parse "Name":"/container_name" — Name is typically the first field */
-	char *key = strstr(buf, "\"Name\"");
-	if (!key)
-		return 0;
-	char *colon = strchr(key + 6, ':');
-	if (!colon)
-		return 0;
-	char *q1 = strchr(colon, '"');
-	if (!q1)
-		return 0;
-	q1++;
-	/* Skip leading / in container name */
-	if (*q1 == '/')
-		q1++;
-	char *q2 = strchr(q1, '"');
-	if (!q2 || q1 == q2)
+	while (!found) {
+		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		if (n == 0)
+			break;
+		buf[n] = '\0';
+
+		/* Search in overlap+buf to handle boundary splits */
+		char combined[sizeof(overlap) + sizeof(buf)];
+		size_t olen = strlen(overlap);
+		memcpy(combined, overlap, olen);
+		memcpy(combined + olen, buf, n + 1);
+
+		char *key = strstr(combined, "\"Name\"");
+		if (key) {
+			char *colon = strchr(key + 6, ':');
+			if (colon) {
+				q1 = strchr(colon, '"');
+				if (q1) {
+					q1++;
+					if (*q1 == '/')
+						q1++;
+					q2 = strchr(q1, '"');
+					if (q2 && q1 != q2)
+						found = 1;
+				}
+			}
+		}
+
+		if (!found) {
+			/* Keep last 255 bytes as overlap for boundary */
+			size_t total = olen + n;
+			size_t keep = total < sizeof(overlap) - 1 ?
+				      total : sizeof(overlap) - 1;
+			memcpy(overlap, combined + total - keep, keep);
+			overlap[keep] = '\0';
+		}
+	}
+	fclose(f);
+
+	if (!found)
 		return 0;
 
 	/* Build path: "docker/<container_name>" */
@@ -641,6 +668,104 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 		return 0;
 	snprintf(dst, dstlen, "docker/%.*s", (int)name_len, q1);
 	return 1;
+}
+
+/*
+ * In-memory cache for docker name resolution.
+ * Maps container ID (64 hex chars) → "docker/<name>".
+ * Avoids repeated fopen/fread of config.v2.json per event.
+ */
+#define DOCKER_NAME_CACHE_SIZE 256
+
+static struct {
+	char container_id[65];       /* 64 hex + NUL */
+	char resolved[EV_CGROUP_LEN];
+	int  negative;               /* 1 = tried and failed, don't retry */
+} docker_name_cache[DOCKER_NAME_CACHE_SIZE];
+static int docker_name_cache_count;
+static pthread_rwlock_t g_docker_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/* Extract container ID from cgroup path, returns pointer to 64-char hex or NULL */
+static const char *extract_docker_id(const char *path)
+{
+	const char *last = strrchr(path, '/');
+	const char *base = last ? last + 1 : path;
+	if (strncmp(base, "docker-", 7) != 0)
+		return NULL;
+	const char *hash = base + 7;
+	const char *dot = strstr(hash, ".scope");
+	if (!dot || (dot - hash) != 64)
+		return NULL;
+	return hash;
+}
+
+/*
+ * Resolve cgroup for HTTP output: if docker resolve is enabled and
+ * path contains docker-<hash>.scope, resolve to docker/<name>.
+ * Uses in-memory cache to avoid repeated filesystem reads.
+ * Otherwise, copy raw path as-is.
+ */
+void http_resolve_cgroup(const char *raw, char *buf, int buflen)
+{
+	if (!cfg_docker_resolve_names || !raw[0]) {
+		snprintf(buf, buflen, "%s", raw);
+		return;
+	}
+
+	const char *id = extract_docker_id(raw);
+	if (!id) {
+		snprintf(buf, buflen, "%s", raw);
+		return;
+	}
+
+	/* Lookup in cache (rdlock) */
+	pthread_rwlock_rdlock(&g_docker_cache_lock);
+	for (int i = 0; i < docker_name_cache_count; i++) {
+		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
+			if (docker_name_cache[i].negative) {
+				/* Previously failed — pass raw path */
+				snprintf(buf, buflen, "%s", raw);
+			} else {
+				snprintf(buf, buflen, "%s",
+					 docker_name_cache[i].resolved);
+			}
+			pthread_rwlock_unlock(&g_docker_cache_lock);
+			return;
+		}
+	}
+	pthread_rwlock_unlock(&g_docker_cache_lock);
+
+	/* Cache miss — resolve from filesystem */
+	char resolved[EV_CGROUP_LEN];
+	int ok = resolve_docker_name(raw, resolved, sizeof(resolved));
+
+	/* Store in cache (wrlock) */
+	pthread_rwlock_wrlock(&g_docker_cache_lock);
+	/* Double-check: another thread may have added it */
+	for (int i = 0; i < docker_name_cache_count; i++) {
+		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
+			pthread_rwlock_unlock(&g_docker_cache_lock);
+			snprintf(buf, buflen, "%s", ok ? resolved : raw);
+			return;
+		}
+	}
+	if (docker_name_cache_count < DOCKER_NAME_CACHE_SIZE) {
+		memcpy(docker_name_cache[docker_name_cache_count].container_id,
+		       id, 64);
+		docker_name_cache[docker_name_cache_count].container_id[64] = '\0';
+		if (ok) {
+			snprintf(docker_name_cache[docker_name_cache_count].resolved,
+				 sizeof(docker_name_cache[0].resolved),
+				 "%s", resolved);
+			docker_name_cache[docker_name_cache_count].negative = 0;
+		} else {
+			docker_name_cache[docker_name_cache_count].negative = 1;
+		}
+		docker_name_cache_count++;
+	}
+	pthread_rwlock_unlock(&g_docker_cache_lock);
+
+	snprintf(buf, buflen, "%s", ok ? resolved : raw);
 }
 
 static void scan_cgroup_dir(const char *base, const char *rel)
@@ -652,18 +777,11 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 	if (stat(full, &st) == 0 && cgroup_cache_count < MAX_CGROUPS) {
 		cgroup_cache[cgroup_cache_count].id = (__u64)st.st_ino;
 
-		/* Always store real filesystem path */
+		/* Store raw filesystem path (docker names resolved lazily on output) */
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
 			 sizeof(cgroup_cache[0].fs_path), "%s", rel);
-
-		/* Try to resolve Docker container name for display */
-		char docker_name[EV_CGROUP_LEN];
-		if (resolve_docker_name(rel, docker_name, sizeof(docker_name)))
-			snprintf(cgroup_cache[cgroup_cache_count].path,
-				 sizeof(cgroup_cache[0].path), "%s", docker_name);
-		else
-			snprintf(cgroup_cache[cgroup_cache_count].path,
-				 sizeof(cgroup_cache[0].path), "%s", rel);
+		snprintf(cgroup_cache[cgroup_cache_count].path,
+			 sizeof(cgroup_cache[0].path), "%s", rel);
 		cgroup_cache_count++;
 	}
 
@@ -769,13 +887,8 @@ static void cgroup_cache_add(__u64 id, const char *path)
 		if (cgroup_cache[i].id == id) {
 			snprintf(cgroup_cache[i].fs_path,
 				 sizeof(cgroup_cache[0].fs_path), "%s", path);
-			char docker_name[EV_CGROUP_LEN];
-			if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
-				snprintf(cgroup_cache[i].path,
-					 sizeof(cgroup_cache[0].path), "%s", docker_name);
-			else
-				snprintf(cgroup_cache[i].path,
-					 sizeof(cgroup_cache[0].path), "%s", path);
+			snprintf(cgroup_cache[i].path,
+				 sizeof(cgroup_cache[0].path), "%s", path);
 			pthread_rwlock_unlock(&g_cgroup_lock);
 			return;
 		}
@@ -785,13 +898,8 @@ static void cgroup_cache_add(__u64 id, const char *path)
 		cgroup_cache[cgroup_cache_count].id = id;
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
 			 sizeof(cgroup_cache[0].fs_path), "%s", path);
-		char docker_name[EV_CGROUP_LEN];
-		if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
-			snprintf(cgroup_cache[cgroup_cache_count].path,
-				 sizeof(cgroup_cache[0].path), "%s", docker_name);
-		else
-			snprintf(cgroup_cache[cgroup_cache_count].path,
-				 sizeof(cgroup_cache[0].path), "%s", path);
+		snprintf(cgroup_cache[cgroup_cache_count].path,
+			 sizeof(cgroup_cache[0].path), "%s", path);
 		cgroup_cache_count++;
 	}
 	pthread_rwlock_unlock(&g_cgroup_lock);
@@ -1082,6 +1190,8 @@ static int load_config(const char *path)
 	/* Docker resolve settings */
 	config_setting_t *dk = config_lookup(&cfg, "docker");
 	if (dk) {
+		if (config_setting_lookup_bool(dk, "resolve_names", &bool_val))
+			cfg_docker_resolve_names = bool_val;
 		if (config_setting_lookup_string(dk, "data_root", &str_val))
 			snprintf(cfg_docker_data_root, sizeof(cfg_docker_data_root),
 				 "%s", str_val);
