@@ -266,8 +266,9 @@ int csv_format_row(char *buf, int buflen,
 	}
 	U32(ev->loginuid);
 	/* login_name (resolved from loginuid) */
-	if (resolvers && resolvers->resolve_uid &&
-	    ev->loginuid != 4294967295U) {
+	if (ev->loginuid == 4294967295U) {
+		STR("AUDIT_UID_UNSET", 64);
+	} else if (resolvers && resolvers->resolve_uid) {
 		char lname[64];
 		resolvers->resolve_uid(ev->loginuid, lname, sizeof(lname));
 		STR(lname, 64);
