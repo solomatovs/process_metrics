@@ -78,7 +78,7 @@ MIN_CLANG_VER := 10
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
-.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse
+.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse compat
 
 help:
 	@echo "process_metrics — событийный BPF-коллектор метрик процессов"
@@ -91,6 +91,7 @@ help:
 	@echo "  make binary     скомпилировать userspace-бинарник"
 	@echo "  make clean      удалить артефакты сборки"
 	@echo "  make test       запустить юнит-тесты"
+	@echo "  make compat     проверить совместимость BPF с разными ядрами"
 	@echo ""
 	@echo "Обнаруженный clang: $(or $(CLANG),НЕ НАЙДЕН — установите clang >= $(MIN_CLANG_VER))"
 	@echo "Версия ядра:        $(shell uname -r)"
@@ -222,3 +223,8 @@ test-clickhouse: $(BINARY)
 	tests/test_clickhouse_integration.sh
 
 test: test-unit
+
+# --- проверка совместимости с ядрами ---
+
+compat: $(BPFTOOL_BIN)
+	tests/compat_kernels.sh
