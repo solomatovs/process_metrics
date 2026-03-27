@@ -79,6 +79,18 @@ struct {
 	__uint(max_entries, RINGBUF_CGROUP_SIZE);
 } events_cgroup SEC(".maps");
 
+/*
+ * thread_cpu_map: предыдущее значение utime+stime каждого потока
+ * для дельта-трекинга CPU в sched_switch (O(1) вместо обхода thread list).
+ * Ключ = pid (thread ID), значение = последнее utime+stime.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PROCS);
+	__type(key, __u32);           /* pid (thread id) */
+	__type(value, __u64);         /* last seen utime+stime */
+} thread_cpu_map SEC(".maps");
+
 /* Статистика ring buffer'ов: потери и общее количество событий */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -194,74 +206,8 @@ static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 	return mi;
 }
 
-/*
- * THREAD_CPU_STEP — один шаг обхода linked list потоков.
- *
- * signal->thread_head → task->thread_node → task->thread_node → ...
- * (circular: последний .next == head_addr)
- *
- * node   — текущий указатель struct list_head * (в ядре)
- * off    — CO-RE смещение thread_node внутри task_struct
- * head   — адрес signal->thread_head (маркер конца кольца)
- * u, s   — аккумуляторы utime/stime
- */
-#define THREAD_CPU_STEP(node, off, head, u, s)				\
-do {									\
-	if ((node) != (head)) {						\
-		struct task_struct *__t =				\
-			(struct task_struct *)((char *)(node) - (off));	\
-		(u) += BPF_CORE_READ(__t, utime);			\
-		(s) += BPF_CORE_READ(__t, stime);			\
-		struct list_head __ln;					\
-		bpf_core_read(&__ln, sizeof(__ln), (node));		\
-		(node) = __ln.next;					\
-	}								\
-} while (0)
-
-/* THREAD_CPU_STEP_x4 — 4 шага за раз для компактности */
-#define THREAD_CPU_4(n, o, h, u, s) \
-	THREAD_CPU_STEP(n, o, h, u, s); \
-	THREAD_CPU_STEP(n, o, h, u, s); \
-	THREAD_CPU_STEP(n, o, h, u, s); \
-	THREAD_CPU_STEP(n, o, h, u, s)
-
-#define THREAD_CPU_16(n, o, h, u, s) \
-	THREAD_CPU_4(n, o, h, u, s); \
-	THREAD_CPU_4(n, o, h, u, s); \
-	THREAD_CPU_4(n, o, h, u, s); \
-	THREAD_CPU_4(n, o, h, u, s)
-
-static __always_inline __u64 read_cpu_ns(struct task_struct *task)
-{
-	/*
-	 * signal->{utime,stime} накапливает CPU завершённых потоков.
-	 * Обходим до 64 живых потоков через thread_head / thread_node.
-	 * Для процессов с > 64 потоками — неучтённый «хвост».
-	 */
-	__u64 u = BPF_CORE_READ(task, signal, utime);
-	__u64 s = BPF_CORE_READ(task, signal, stime);
-
-	/* Адрес thread_head = sig + CO-RE offset */
-	struct signal_struct *sig = BPF_CORE_READ(task, signal);
-	if (!sig)
-		return u + s;
-
-	unsigned long off = bpf_core_field_offset(struct task_struct, thread_node);
-	void *head = (void *)sig +
-		     bpf_core_field_offset(struct signal_struct, thread_head);
-
-	/* Первый узел: thread_head.next */
-	struct list_head lh;
-	bpf_core_read(&lh, sizeof(lh), head);
-	void *node = lh.next;
-
-	THREAD_CPU_16(node, off, head, u, s);  /*  1–16 */
-	THREAD_CPU_16(node, off, head, u, s);  /* 17–32 */
-	THREAD_CPU_16(node, off, head, u, s);  /* 33–48 */
-	THREAD_CPU_16(node, off, head, u, s);  /* 49–64 */
-
-	return u + s;
-}
+/* read_cpu_ns удалён — CPU считается через дельта-трекинг
+ * в sched_switch (thread_cpu_map), см. handle_sched_switch. */
 
 /*
  * Виртуальная память процесса в страницах.
@@ -729,8 +675,31 @@ int handle_sched_switch(void *ctx)
 	if (mi.rss_pages > info->rss_max_pages)
 		info->rss_max_pages = mi.rss_pages;
 
-	/* Время CPU (нс) — приблизительно для многопоточных */
-	info->cpu_ns = read_cpu_ns(task);
+	/*
+	 * CPU (нс) — дельта-трекинг по task->utime + task->stime.
+	 *
+	 * Читаем ТОЛЬКО per-thread utime/stime (не signal->utime),
+	 * чтобы избежать двойного подсчёта при смерти потоков.
+	 * O(1) на sched_switch, без лимита на число потоков.
+	 *
+	 * Первый sched_switch для каждого потока: запоминаем значение,
+	 * дельту не добавляем. cpu_ns растёт с момента начала трекинга.
+	 */
+	{
+		__u32 tid = (__u32)pid_tgid;
+		__u64 thr_cpu = BPF_CORE_READ(task, utime)
+			      + BPF_CORE_READ(task, stime);
+		__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map, &tid);
+		if (prev) {
+			if (thr_cpu > *prev)
+				__sync_fetch_and_add(&info->cpu_ns,
+						     thr_cpu - *prev);
+			*prev = thr_cpu;
+		} else {
+			bpf_map_update_elem(&thread_cpu_map, &tid,
+					    &thr_cpu, BPF_NOEXIST);
+		}
+	}
 
 	/* Виртуальная память (страницы) */
 	info->vsize_pages = read_vsize_pages(task);
@@ -787,16 +756,31 @@ int handle_exit(void *ctx)
 	__u32 pid  = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Обрабатываем только выход лидера группы потоков (процесса) */
-	if (pid != tgid)
-		return 0;
-
 	/* Только для отслеживаемых процессов */
 	struct track_info *ti = bpf_map_lookup_elem(&tracked_map, &tgid);
 	if (!ti)
 		return 0;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* Финальная дельта CPU для этого потока + cleanup thread_cpu_map */
+	{
+		struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
+		if (pi) {
+			__u64 thr_cpu = BPF_CORE_READ(task, utime)
+				      + BPF_CORE_READ(task, stime);
+			__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map,
+							  &pid);
+			if (prev && thr_cpu > *prev)
+				__sync_fetch_and_add(&pi->cpu_ns,
+						     thr_cpu - *prev);
+		}
+		bpf_map_delete_elem(&thread_cpu_map, &pid);
+	}
+
+	/* Для потоков (не лидера) — только дельта+cleanup, без события */
+	if (pid != tgid)
+		return 0;
 
 	/* Отправляем событие EXIT с финальными метриками */
 	RB_STAT_TOTAL_PROC();
@@ -817,8 +801,7 @@ int handle_exit(void *ctx)
 	e->root_pid = ti->root_pid;
 	e->rule_id  = ti->rule_id;
 
-	/* Финальный снимок метрик */
-	e->cpu_ns        = read_cpu_ns(task);
+	/* Финальный снимок метрик (cpu_ns уже накоплен через дельта-трекинг) */
 	struct mem_info exit_mi = read_mem_pages(task);
 	e->rss_pages     = exit_mi.rss_pages;
 	e->vsize_pages   = read_vsize_pages(task);
@@ -826,9 +809,10 @@ int handle_exit(void *ctx)
 	e->oom_score_adj = read_oom_score_adj(task);
 	e->exit_code     = BPF_CORE_READ(task, exit_code);
 
-	/* Переносим min/max rss, start_ns, oom_killed из proc_info */
+	/* Переносим накопленные метрики из proc_info */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
+		e->cpu_ns        = info->cpu_ns;
 		e->rss_min_pages = info->rss_min_pages;
 		e->rss_max_pages = info->rss_max_pages;
 		e->start_ns      = info->start_ns;
