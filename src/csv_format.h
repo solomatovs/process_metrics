@@ -20,15 +20,24 @@
 const char *csv_header(int *len);
 
 /*
+ * Resolver callbacks used during CSV formatting.
+ * Any field may be NULL — raw values are used as-is.
+ */
+struct csv_resolvers {
+	void (*resolve_cgroup)(const char *raw, char *out, int outlen);
+	void (*resolve_uid)(__u32 uid, char *out, int outlen);
+};
+
+/*
  * Format one ef_record as a CSV row into buf[0..buflen-1].
  *
- * resolve_cgroup: callback to resolve cgroup path (e.g. docker name).
- *                 May be NULL — raw cgroup is used as-is.
+ * resolvers: optional callbacks for lazy resolution (cgroup, uid).
+ *            May be NULL — raw values are used as-is.
  *
  * Returns number of bytes written (excluding NUL), or -1 if buf is too small.
  */
 int csv_format_row(char *buf, int buflen,
 		   const struct ef_record *rec,
-		   void (*resolve_cgroup)(const char *raw, char *out, int outlen));
+		   const struct csv_resolvers *resolvers);
 
 #endif /* CSV_FORMAT_H */

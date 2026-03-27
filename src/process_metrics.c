@@ -27,6 +27,8 @@
 #include <mntent.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <pwd.h>
+#include <dlfcn.h>
 #include <regex.h>
 #include <libconfig.h>
 #include <bpf/libbpf.h>
@@ -766,6 +768,160 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 	pthread_rwlock_unlock(&g_docker_cache_lock);
 
 	snprintf(buf, buflen, "%s", ok ? resolved : raw);
+}
+
+/*
+ * In-memory cache for UID → username resolution.
+ * Uses getpwuid_r() on cache miss, caches result.
+ */
+#define UID_NAME_CACHE_SIZE 512
+#define UID_NAME_MAX 64
+
+static struct {
+	__u32 uid;
+	char  name[UID_NAME_MAX];
+	int   valid;   /* 1 = entry used */
+} uid_name_cache[UID_NAME_CACHE_SIZE];
+static int uid_name_cache_count;
+static pthread_rwlock_t g_uid_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+/*
+ * Dynamic NSS-aware UID resolution for statically linked binaries.
+ *
+ * Static linking breaks getpwuid_r because glibc's NSS (Name Service Switch)
+ * uses dlopen() internally to load modules (libnss_sss.so, libnss_ldap.so, etc).
+ * In a statically linked binary, those dlopen calls fail silently, returning only
+ * entries from /etc/passwd and ignoring LDAP/SSSD/NIS backends.
+ *
+ * Solution: dlopen the system's shared libc.so.6 at runtime and call getpwuid_r
+ * through it.  The shared libc has full NSS support, so all configured backends
+ * (files, sss, ldap, etc.) work correctly.
+ *
+ * Fallback: if dlopen fails (e.g., no shared libc on the system), we parse
+ * /etc/passwd directly — covers the basic case.
+ */
+
+/* getpwuid_r signature for dlsym */
+typedef int (*getpwuid_r_fn)(uid_t, struct passwd *, char *, size_t,
+			     struct passwd **);
+static getpwuid_r_fn g_getpwuid_r;
+static int g_nss_init_done;
+
+static void init_nss_resolver(void)
+{
+	if (g_nss_init_done) return;
+	g_nss_init_done = 1;
+
+	/* Try to load shared libc for NSS support */
+	void *libc = dlopen("libc.so.6", RTLD_NOW | RTLD_NOLOAD);
+	if (!libc)
+		libc = dlopen("libc.so.6", RTLD_NOW);
+	if (libc) {
+		g_getpwuid_r = (getpwuid_r_fn)dlsym(libc, "getpwuid_r");
+		if (g_getpwuid_r)
+			fprintf(stderr, "[INFO] uid resolver: using NSS "
+				"(shared libc)\n");
+		else
+			fprintf(stderr, "[WARN] uid resolver: dlsym "
+				"getpwuid_r failed, fallback to "
+				"/etc/passwd\n");
+		/* intentionally don't dlclose — keep loaded */
+	} else {
+		fprintf(stderr, "[WARN] uid resolver: dlopen libc.so.6 "
+			"failed (%s), fallback to /etc/passwd\n",
+			dlerror());
+	}
+}
+
+/* Fallback: parse /etc/passwd directly (no NSS) */
+static int resolve_uid_from_passwd(__u32 uid, char *name, int namelen)
+{
+	FILE *f = fopen("/etc/passwd", "r");
+	if (!f) return 0;
+
+	char line[1024];
+	while (fgets(line, sizeof(line), f)) {
+		/* format: name:x:uid:gid:... */
+		char *colon1 = strchr(line, ':');
+		if (!colon1) continue;
+		char *colon2 = strchr(colon1 + 1, ':');
+		if (!colon2) continue;
+		char *colon3 = strchr(colon2 + 1, ':');
+		if (!colon3) continue;
+
+		*colon3 = '\0';
+		unsigned long file_uid = strtoul(colon2 + 1, NULL, 10);
+		if (file_uid == uid) {
+			*colon1 = '\0';
+			snprintf(name, namelen, "%s", line);
+			fclose(f);
+			return 1;
+		}
+	}
+	fclose(f);
+	return 0;
+}
+
+/* Resolve uid → username, trying NSS first, then /etc/passwd */
+static int resolve_uid_to_name(__u32 uid, char *name, int namelen)
+{
+	init_nss_resolver();
+
+	if (g_getpwuid_r) {
+		struct passwd pw, *result = NULL;
+		char pwbuf[1024];
+		int rc = g_getpwuid_r((uid_t)uid, &pw, pwbuf,
+				      sizeof(pwbuf), &result);
+		if (rc == 0 && result && result->pw_name) {
+			snprintf(name, namelen, "%s", result->pw_name);
+			return 1;
+		}
+	}
+
+	return resolve_uid_from_passwd(uid, name, namelen);
+}
+
+void http_resolve_uid(__u32 uid, char *buf, int buflen)
+{
+	if (buflen <= 0) return;
+	buf[0] = '\0';
+
+	/* Lookup in cache (rdlock) */
+	pthread_rwlock_rdlock(&g_uid_cache_lock);
+	for (int i = 0; i < uid_name_cache_count; i++) {
+		if (uid_name_cache[i].uid == uid) {
+			snprintf(buf, buflen, "%s", uid_name_cache[i].name);
+			pthread_rwlock_unlock(&g_uid_cache_lock);
+			return;
+		}
+	}
+	pthread_rwlock_unlock(&g_uid_cache_lock);
+
+	/* Cache miss — resolve via NSS or /etc/passwd */
+	char name[UID_NAME_MAX] = "";
+	resolve_uid_to_name(uid, name, sizeof(name));
+
+	/* Store in cache (wrlock) */
+	pthread_rwlock_wrlock(&g_uid_cache_lock);
+	/* Double-check */
+	for (int i = 0; i < uid_name_cache_count; i++) {
+		if (uid_name_cache[i].uid == uid) {
+			pthread_rwlock_unlock(&g_uid_cache_lock);
+			snprintf(buf, buflen, "%s",
+				 uid_name_cache[i].name);
+			return;
+		}
+	}
+	if (uid_name_cache_count < UID_NAME_CACHE_SIZE) {
+		uid_name_cache[uid_name_cache_count].uid = uid;
+		snprintf(uid_name_cache[uid_name_cache_count].name,
+			 UID_NAME_MAX, "%s", name);
+		uid_name_cache[uid_name_cache_count].valid = 1;
+		uid_name_cache_count++;
+	}
+	pthread_rwlock_unlock(&g_uid_cache_lock);
+
+	snprintf(buf, buflen, "%s", name);
 }
 
 static void scan_cgroup_dir(const char *base, const char *rel)

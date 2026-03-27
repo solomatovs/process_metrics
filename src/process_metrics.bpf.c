@@ -202,6 +202,33 @@ struct mem_info {
 	__u64 swap_pages;   /* записи подкачки */
 };
 
+/*
+ * CO-RE совместимость task_struct.state (ядро < 5.14) vs __state (ядро >= 5.14).
+ * В ванильном ядре 5.14 поле было переименовано state → __state.
+ * CentOS/RHEL 9 (ядро 5.14) уже содержит __state (backport).
+ */
+struct task_struct___old {
+	long unsigned int state;
+};
+
+/*
+ * Структура mm_rss_stat — для CO-RE совместимости с ядрами 6.x,
+ * где mm_struct.rss_stat это struct mm_rss_stat { atomic_long_t count[4]; }.
+ * В ядрах 5.x (CentOS 9, RHEL 9) rss_stat — массив percpu_counter[4]
+ * без вложенной структуры mm_rss_stat.
+ */
+struct mm_rss_stat___new {
+	atomic_long_t count[4];
+};
+
+struct mm_struct___new {
+	struct mm_rss_stat___new rss_stat;
+};
+
+struct mm_struct___old {
+	struct percpu_counter rss_stat[4];
+};
+
 static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 {
 	struct mem_info mi = {0};
@@ -211,10 +238,27 @@ static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 
 	/* MM_FILEPAGES=0, MM_ANONPAGES=1, MM_SWAPENTS=2, MM_SHMEMPAGES=3 */
 	long v0 = 0, v1 = 0, v2 = 0, v3 = 0;
-	bpf_core_read(&v0, sizeof(v0), &mm->rss_stat.count[0].counter);
-	bpf_core_read(&v1, sizeof(v1), &mm->rss_stat.count[1].counter);
-	bpf_core_read(&v2, sizeof(v2), &mm->rss_stat.count[2].counter);
-	bpf_core_read(&v3, sizeof(v3), &mm->rss_stat.count[3].counter);
+
+	if (bpf_core_field_exists(((struct mm_struct___new *)0)->rss_stat.count)) {
+		/*
+		 * Ядро 6.x: mm->rss_stat это struct mm_rss_stat { atomic_long_t count[4]; }
+		 */
+		struct mm_struct___new *mm_new = (void *)mm;
+		bpf_core_read(&v0, sizeof(v0), &mm_new->rss_stat.count[0].counter);
+		bpf_core_read(&v1, sizeof(v1), &mm_new->rss_stat.count[1].counter);
+		bpf_core_read(&v2, sizeof(v2), &mm_new->rss_stat.count[2].counter);
+		bpf_core_read(&v3, sizeof(v3), &mm_new->rss_stat.count[3].counter);
+	} else {
+		/*
+		 * Ядро 5.x: mm->rss_stat это percpu_counter[4],
+		 * читаем приблизительное значение из percpu_counter.count (s64).
+		 */
+		struct mm_struct___old *mm_old = (void *)mm;
+		bpf_core_read(&v0, sizeof(v0), &mm_old->rss_stat[0].count);
+		bpf_core_read(&v1, sizeof(v1), &mm_old->rss_stat[1].count);
+		bpf_core_read(&v2, sizeof(v2), &mm_old->rss_stat[2].count);
+		bpf_core_read(&v3, sizeof(v3), &mm_old->rss_stat[3].count);
+	}
 
 	long total = v0 + v1 + v3;
 	mi.rss_pages   = total > 0 ? (__u64)total : 0;
@@ -794,8 +838,12 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	/* Cgroup — может измениться при перемещении процесса между cgroup */
 	info->cgroup_id = bpf_get_current_cgroup_id();
 
-	/* Состояние процесса — task->__state (ядро 5.14+) */
-	unsigned int task_state = BPF_CORE_READ(task, __state);
+	/* Состояние процесса — task->__state (ядро 5.14+), task->state (ядро < 5.14) */
+	unsigned int task_state = 0;
+	if (bpf_core_field_exists(task->__state))
+		task_state = BPF_CORE_READ(task, __state);
+	else
+		task_state = (unsigned int)BPF_CORE_READ((struct task_struct___old *)task, state);
 	info->state = state_to_char(task_state);
 
 	/* UID — обновляем при каждом sched_switch (может измениться через setuid) */

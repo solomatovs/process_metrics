@@ -10,6 +10,8 @@
 #ifndef HTTP_SERVER_H
 #define HTTP_SERVER_H
 
+#include <linux/types.h>
+
 struct http_config {
 	int  port;           /* listen port (default: 9091) */
 	char bind[64];       /* bind address (default: "0.0.0.0") */
@@ -23,6 +25,12 @@ struct http_config {
  * buf must be at least EV_CGROUP_LEN bytes.
  */
 void http_resolve_cgroup(const char *raw, char *buf, int buflen);
+
+/*
+ * Resolve UID to username from /etc/passwd (cached).
+ * If not found, buf is set to empty string.
+ */
+void http_resolve_uid(__u32 uid, char *buf, int buflen);
 
 /*
  * Start the HTTP server in a background thread.

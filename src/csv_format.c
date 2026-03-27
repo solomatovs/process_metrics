@@ -20,7 +20,7 @@
 
 static const char CSV_HEADER_STR[] =
 	"timestamp,hostname,event_type,rule,tags,"
-	"root_pid,pid,ppid,uid,loginuid,sessionid,euid,tty_nr,"
+	"root_pid,pid,ppid,uid,user_name,loginuid,login_name,sessionid,euid,euser_name,tty_nr,"
 	"comm,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
 	"cpu_ns,cpu_usage_ratio,"
 	"rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
@@ -227,7 +227,7 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 
 int csv_format_row(char *buf, int buflen,
 		   const struct ef_record *rec,
-		   void (*resolve_cgroup)(const char *raw, char *out, int outlen))
+		   const struct csv_resolvers *resolvers)
 {
 	/*
 	 * Worst-case row size estimate:
@@ -256,9 +256,34 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->pid);
 	U32(ev->ppid);
 	U32(ev->uid);
+	/* user_name (resolved from uid) */
+	if (resolvers && resolvers->resolve_uid) {
+		char uname[64];
+		resolvers->resolve_uid(ev->uid, uname, sizeof(uname));
+		STR(uname, 64);
+	} else {
+		*p++ = '"'; *p++ = '"'; COMMA();
+	}
 	U32(ev->loginuid);
+	/* login_name (resolved from loginuid) */
+	if (resolvers && resolvers->resolve_uid &&
+	    ev->loginuid != 4294967295U) {
+		char lname[64];
+		resolvers->resolve_uid(ev->loginuid, lname, sizeof(lname));
+		STR(lname, 64);
+	} else {
+		*p++ = '"'; *p++ = '"'; COMMA();
+	}
 	U32(ev->sessionid);
 	U32(ev->euid);
+	/* euser_name (resolved from euid) */
+	if (resolvers && resolvers->resolve_uid) {
+		char ename[64];
+		resolvers->resolve_uid(ev->euid, ename, sizeof(ename));
+		STR(ename, 64);
+	} else {
+		*p++ = '"'; *p++ = '"'; COMMA();
+	}
 	U32(ev->tty_nr);
 
 	/* ── process metadata ───────────────────────────────────────── */
@@ -267,9 +292,10 @@ int csv_format_row(char *buf, int buflen,
 	STR(ev->args, CMDLINE_MAX);
 
 	/* cgroup: resolve docker names if callback provided */
-	if (resolve_cgroup) {
+	if (resolvers && resolvers->resolve_cgroup) {
 		char cg_resolved[EV_CGROUP_LEN];
-		resolve_cgroup(ev->cgroup, cg_resolved, sizeof(cg_resolved));
+		resolvers->resolve_cgroup(ev->cgroup, cg_resolved,
+					  sizeof(cg_resolved));
 		STR(cg_resolved, EV_CGROUP_LEN);
 	} else {
 		STR(ev->cgroup, EV_CGROUP_LEN);

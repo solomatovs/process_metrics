@@ -41,7 +41,11 @@ static volatile int  g_running;
 
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
-	return csv_format_row(buf, buflen, rec, http_resolve_cgroup);
+	static const struct csv_resolvers resolvers = {
+		.resolve_cgroup = http_resolve_cgroup,
+		.resolve_uid    = http_resolve_uid,
+	};
+	return csv_format_row(buf, buflen, rec, &resolvers);
 }
 
 /*
