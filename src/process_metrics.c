@@ -55,7 +55,8 @@
 
 /* ── configuration ────────────────────────────────────────────────── */
 
-#define MAX_RULES    64
+#define MAX_RULES       64
+#define RULE_NOT_MATCH  "NOT_MATCH"
 #define MAX_CGROUPS  256
 #define PATH_MAX_LEN 512
 
@@ -1844,7 +1845,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Имя правила по rule_id из track_info (O(1)) */
 		const char *rname = (ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : "?";
+			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		log_debug("FILE_CLOSE: pid=%u rule=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
@@ -1912,7 +1913,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Имя правила по rule_id (O(1)) */
 		const char *rname = (ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : "?";
+			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		log_debug("NET_CLOSE: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
@@ -1989,14 +1990,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Определяем правило: сначала по отправителю, потом по получателю */
 		struct track_info ti;
-		const char *rname = "?";
+		const char *rname = RULE_NOT_MATCH;
 		if (bpf_map_lookup_elem(tracked_map_fd, &se->sender_tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
-				? rules[ti.rule_id].name : "?";
+				? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		if (rname[0] == '?' && rname[1] == '\0') {
 			if (bpf_map_lookup_elem(tracked_map_fd, &se->target_pid, &ti) == 0)
 				rname = (ti.rule_id < num_rules)
-					? rules[ti.rule_id].name : "?";
+					? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		}
 
 		log_debug("SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
@@ -2094,6 +2095,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 
 			/* Время: clock_gettime (ретрансмиты редкие) */
 			struct timespec ts_now;
@@ -2166,6 +2168,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
@@ -2236,6 +2239,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
@@ -2381,7 +2385,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Отправляем fork-событие в буферный файл */
 		if (g_http_cfg.enabled) {
 			const char *rname = (parent_ti.rule_id < num_rules)
-				? rules[parent_ti.rule_id].name : "unknown";
+				? rules[parent_ti.rule_id].name : RULE_NOT_MATCH;
 			char cg_buf[PATH_MAX_LEN];
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
@@ -2409,7 +2413,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				exit_rule_id = ti.rule_id;
 		}
 		const char *rname = (exit_rule_id < num_rules)
-			? rules[exit_rule_id].name : "?";
+			? rules[exit_rule_id].name : RULE_NOT_MATCH;
 
 		char exit_tags[TAGS_MAX_LEN];
 #ifdef NO_TAGS
@@ -2467,14 +2471,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) != 0)
 			try_track_pid(e->tgid);
-		const char *rname = "?";
+		const char *rname = RULE_NOT_MATCH;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
-				? rules[ti.rule_id].name : "?";
+				? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		if (rname[0] == '?' && rname[1] == '\0') {
 			if (bpf_map_lookup_elem(tracked_map_fd, &e->ppid, &ti) == 0)
 				rname = (ti.rule_id < num_rules)
-					? rules[ti.rule_id].name : "?";
+					? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		}
 		log_ts("WARN", "OOM_KILL: pid=%u rule=%s comm=%.16s "
 		       "rss=%lluMB",
@@ -2872,7 +2876,7 @@ static void write_snapshot(void)
 		}
 
 		const char *rule_name = (ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : "unknown";
+			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		/* Refresh cmdline + comm from /proc */
 		if (cfg_refresh_proc) {
@@ -3080,6 +3084,7 @@ static void write_snapshot(void)
 			    && (uval.tx_packets || uval.rx_packets)) {
 				struct metric_event cev;
 				memset(&cev, 0, sizeof(cev));
+				snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 				cev.timestamp_ns = snap_timestamp_ns;
 				snprintf(cev.event_type, sizeof(cev.event_type),
 					 "udp_agg");
@@ -3150,6 +3155,7 @@ static void write_snapshot(void)
 			    && ival.count > 0) {
 				struct metric_event cev;
 				memset(&cev, 0, sizeof(cev));
+				snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
 				cev.timestamp_ns = snap_timestamp_ns;
 				snprintf(cev.event_type, sizeof(cev.event_type),
 					 "icmp_agg");
