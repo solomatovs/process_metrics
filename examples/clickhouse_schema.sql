@@ -2,7 +2,7 @@
 --
 -- Одна таблица для всех типов событий: snapshot, fork, exec, exit, oom_kill,
 -- file_close, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv,
--- udp_agg, icmp_agg.
+-- udp_agg, icmp_agg, disk_usage.
 -- Выполнить один раз на сервере ClickHouse.
 --
 -- Проектные решения:
@@ -13,14 +13,24 @@
 --     pid перед timestamp — выборка истории процесса читает смежные блоки.
 --     timestamp последним — диапазонные выборки внутри pid идут последовательно.
 --
+--   Projection proj_time_series:
+--     Основной ORDER BY оптимален для точечных запросов по PID, но для типичных
+--     Grafana-запросов (GROUP BY time с фильтром по timestamp range) timestamp
+--     стоит слишком поздно в ключе, и ClickHouse сканирует все гранулы event_type.
+--     Projection переупорядочивает данные как (hostname, event_type, timestamp, rule, pid),
+--     позволяя пропускать гранулы по диапазону времени — ускорение ~10x.
+--     Ценой ~50-80% дополнительного дискового пространства.
+--
 --   Кодеки:
 --     Delta    — для монотонно возрастающих счётчиков (cpu_ns, io_*, faults, ctxsw).
 --                Delta хранит разности между последовательными значениями; для медленно
 --                растущих счётчиков разности малы → ZSTD сжимает их до битов.
+--     DoubleDelta — для timestamp-подобных значений (start_time_ns), которые не
+--                монотонны в рамках гранулы (разные PID'ы), но имеют малые вторые разности.
 --     Gorilla  — IEEE 754 XOR-сжатие для чисел с плавающей точкой (cpu_usage_ratio).
 --                Соседние значения snapshot'ов близки → большинство XOR-битов нулевые.
 --     T64      — блочная упаковка для целых чисел, не использующих весь 64-битный диапазон
---                (PID'ы, потоки, exit_code, OOM-флаги, лимиты cgroup).
+--                (PID'ы, потоки, exit_code, OOM-флаги, лимиты cgroup, rss_min/max).
 --     ZSTD(1)  — финальное универсальное сжатие на каждой колонке.
 --                Уровень 1 даёт ~95% максимальной степени сжатия при ~10x быстрее.
 --
@@ -33,13 +43,19 @@
 --     Помесячно = 1-2 активные партиции, меньше накладных расходов на слияние,
 --     та же гранулярность TTL (ClickHouse удаляет партиции, где ВСЕ строки истекли).
 --
+--   TTL:
+--     Общий TTL: 30 дней.
+--     file_close (39% объёма) — 7 дней: эти события нужны для оперативного анализа,
+--     а долгосрочное хранение неоправданно из-за объёма.
+--
 --   Skip-индексы:
 --     bloom_filter на pid — быстрые точечные запросы ("покажи историю PID 12345")
 --       без сканирования всех партиций. Работает потому что pid не является первой
---       колонкой ключа, и без индекса ClickHouse сканировал бы все гранулы
---       в пределах префикса (hostname, event_type, rule).
+--       колонкой ключа, и без индекса ClickHouse сканировал бы все гранулы.
+--     bloom_filter на cgroup, login_name — используются в фильтрах Grafana-дашбордов,
+--       но не входят в primary key.
+--     bloom_filter на sec_remote_addr — фильтрация в security-дашборде.
 
-DROP TABLE IF EXISTS process_metrics;
 CREATE TABLE IF NOT EXISTS process_metrics (
     -- ── идентификация ─────────────────────────────────────────────
     timestamp              DateTime64(3)               CODEC(Delta, ZSTD(1)),
@@ -76,8 +92,8 @@ CREATE TABLE IF NOT EXISTS process_metrics (
 
     -- ── память ────────────────────────────────────────────────────
     rss_bytes              UInt64                      CODEC(Delta, ZSTD(1)),
-    rss_min_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
-    rss_max_bytes          UInt64                      CODEC(Delta, ZSTD(1)),
+    rss_min_bytes          UInt64                      CODEC(T64, ZSTD(1)),
+    rss_max_bytes          UInt64                      CODEC(T64, ZSTD(1)),
     shmem_bytes            UInt64                      CODEC(Delta, ZSTD(1)),
     swap_bytes             UInt64                      CODEC(Delta, ZSTD(1)),
     vsize_bytes            UInt64                      CODEC(Delta, ZSTD(1)),
@@ -104,7 +120,7 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
 
     -- ── временны́е метки ───────────────────────────────────────────
-    start_time_ns          UInt64                      CODEC(Delta, ZSTD(1)),
+    start_time_ns          UInt64                      CODEC(DoubleDelta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
 
     -- ── пространства имён (inum из /proc/PID/ns) ────────────────
@@ -168,12 +184,17 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
 
     -- ── skip-индексы ──────────────────────────────────────────────
-    INDEX idx_pid pid TYPE bloom_filter(0.01) GRANULARITY 4
+    INDEX idx_pid       pid            TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_cgroup    cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_login     login_name     TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_sec_addr  sec_remote_addr TYPE bloom_filter(0.01) GRANULARITY 4
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (hostname, event_type, rule, pid, timestamp)
-TTL timestamp + INTERVAL 30 DAY
+TTL
+    timestamp + INTERVAL 7 DAY DELETE WHERE event_type = 'file_close',
+    timestamp + INTERVAL 30 DAY DELETE
 SETTINGS
     index_granularity = 8192,
     min_bytes_for_wide_part = 10485760,      -- 10 МБ: маленькие части остаются компактными
@@ -181,10 +202,29 @@ SETTINGS
 
 
 -- ══════════════════════════════════════════════════════════════════════
+-- Projection для ускорения time-series запросов Grafana (~10x)
+--
+-- Основной ORDER BY оптимален для точечных запросов по PID, но для типичных
+-- дашбордов (GROUP BY toStartOfInterval(timestamp, ...) с фильтром по диапазону)
+-- timestamp стоит последним в ключе → ClickHouse сканирует все гранулы event_type.
+--
+-- Projection переупорядочивает как (hostname, event_type, timestamp, rule, pid),
+-- что позволяет пропускать гранулы вне запрошенного диапазона времени.
+-- ══════════════════════════════════════════════════════════════════════
+
+ALTER TABLE process_metrics ADD PROJECTION IF NOT EXISTS proj_time_series (
+    SELECT *
+    ORDER BY (hostname, event_type, timestamp, rule, pid)
+);
+
+ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;
+
+
+-- ══════════════════════════════════════════════════════════════════════
 -- Обновляемое материализованное представление — автоматический pull
 -- из HTTP-сервера process_metrics
 --
--- ClickHouse периодически (каждые 30 секунд) забирает CSV с HTTP-сервера
+-- ClickHouse периодически (каждые 3 секунды) забирает CSV с HTTP-сервера
 -- process_metrics и вставляет строки в таблицу process_metrics.
 --
 -- Требования:
@@ -211,7 +251,7 @@ SETTINGS
 -- Временна́я метка в формате ISO 8601 (YYYY-MM-DD HH:MM:SS.mmm, UTC).
 -- ══════════════════════════════════════════════════════════════════════
 
--- Пример: забирать данные с server1 каждые 30 секунд
+-- Пример: забирать данные с server1 каждые 3 секунды
 -- RANDOMIZE FOR — при ошибке (например, перезапуск process_metrics)
 -- ClickHouse сдвигает следующий refresh на случайный интервал,
 -- чтобы избежать зависания планировщика.
@@ -222,51 +262,9 @@ TO process_metrics
 AS
 SELECT * REPLACE (if(tags = '', [], splitByChar('|', tags)) AS tags)
 FROM url(
-    'http://server1:10003/metrics?format=csv&clear=1',
+    'http://server1:9091/metrics?format=csv&clear=1',
     'CSVWithNames',
-    'timestamp DateTime64(3, 'UTC'), hostname String, event_type String, rule String, tags String,
-     root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32, user_name String,
-     loginuid UInt32, login_name String, sessionid UInt32, euid UInt32, euser_name String, tty_nr UInt32,
-     comm String, exec String, args String, cgroup String, pwd String,
-     is_root UInt8, state String, exit_code UInt32, sched_policy UInt32,
-     cpu_ns UInt64, cpu_usage_ratio Float64,
-     rss_bytes UInt64, rss_min_bytes UInt64, rss_max_bytes UInt64,
-     shmem_bytes UInt64, swap_bytes UInt64, vsize_bytes UInt64,
-     io_read_bytes UInt64, io_write_bytes UInt64,
-     io_rchar UInt64, io_wchar UInt64, io_syscr UInt64, io_syscw UInt64,
-     maj_flt UInt64, min_flt UInt64,
-     nvcsw UInt64, nivcsw UInt64, threads UInt32, oom_score_adj Int16, oom_killed UInt8,
-     net_tx_bytes UInt64, net_rx_bytes UInt64,
-     start_time_ns UInt64, uptime_seconds UInt64,
-     mnt_ns UInt32, pid_ns UInt32, net_ns UInt32, cgroup_ns UInt32,
-     preempted_by_pid UInt32, preempted_by_comm String,
-     cgroup_memory_max Int64, cgroup_memory_current Int64, cgroup_swap_current Int64,
-     cgroup_cpu_weight Int64, cgroup_cpu_max Int64, cgroup_cpu_max_period Int64,
-     cgroup_cpu_nr_periods Int64, cgroup_cpu_nr_throttled Int64, cgroup_cpu_throttled_usec Int64,
-     cgroup_pids_current Int64,
-     file_path String, file_flags UInt32, file_read_bytes UInt64, file_write_bytes UInt64,
-     file_open_count UInt32,
-     net_local_addr String, net_remote_addr String, net_local_port UInt16, net_remote_port UInt16,
-     net_conn_tx_bytes UInt64, net_conn_rx_bytes UInt64, net_duration_ms UInt64,
-     sig_num UInt32, sig_target_pid UInt32, sig_target_comm String,
-     sig_code Int32, sig_result Int32,
-     sec_local_addr String, sec_remote_addr String,
-     sec_local_port UInt16, sec_remote_port UInt16,
-     sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
-     open_tcp_conns UInt64,
-     disk_total_bytes UInt64, disk_used_bytes UInt64, disk_avail_bytes UInt64'
-);
-
--- ══════════════════════════════════════════════════════════════════════
--- Альтернатива: разовый импорт (без материализованного представления)
--- ВАЖНО: необходимо указать явную структуру, чтобы избежать двойного GET
--- ══════════════════════════════════════════════════════════════════════
-
-INSERT INTO process_metrics
-SELECT * FROM url(
-    'http://server1:10003/metrics?format=csv&clear=1',
-    'CSVWithNames',
-    'timestamp DateTime64(3, 'UTC'), hostname String, event_type String, rule String, tags String,
+    'timestamp DateTime64(3, ''UTC''), hostname String, event_type String, rule String, tags String,
      root_pid UInt32, pid UInt32, ppid UInt32, uid UInt32, user_name String,
      loginuid UInt32, login_name String, sessionid UInt32, euid UInt32, euser_name String, tty_nr UInt32,
      comm String, exec String, args String, cgroup String, pwd String,
