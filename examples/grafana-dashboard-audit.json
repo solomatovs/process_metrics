@@ -1,0 +1,927 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "Audit log dashboard: process lifecycle, file access, network connections, signals",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "title": "Overview",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisLabel": "",
+            "fillOpacity": 30,
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "legend": {
+          "calcs": [
+            "sum"
+          ],
+          "displayMode": "table",
+          "placement": "right"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 0,
+          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 1 MINUTE) as time, event_type, count() as count FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${event_type}' = 'All' OR event_type = '${event_type}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') GROUP BY time, event_type ORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "title": "Events Timeline",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 9
+      },
+      "id": 3,
+      "options": {
+        "barWidth": 0.8,
+        "groupWidth": 0.7,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "orientation": "horizontal",
+        "showValue": "always",
+        "tooltip": {
+          "mode": "single"
+        },
+        "xTickLabelRotation": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "rawSql": "SELECT event_type as label, count() as value FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') GROUP BY event_type ORDER BY value DESC",
+          "refId": "A"
+        }
+      ],
+      "title": "Events by Type",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 9
+      },
+      "id": 4,
+      "options": {
+        "barWidth": 0.8,
+        "groupWidth": 0.7,
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "orientation": "horizontal",
+        "showValue": "always",
+        "tooltip": {
+          "mode": "single"
+        },
+        "xTickLabelRotation": 0
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "rawSql": "SELECT if(login_name = '', 'unknown', login_name) as login_user, count() as count FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${event_type}' = 'All' OR event_type = '${event_type}') AND ('${rule}' = 'All' OR rule = '${rule}') GROUP BY login_user ORDER BY count DESC LIMIT 15",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Users",
+      "type": "barchart"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_CLICKHOUSE}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 9
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "single"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "format": 1,
+          "rawSql": "SELECT comm, count() as count FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${event_type}' = 'All' OR event_type = '${event_type}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND comm != '' GROUP BY comm ORDER BY count DESC LIMIT 20",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Processes",
+      "type": "barchart"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 6,
+      "panels": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 12,
+            "w": 24,
+            "x": 0,
+            "y": 18
+          },
+          "id": 7,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, rule, pid, ppid, comm, exec, args, cgroup, uid, is_root FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'exec' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${comm_search}' = '' OR comm LIKE '%${comm_search}%' OR exec LIKE '%${comm_search}%' OR args LIKE '%${comm_search}%') ORDER BY timestamp DESC LIMIT 500",
+              "refId": "A"
+            }
+          ],
+          "title": "Process Exec Log",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 12,
+            "w": 24,
+            "x": 0,
+            "y": 30
+          },
+          "id": 8,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, rule, pid, comm, exit_code, oom_killed, cpu_ns / 1000000000.0 as cpu_sec, rss_max_bytes / 1048576 as rss_max_mb, uptime_seconds, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'exit' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${comm_search}' = '' OR comm LIKE '%${comm_search}%') AND (exit_code != 0 OR oom_killed = 1) ORDER BY timestamp DESC LIMIT 500",
+              "refId": "A"
+            }
+          ],
+          "title": "Abnormal Process Exits (exit_code != 0 or OOM killed)",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 42
+          },
+          "id": 9,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, pid, comm, exec, rss_max_bytes / 1048576 as rss_max_mb, oom_score_adj, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type IN ('exit', 'oom_kill') AND oom_killed = 1 AND ('${hostname}' = 'All' OR hostname = '${hostname}') ORDER BY timestamp DESC LIMIT 200",
+              "refId": "A"
+            }
+          ],
+          "title": "OOM Kills",
+          "type": "table"
+        }
+      ],
+      "title": "Process Lifecycle Audit",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 10,
+      "panels": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 14,
+            "w": 24,
+            "x": 0,
+            "y": 19
+          },
+          "id": 11,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, rule, pid, comm, file_path, file_read_bytes, file_write_bytes, file_open_count, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'file_close' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${comm_search}' = '' OR comm LIKE '%${comm_search}%') AND ('${file_search}' = '' OR file_path LIKE '%${file_search}%') ORDER BY timestamp DESC LIMIT 500",
+              "refId": "A"
+            }
+          ],
+          "title": "File Access Log",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 0,
+            "y": 33
+          },
+          "id": 12,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "total_write"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT file_path, count() as access_count, sum(file_write_bytes) as total_write, sum(file_read_bytes) as total_read, groupUniqArray(10)(comm) as processes FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'file_close' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${file_search}' = '' OR file_path LIKE '%${file_search}%') AND file_write_bytes > 0 GROUP BY file_path ORDER BY total_write DESC LIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "title": "Top Files by Write Volume",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 12,
+            "y": 33
+          },
+          "id": 13,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "access_count"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT file_path, count() as access_count, uniqExact(pid) as unique_pids, groupUniqArray(10)(comm) as processes FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'file_close' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${file_search}' = '' OR file_path LIKE '%${file_search}%') GROUP BY file_path ORDER BY access_count DESC LIMIT 50",
+              "refId": "A"
+            }
+          ],
+          "title": "Top Files by Access Count",
+          "type": "table"
+        }
+      ],
+      "title": "File Access Audit",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 19
+      },
+      "id": 14,
+      "panels": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 14,
+            "w": 24,
+            "x": 0,
+            "y": 20
+          },
+          "id": 15,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, rule, pid, comm, net_local_addr || ':' || toString(net_local_port) as local, net_remote_addr || ':' || toString(net_remote_port) as remote, net_conn_tx_bytes as tx_bytes, net_conn_rx_bytes as rx_bytes, net_duration_ms / 1000.0 as duration_sec, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'net_close' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${comm_search}' = '' OR comm LIKE '%${comm_search}%') AND ('${net_search}' = '' OR net_remote_addr LIKE '%${net_search}%' OR net_local_addr LIKE '%${net_search}%' OR toString(net_remote_port) LIKE '%${net_search}%') ORDER BY timestamp DESC LIMIT 500",
+              "refId": "A"
+            }
+          ],
+          "title": "Network Connections Log",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 0,
+            "y": 34
+          },
+          "id": 16,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, comm, sec_remote_addr || ':' || toString(sec_remote_port) as source, sec_local_addr || ':' || toString(sec_local_port) as destination, rule, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'syn_recv' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${net_search}' = '' OR sec_remote_addr LIKE '%${net_search}%' OR sec_local_addr LIKE '%${net_search}%') ORDER BY timestamp DESC LIMIT 200",
+              "refId": "A"
+            }
+          ],
+          "title": "Inbound Connections (SYN)",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 12,
+            "x": 12,
+            "y": 34
+          },
+          "id": 17,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, event_type, hostname, comm, pid, sec_remote_addr || ':' || toString(sec_remote_port) as remote, sec_local_addr || ':' || toString(sec_local_port) as local, rule FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type IN ('tcp_retrans', 'rst_sent', 'rst_recv') AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') ORDER BY timestamp DESC LIMIT 200",
+              "refId": "A"
+            }
+          ],
+          "title": "TCP Anomalies (RST + Retransmits)",
+          "type": "table"
+        }
+      ],
+      "title": "Network Audit",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "id": 18,
+      "panels": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 12,
+            "w": 24,
+            "x": 0,
+            "y": 21
+          },
+          "id": 19,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, pid as sender_pid, comm as sender_comm, sig_num, sig_target_pid, sig_target_comm, sig_code, sig_result, rule, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'signal' AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND ('${rule}' = 'All' OR rule = '${rule}') AND ('${user}' = 'All' OR login_name = '${user}') AND ('${comm_search}' = '' OR comm LIKE '%${comm_search}%' OR sig_target_comm LIKE '%${comm_search}%') ORDER BY timestamp DESC LIMIT 500",
+              "refId": "A"
+            }
+          ],
+          "title": "Signal Log",
+          "type": "table"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_CLICKHOUSE}"
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 33
+          },
+          "id": 20,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {
+              "enablePagination": true
+            },
+            "showHeader": true,
+            "sortBy": [
+              {
+                "desc": true,
+                "displayName": "timestamp"
+              }
+            ]
+          },
+          "targets": [
+            {
+              "datasource": {
+                "type": "grafana-clickhouse-datasource",
+                "uid": "${DS_CLICKHOUSE}"
+              },
+              "format": 1,
+              "rawSql": "SELECT timestamp, hostname, login_name, pid as sender_pid, comm as sender, sig_num, sig_target_pid, sig_target_comm as target, rule, cgroup FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND event_type = 'signal' AND sig_num IN (9, 15) AND ('${hostname}' = 'All' OR hostname = '${hostname}') ORDER BY timestamp DESC LIMIT 200",
+              "refId": "A"
+            }
+          ],
+          "title": "Kill Signals (SIGKILL=9, SIGTERM=15)",
+          "type": "table"
+        }
+      ],
+      "title": "Signal Audit",
+      "type": "row"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": [
+    "audit",
+    "process-metrics"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_CLICKHOUSE}"
+        },
+        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY hostname",
+        "includeAll": false,
+        "multi": false,
+        "name": "hostname",
+        "query": "SELECT 'All' UNION ALL SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY hostname",
+        "refresh": 2,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_CLICKHOUSE}"
+        },
+        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT event_type FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY event_type",
+        "includeAll": false,
+        "multi": false,
+        "name": "event_type",
+        "query": "SELECT 'All' UNION ALL SELECT DISTINCT event_type FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY event_type",
+        "refresh": 2,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_CLICKHOUSE}"
+        },
+        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY rule",
+        "includeAll": false,
+        "multi": false,
+        "name": "rule",
+        "query": "SELECT 'All' UNION ALL SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime ORDER BY rule",
+        "refresh": 2,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "All"
+        },
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_CLICKHOUSE}"
+        },
+        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT login_name FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND login_name != '' ORDER BY login_name",
+        "includeAll": false,
+        "label": "Login user",
+        "multi": false,
+        "name": "user",
+        "query": "SELECT 'All' UNION ALL SELECT DISTINCT login_name FROM default.process_metrics WHERE timestamp >= $__fromTime AND timestamp <= $__toTime AND login_name != '' ORDER BY login_name",
+        "refresh": 2,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        "label": "Process filter",
+        "name": "comm_search",
+        "options": [],
+        "query": "",
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        "label": "File path filter",
+        "name": "file_search",
+        "options": [],
+        "query": "",
+        "type": "textbox"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "",
+          "value": ""
+        },
+        "label": "Network filter (addr:port)",
+        "name": "net_search",
+        "options": [],
+        "query": "",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "Audit Log",
+  "uid": "audit-log",
+  "__inputs": [
+    {
+      "name": "DS_CLICKHOUSE",
+      "label": "ClickHouse",
+      "description": "ClickHouse datasource",
+      "type": "datasource",
+      "pluginId": "grafana-clickhouse-datasource",
+      "pluginName": "ClickHouse"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "grafana-clickhouse-datasource",
+      "name": "ClickHouse",
+      "version": "3.0.0"
+    }
+  ]
+}
