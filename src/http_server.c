@@ -97,14 +97,22 @@ static int csv_escape_field(const char *src, char *dst, int dstlen)
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
 	const struct metric_event *ev = &rec->event;
-	char hostname_esc[600], event_type_esc[32], rule_esc[150], tags_esc[1100];
-	char comm_esc[200], exec_esc[600];
-	char args_esc[600], cgroup_esc[600], state_esc[8];
-	char file_path_esc[600];
-	char net_local_esc[100], net_remote_esc[100];
-	char pwd_esc[600];
-	char sig_target_comm_esc[200];
-	char sec_local_esc[100], sec_remote_esc[100];
+	char hostname_esc[EV_ESC_SIZE(EF_HOSTNAME_LEN)];
+	char event_type_esc[EV_ESC_SIZE(EV_EVENT_TYPE_LEN)];
+	char rule_esc[EV_ESC_SIZE(EV_RULE_LEN)];
+	char tags_esc[EV_ESC_SIZE(EV_TAGS_LEN)];
+	char comm_esc[EV_ESC_SIZE(COMM_LEN)];
+	char exec_esc[EV_ESC_SIZE(CMDLINE_MAX)];
+	char args_esc[EV_ESC_SIZE(CMDLINE_MAX)];
+	char cgroup_esc[EV_ESC_SIZE(EV_CGROUP_LEN)];
+	char state_esc[EV_ESC_SIZE(2)];
+	char file_path_esc[EV_ESC_SIZE(FILE_PATH_MAX)];
+	char net_local_esc[EV_ESC_SIZE(EV_ADDR_LEN)];
+	char net_remote_esc[EV_ESC_SIZE(EV_ADDR_LEN)];
+	char pwd_esc[EV_ESC_SIZE(EV_PWD_LEN)];
+	char sig_target_comm_esc[EV_ESC_SIZE(COMM_LEN)];
+	char sec_local_esc[EV_ESC_SIZE(EV_ADDR_LEN)];
+	char sec_remote_esc[EV_ESC_SIZE(EV_ADDR_LEN)];
 
 	csv_escape_field(rec->hostname, hostname_esc, sizeof(hostname_esc));
 	csv_escape_field(ev->event_type, event_type_esc, sizeof(event_type_esc));

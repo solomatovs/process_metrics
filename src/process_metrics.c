@@ -59,7 +59,7 @@
 #define PATH_MAX_LEN 512
 
 struct rule {
-	char    name[64];
+	char    name[EV_RULE_LEN];
 	regex_t regex;
 	int     ignore;   /* 1 = не отслеживать совпавший процесс */
 };
@@ -69,7 +69,7 @@ static int         num_rules;
 
 /* Configuration values (loaded from libconfig) */
 static const char *cfg_config_file     = NULL;
-static char        cfg_hostname[256]               = "";
+static char        cfg_hostname[EF_HOSTNAME_LEN]    = "";
 static int         cfg_snapshot_interval           = 30;
 static int         cfg_cmdline_max_len             = 500;
 static int         cfg_exec_rate_limit             = 0;  /* 0 = unlimited */
@@ -217,7 +217,7 @@ static void refresh_boot_to_wall(void)
  *   После: 418k events, 0 drops   (0%),  kernel syscalls = 4.7% CPU
  */
 
-#define TAGS_MAX_LEN 512
+#define TAGS_MAX_LEN EV_TAGS_LEN
 #define TAGS_HT_SIZE 16384  /* must be power of 2 */
 
 #ifdef NO_TAGS
@@ -524,8 +524,8 @@ static void cpu_prev_remove(__u32 tgid)
 
 struct cgroup_entry {
 	__u64 id;
-	char  path[256];    /* display name (docker/xxx or original) */
-	char  fs_path[256]; /* real filesystem path under /sys/fs/cgroup */
+	char  path[EV_CGROUP_LEN];    /* display name (docker/xxx or original) */
+	char  fs_path[EV_CGROUP_LEN]; /* real filesystem path under /sys/fs/cgroup */
 };
 
 static struct cgroup_entry cgroup_cache[MAX_CGROUPS];
@@ -657,7 +657,7 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 			 sizeof(cgroup_cache[0].fs_path), "%s", rel);
 
 		/* Try to resolve Docker container name for display */
-		char docker_name[256];
+		char docker_name[EV_CGROUP_LEN];
 		if (resolve_docker_name(rel, docker_name, sizeof(docker_name)))
 			snprintf(cgroup_cache[cgroup_cache_count].path,
 				 sizeof(cgroup_cache[0].path), "%s", docker_name);
@@ -769,7 +769,7 @@ static void cgroup_cache_add(__u64 id, const char *path)
 		if (cgroup_cache[i].id == id) {
 			snprintf(cgroup_cache[i].fs_path,
 				 sizeof(cgroup_cache[0].fs_path), "%s", path);
-			char docker_name[256];
+			char docker_name[EV_CGROUP_LEN];
 			if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
 				snprintf(cgroup_cache[i].path,
 					 sizeof(cgroup_cache[0].path), "%s", docker_name);
@@ -785,7 +785,7 @@ static void cgroup_cache_add(__u64 id, const char *path)
 		cgroup_cache[cgroup_cache_count].id = id;
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
 			 sizeof(cgroup_cache[0].fs_path), "%s", path);
-		char docker_name[256];
+		char docker_name[EV_CGROUP_LEN];
 		if (resolve_docker_name(path, docker_name, sizeof(docker_name)))
 			snprintf(cgroup_cache[cgroup_cache_count].path,
 				 sizeof(cgroup_cache[0].path), "%s", docker_name);
@@ -1431,7 +1431,7 @@ static __u64 read_proc_cgroup_id(__u32 pid)
 	if (!f) return 0;
 
 	/* Find cgroup v2 line "0::/path" or fallback to first line */
-	char cg_path[256] = "";
+	char cg_path[EV_CGROUP_LEN] = "";
 	while (fgets(buf, sizeof(buf), f)) {
 		buf[strcspn(buf, "\n")] = '\0';
 		if (strncmp(buf, "0::", 3) == 0) {
@@ -2533,7 +2533,7 @@ static void write_snapshot(void)
 
 	/* Collect unique cgroups for cgroup metrics (with cached values) */
 	struct {
-		char path[256];
+		char path[EV_CGROUP_LEN];
 		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
 		int read;  /* 1 = values read from /sys/fs/cgroup */
 	} seen_cg[MAX_CGROUPS];

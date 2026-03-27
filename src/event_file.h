@@ -15,14 +15,29 @@
 #include <linux/types.h>
 #include "process_metrics_common.h"
 
+/* ── metric_event field sizes ────────────────────────────────────── */
+
+#define EV_EVENT_TYPE_LEN  12    /* "fork","exec","exit","oom_kill","snapshot","file_close" */
+#define EV_RULE_LEN        64   /* rule name */
+#define EV_TAGS_LEN        512  /* pipe-separated list of all matched rules */
+#define EV_CGROUP_LEN      512  /* cgroup path */
+#define EV_ADDR_LEN        46   /* formatted IP string (INET6_ADDRSTRLEN) */
+#define EV_PWD_LEN         512  /* current working directory */
+
+/*
+ * CSV escape worst case: every char doubled + 2 quotes + NUL.
+ * ESC(n) = (n) * 2 + 3
+ */
+#define EV_ESC_SIZE(n) ((n) * 2 + 3)
+
 /* ── metric event (shared by event_file, http_server, main) ──────── */
 
 struct metric_event {
 	/* ── common fields ─────────────────────────────────────────── */
 	__u64 timestamp_ns;
-	char  event_type[12];         /* "fork","exec","exit","oom_kill","snapshot","file_close" */
-	char  rule[64];
-	char  tags[512];              /* pipe-separated list of all matched rules */
+	char  event_type[EV_EVENT_TYPE_LEN];
+	char  rule[EV_RULE_LEN];
+	char  tags[EV_TAGS_LEN];     /* pipe-separated list of all matched rules */
 	__u32 root_pid;
 	__u32 pid;
 	__u32 ppid;
@@ -30,7 +45,7 @@ struct metric_event {
 	char  comm[COMM_LEN];
 	char  exec_path[CMDLINE_MAX]; /* executable path (argv[0]) */
 	char  args[CMDLINE_MAX];      /* arguments (argv[1..]) */
-	char  cgroup[256];
+	char  cgroup[EV_CGROUP_LEN];
 	__u8  is_root;
 	__u8  state;
 
@@ -73,8 +88,8 @@ struct metric_event {
 	__u32 file_open_count;
 
 	/* ── network tracking metrics (EVENT_NET_CLOSE only) ───────── */
-	char  net_local_addr[46];   /* formatted IP string */
-	char  net_remote_addr[46];  /* formatted IP string */
+	char  net_local_addr[EV_ADDR_LEN];   /* formatted IP string */
+	char  net_remote_addr[EV_ADDR_LEN];  /* formatted IP string */
 	__u16 net_local_port;
 	__u16 net_remote_port;
 	__u64 net_conn_tx_bytes;    /* bytes sent on this connection */
@@ -103,7 +118,7 @@ struct metric_event {
 	__u32 cgroup_ns_inum;       /* cgroup namespace */
 
 	/* ── filesystem ───────────────────────────────────────────── */
-	char  pwd[256];             /* current working directory */
+	char  pwd[EV_PWD_LEN];      /* current working directory */
 
 	/* ── signal tracking (EVENT_SIGNAL only) ──────────────────── */
 	__u32 sig_num;              /* signal number (SIGKILL=9, etc.) */
@@ -114,8 +129,8 @@ struct metric_event {
 
 	/* ── security tracking ────────────────────────────────────── */
 	/* TCP retransmit (EVENT_TCP_RETRANSMIT) */
-	char  sec_local_addr[46];   /* formatted IP string */
-	char  sec_remote_addr[46];  /* formatted IP string */
+	char  sec_local_addr[EV_ADDR_LEN];   /* formatted IP string */
+	char  sec_remote_addr[EV_ADDR_LEN];  /* formatted IP string */
 	__u16 sec_local_port;
 	__u16 sec_remote_port;
 	__u8  sec_af;               /* AF_INET=2, AF_INET6=10 */
