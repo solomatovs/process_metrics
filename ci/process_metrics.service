@@ -10,11 +10,9 @@
 #
 # Установка:
 #   sudo useradd -r -s /usr/sbin/nologin process_metrics
-#   sudo mkdir -p /app/process_metrics
-#   sudo chown nginx:nginx /app/process_metrics
-#   sudo cp build/process_metrics /app/process_metrics/process_metrics
-#   sudo mkdir -p /app/process_metrics
-#   sudo cp examples/process_metrics.conf /app/process_metrics/
+#   sudo cp build/process_metrics /usr/local/bin/
+#   sudo mkdir -p /etc/process_metrics
+#   sudo cp examples/process_metrics.conf /etc/process_metrics/
 #   sudo cp ci/process_metrics.service /etc/systemd/system/
 #   sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
 #   sudo sysctl --system
@@ -22,10 +20,10 @@
 #   sudo systemctl enable --now process_metrics
 #
 # Capabilities:
-#   CAP_BPF        — загрузка eBPF программ и работа с BPF-картами
-#   CAP_PERFMON    — подключение к tracepoints, kprobes, raw_tracepoints
-#   CAP_SYS_PTRACE — чтение /proc/PID/* процессов других пользователей
-#   CAP_KILL       — kill(pid, 0) для проверки liveness чужих процессов
+#   CAP_BPF            — загрузка eBPF программ и работа с BPF-картами
+#   CAP_PERFMON        — подключение к tracepoints, kprobes, raw_tracepoints
+#   CAP_SYS_PTRACE     — чтение /proc/PID/* процессов других пользователей
+#   CAP_KILL           — kill(pid, 0) для проверки liveness чужих процессов
 #   CAP_DAC_READ_SEARCH — чтение /sys/fs/cgroup/*, /proc/*/cgroup, tracefs
 #
 # Kernel requirements (см. ci/99-process-metrics.conf):
@@ -33,10 +31,18 @@
 #   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
 #   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
 #
-# Ресурсы (по результатам бенчмарков с catch-all правилом, ~1600 PIDs):
-#   CPU:  ~15% одного ядра (~0.15 core). Деградация начинается при < 0.25 core.
-#   RAM:  ~365 МБ (256 МБ ring buffer + BPF maps + hash tables).
-#         Минимум 512 МБ. OOM при < 256 МБ.
+# Ресурсы (по результатам стресс-тестирования, ~1600 PIDs, все коллекторы вкл):
+#
+#   CPU в production (snapshot_interval=60):  ~5-15% одного ядра.
+#       При стрессе (snapshot=3s + fork/exec storm): ~20% одного ядра.
+#       Деградация (ringbuf drops) начинается при CPUQuota < 20%.
+#       CPUQuota=25% — минимум без drops при экстремальной нагрузке.
+#
+#   RAM:  ~287 МБ (256 МБ BPF ring buffers + BPF maps + uid/docker кэш).
+#       BPF ring buffers размещаются в ядре и не учитываются в cgroup memory.
+#       Userspace RSS ≈ 30 МБ + HTTP-буфер (max_buffer_size, по умолчанию 256 МБ).
+#       MemoryMax=384M — достаточно с запасом. OOM при < 256 МБ.
+#
 #   Disk: 0 (все данные в RAM, disk I/O отсутствует).
 
 [Unit]
@@ -89,12 +95,12 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-# Ring buffer 256 МБ + BPF maps + рабочий набор ≈ 365 МБ.
-# 512 МБ — минимум. При < 256 МБ — OOM kill.
-MemoryMax=512M
-# ~15% одного ядра в production. 50% — безопасный запас (3×).
-# Деградация (drops) начинается при < 10%.
-CPUQuota=50%
+# Стресс-тест (snapshot=3s, fork storm, все коллекторы):
+#   CPUQuota=20%  → 0 drops (граница)
+#   CPUQuota=15%  → 70% drops
+#   RSS стабильно ~287 МБ при любой нагрузке
+MemoryMax=384M
+CPUQuota=25%
 
 # --- Hardening ---
 ProtectSystem=strict

@@ -2,19 +2,22 @@
 
 Мониторинг процессов Linux через eBPF. Отслеживает жизненный цикл процессов (exec/fork/exit/OOM), сетевые соединения (TCP connect/accept/close), файловые операции (open/close/read/write), сигналы, заполненность дисков и сетевые аномалии (retransmit, SYN flood, RST, UDP/ICMP flood).
 
-Работает по pull-модели: накапливает события в бинарный файл, отдаёт по HTTP в формате CSV или Prometheus. Внешний коллектор (ClickHouse Refreshable MV, Prometheus, Vector) периодически забирает данные.
+Работает по pull-модели: накапливает события в кольцевой буфер в памяти и отдаёт по HTTP в формате CSV. Внешний коллектор (ClickHouse Refreshable MV) периодически забирает данные. Disk I/O на горячем пути отсутствует.
 
 ## Возможности
 
 - **15 типов событий**: snapshot, fork, exec, exit, oom_kill, file_close, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv, udp_agg, icmp_agg, disk_usage
-- **65 метрик** на процесс: CPU, RSS, swap, I/O, page faults, context switches, threads, namespaces, cgroup v2, сеть, файлы, сигналы, диски
+- **65+ метрик** на процесс: CPU, RSS, swap, I/O, page faults, context switches, threads, namespaces, cgroup v2, сеть, файлы, сигналы, диски
 - **Правила отслеживания**: regex-фильтрация по командной строке с наследованием потомков
-- **Двухфазная доставка**: swap → send → commit. При сбое данные не теряются
-- **Security-пробы**: TCP retransmit, SYN flood, RST, UDP/ICMP — не привязаны к rules, захватывают весь трафик хоста
-- **Ротация файла данных**: автоматическое усечение при превышении лимита (по умолчанию 1 ГБ)
-- **Совместимость с ядрами 5.15+**: условная компиляция через макросы `BPF_ZERO` для обхода ограничений верификатора
+- **Кольцевой буфер в RAM**: все данные в памяти, без файлового I/O на горячем пути
+- **Резолвинг пользователей**: uid/euid/loginuid → текстовые имена через NSS (LDAP, SSSD, локальные)
+- **Аудит**: отслеживание loginuid (audit UID) для идентификации реального пользователя через sudo/su
+- **Docker resolve**: автоматическое определение имён контейнеров по cgroup path (без Docker socket)
+- **Security-пробы**: TCP retransmit, SYN flood, RST, UDP/ICMP — захватывают весь трафик хоста
+- **cgroup v2**: memory, swap, cpu.weight, pids из /sys/fs/cgroup
+- **Совместимость**: ядра 5.15+ (CO-RE + условная компиляция через `BPF_ZERO`)
 - **Перезагрузка без рестарта**: `SIGHUP` — пересканирование /proc и перезагрузка правил
-- **Статический бинарник**: один файл, переносимый между дистрибутивами
+- **Минимальные привилегии**: работает без root, только точечные capabilities (CAP_BPF, CAP_PERFMON, ...)
 
 ## Требования
 
@@ -33,12 +36,14 @@
 # Установка зависимостей (автоопределение apt/yum)
 make deps
 
-# Полная сборка: vmlinux.h + bpftool + BPF + статический бинарник
+# Полная сборка: vmlinux.h + bpftool + BPF + бинарник
 make all
 
 # Или с явным указанием clang
 make all CLANG=clang-15
 ```
+
+Бинарник линкуется частично динамически: glibc подключается динамически (для поддержки NSS — LDAP, SSSD, NIS), остальные библиотеки (libbpf, libelf, zlib, libconfig) — статически.
 
 ### Цели сборки
 
@@ -55,14 +60,6 @@ make all CLANG=clang-15
 | `make test-http` | Тесты HTTP-сервера |
 | `make test-clickhouse` | Интеграционные тесты ClickHouse |
 
-### Компиляторы
-
-| Что | Компилятор | Почему |
-|-----|-----------|--------|
-| BPF-код (`*.bpf.c`) | clang (`-target bpf`) | Единственный компилятор с backend для BPF-байткода |
-| Userspace (`*.c`) | clang (`-static`) | Статический бинарник, переносимый между дистрибутивами |
-| bpftool (vendored) | gcc | Внутренний Makefile bpftool требует gcc |
-
 ### Цепочка сборки
 
 ```
@@ -72,14 +69,17 @@ process_metrics.bpf.c → clang -target bpf -DKERN_VER_MAJOR=N → .bpf.o
     ↓
 bpftool gen skeleton → .skel.h (встроенный ELF ~500KB)
     ↓
-process_metrics.c → clang -static → build/process_metrics
+process_metrics.c + csv_format.c + event_file.c + http_server.c
+    → clang -Wl,-Bstatic (libbpf,libelf,zlib,libconfig) -Wl,-Bdynamic (libc)
+    → build/process_metrics
 ```
-
-Makefile автоматически определяет версию ядра (`KERN_VER_MAJOR`, `KERN_VER_MINOR`) и передаёт в BPF-компиляцию. На ядрах < 6.0 активируется макрос `BPF_ZERO` для обнуления padding-байтов на стеке (требование верификатора 5.15).
 
 ## Установка
 
 ```bash
+# Создание пользователя
+sudo useradd -r -s /usr/sbin/nologin process_metrics
+
 # Бинарник
 sudo cp build/process_metrics /usr/local/bin/
 
@@ -87,7 +87,7 @@ sudo cp build/process_metrics /usr/local/bin/
 sudo mkdir -p /etc/process_metrics
 sudo cp examples/process_metrics.conf /etc/process_metrics/
 
-# sysctl для BPF
+# sysctl для BPF (требуется на Debian/Astra Linux)
 sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
 sudo sysctl --system
 
@@ -114,62 +114,14 @@ sudo systemctl reload process_metrics   # или kill -HUP <pid>
 
 ## Конфигурация
 
-Один файл формата libconfig. Полный пример: [examples/process_metrics.conf](examples/process_metrics.conf).
-
-```conf
-snapshot_interval = 30;
-metric_prefix = "process_metrics";
-
-rules = (
-    { name = "nginx";    regex = "^nginx: "; },
-    { name = "dockerd";  regex = "/usr/bin/dockerd"; },
-    { name = "other";    regex = "."; }
-);
-
-cgroup_metrics = true;
-
-net_tracking = {
-    enabled = true;
-    track_bytes = false;
-};
-
-file_tracking = {
-    enabled = true;
-    track_bytes = false;
-    include = ( "/home", "/var/lib", "/etc" );
-    exclude = ( "/proc", "/sys", "/dev", "/run", "/tmp",
-                "/etc/ld.so.cache", "/etc/passwd", "/etc/group" );
-};
-
-disk_tracking = {
-    enabled = true;
-    exclude = ( "/boot/efi" );
-};
-
-security_tracking = {
-    tcp_retransmit = true;
-    syn_tracking = false;
-    rst_tracking = false;
-    udp_tracking = false;
-    icmp_tracking = false;
-    open_conn_count = false;
-};
-
-http_server = {
-    port = 9091;
-    bind = "0.0.0.0";
-    data_file = "/var/lib/process_metrics/events.dat";
-    max_data_file_size = 1073741824;  # 1 ГБ
-};
-```
+Один файл формата libconfig. Полный пример с описанием всех параметров: [examples/process_metrics.conf](examples/process_metrics.conf).
 
 ### Общие параметры
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
 | `hostname` | `gethostname()` | Идентификатор сервера |
-| `snapshot_interval` | `30` | Интервал снимков (секунды) |
-| `metric_prefix` | `process_metrics` | Префикс Prometheus-метрик |
+| `snapshot_interval` | `60` | Интервал снимков (секунды) |
 | `cmdline_max_len` | `500` | Макс. длина args в выводе |
 | `exec_rate_limit` | `0` (без лимита) | Лимит exec-событий/сек в ringbuf |
 | `log_level` | `1` | 0 = errors, 1 = info, 2 = debug |
@@ -178,13 +130,15 @@ http_server = {
 
 ### Правила (`rules`)
 
-Список объектов `{ name, regex }`. Regex применяется к полной командной строке процесса (`/proc/<pid>/cmdline`). При совпадении процесс и все его потомки отслеживаются. Первое совпадение побеждает. Перезагружаются по `SIGHUP`.
+Список объектов `{ name, regex, ignore }`. Regex применяется к полной командной строке процесса (`/proc/<pid>/cmdline`). При совпадении процесс и все его потомки отслеживаются. Первое совпадение побеждает. Перезагружаются по `SIGHUP`.
+
+`ignore = true` — процесс и его потомки НЕ отслеживаются. Должно стоять перед более общими правилами.
 
 ### Коллекторы
 
 | Коллектор | Описание | По умолчанию |
 |-----------|----------|-------------|
-| `cgroup_metrics` | memory.max, memory.current, cpu.weight, pids.current из cgroup v2 | вкл |
+| `cgroup_metrics` | memory.max, memory.current, memory.swap.current, cpu.weight, pids.current из cgroup v2 | вкл |
 | `net_tracking` | TCP connect/accept/close через kprobes. События `net_close` | выкл |
 | `file_tracking` | open/close/read/write через tracepoints. События `file_close` | выкл |
 | `disk_tracking` | Заполненность дисков через statvfs(). События `disk_usage` | вкл |
@@ -211,36 +165,39 @@ http_server = {
 
 ### Docker resolve
 
-Автоматический резолвинг имён Docker-контейнеров по cgroup path. Хэш контейнера в `docker-<hash>.scope` заменяется на имя контейнера. Кэш обновляется каждый `snapshot_interval`. `data_root` определяется из `daemon.json` или задаётся явно.
+Автоматический резолвинг имён Docker-контейнеров по cgroup path. Хэш контейнера в `docker-<hash>.scope` заменяется на имя контейнера. Работает без Docker socket — читает hostname файлы напрямую из overlay2. Кэш обновляется каждый `snapshot_interval`.
+
+### Резолвинг пользователей
+
+При формировании CSV автоматически подставляются текстовые имена пользователей:
+
+| Столбец | Источник | Описание |
+|---------|----------|----------|
+| `user_name` | uid | Эффективный владелец процесса |
+| `login_name` | loginuid | Audit UID — реальный пользователь (сохраняется через sudo/su) |
+| `euser_name` | euid | Effective UID |
+
+Резолвинг через NSS (`getpwuid_r`) — поддерживает LDAP, SSSD, NIS и локальные /etc/passwd. Результаты кэшируются с rwlock. `loginuid=4294967295` (не установлен) записывается как `AUDIT_UID_UNSET`.
 
 ## HTTP-сервер
 
-Если определена секция `http_server` с `port`, запускается встроенный HTTP-сервер.
+Встроенный HTTP/1.1 сервер с кольцевым буфером в памяти. Все данные в RAM — disk I/O отсутствует. Оптимизирован с помощью TCP_CORK и userspace буферизации (128 КБ чанки).
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
 | `port` | `9091` | Порт |
 | `bind` | `0.0.0.0` | Адрес привязки |
-| `data_file` | `/tmp/process_metrics_events.dat` | Файл накопления событий |
-| `max_data_file_size` | `1073741824` (1 ГБ) | Макс. размер файла (0 = без лимита) |
+| `max_buffer_size` | `268435456` (256 МБ) | Размер кольцевого буфера |
 
 ### Эндпоинты
 
 | URL | Описание |
 |-----|----------|
-| `GET /metrics?format=csv` | CSV-снапшот (буфер НЕ очищается) |
+| `GET /metrics` | CSV — все накопленные события (буфер НЕ очищается) |
+| `GET /metrics?format=csv` | То же (явный формат) |
 | `GET /metrics?format=csv&clear=1` | CSV + очистка буфера (для ClickHouse MV) |
-| `GET /metrics?format=prom` | Prometheus text exposition |
 
-Запрос с `clear=1` использует двухфазную доставку: `swap → send → commit`. При разрыве соединения данные сохраняются в `.pending` файле и отдаются при следующем запросе.
-
-### Ротация файла данных
-
-При превышении `max_data_file_size`:
-- Файл `events.dat` усекается (`ftruncate`) — старые данные теряются
-- Файл `.pending` (незабранные данные) также ограничен тем же лимитом — при превышении удаляется
-
-Защищает от переполнения диска при недоступности коллектора.
+При переполнении буфера старые события перезатираются (кольцевая семантика).
 
 ## Типы событий
 
@@ -270,9 +227,12 @@ ClickHouse забирает данные через Refreshable Materialized Vie
 -- 1. Создать таблицу
 clickhouse-client < examples/clickhouse_schema.sql
 
--- 2. Создать view для автоматического сбора (пример)
+-- 2. Миграция с предыдущей версии (добавление новых столбцов)
+clickhouse-client < examples/migrate.sql
+
+-- 3. Создать view для автоматического сбора
 CREATE MATERIALIZED VIEW process_metrics_pull_server1
-REFRESH EVERY 30 SECOND APPEND
+REFRESH EVERY 3 SECOND APPEND
 TO process_metrics
 AS SELECT * FROM url(
     'http://server1:9091/metrics?format=csv&clear=1',
@@ -280,13 +240,13 @@ AS SELECT * FROM url(
 );
 ```
 
-Требуется ClickHouse >= 23.12. Полная схема с кодеками и определением колонок — в [examples/clickhouse_schema.sql](examples/clickhouse_schema.sql).
+Требуется ClickHouse >= 23.12. Полная схема — в [examples/clickhouse_schema.sql](examples/clickhouse_schema.sql). Миграция — [examples/migrate.sql](examples/migrate.sql).
 
 ### Примеры запросов
 
 ```sql
 -- Текущее состояние процессов
-SELECT pid, comm, exec, rule,
+SELECT pid, comm, exec, rule, user_name, login_name,
        rss_bytes / 1048576 AS rss_mb,
        cpu_usage_ratio
 FROM process_metrics
@@ -294,12 +254,11 @@ WHERE event_type = 'snapshot'
   AND timestamp > now() - INTERVAL 1 MINUTE
 ORDER BY rss_bytes DESC;
 
--- Завершившиеся процессы за час
-SELECT timestamp, hostname, pid, comm, exec, args, rule,
-       exit_code, cpu_ns / 1e9 AS cpu_sec,
-       rss_max_bytes / 1048576 AS rss_max_mb
+-- Действия конкретного пользователя (через sudo/su)
+SELECT timestamp, comm, args, user_name, login_name
 FROM process_metrics
-WHERE event_type = 'exit'
+WHERE login_name = 'solomatovs'
+  AND event_type IN ('exec', 'exit')
   AND timestamp > now() - INTERVAL 1 HOUR
 ORDER BY timestamp DESC;
 
@@ -314,38 +273,11 @@ GROUP BY file_path
 ORDER BY total_write DESC
 LIMIT 10;
 
--- Сетевые соединения процесса
-SELECT timestamp, net_remote_addr, net_remote_port,
-       net_conn_tx_bytes, net_conn_rx_bytes,
-       net_duration_ms / 1000 AS duration_sec
-FROM process_metrics
-WHERE event_type = 'net_close'
-  AND pid = 1234
-ORDER BY timestamp DESC;
-
--- TCP retransmissions (аномалии сети)
+-- TCP retransmissions
 SELECT timestamp, sec_local_addr, sec_remote_addr,
        sec_local_port, sec_remote_port, sec_tcp_state
 FROM process_metrics
 WHERE event_type = 'tcp_retrans'
-  AND timestamp > now() - INTERVAL 1 HOUR
-ORDER BY timestamp DESC;
-
--- Заполненность дисков
-SELECT timestamp, comm AS device, file_path AS mount_point,
-       disk_total_bytes / 1073741824 AS total_gb,
-       disk_used_bytes / 1073741824 AS used_gb,
-       disk_avail_bytes / 1073741824 AS avail_gb,
-       round(disk_used_bytes * 100.0 / disk_total_bytes, 1) AS usage_pct
-FROM process_metrics
-WHERE event_type = 'disk_usage'
-  AND timestamp > now() - INTERVAL 5 MINUTE
-ORDER BY usage_pct DESC;
-
--- Сигналы (кто кого killнул)
-SELECT timestamp, comm, pid, sig_num, sig_target_pid, sig_target_comm, sig_result
-FROM process_metrics
-WHERE event_type = 'signal'
   AND timestamp > now() - INTERVAL 1 HOUR
 ORDER BY timestamp DESC;
 ```
@@ -357,9 +289,39 @@ ORDER BY timestamp DESC;
 | Файл | Описание |
 |------|----------|
 | [grafana-dashboard.json](examples/grafana-dashboard.json) | Основной дашборд: процессы, CPU, память, I/O, сеть, файлы, диски |
-| [grafana-security-dashboard.json](examples/grafana-security-dashboard.json) | Security: retransmissions, SYN flood, RST, UDP/ICMP, port scan detection |
+| [grafana-dashboard-security.json](examples/grafana-dashboard-security.json) | Security: retransmissions, SYN flood, RST, UDP/ICMP |
+
+Дашборды поддерживают фильтрацию по:
+- **hostname** — сервер
+- **login** — audit login (реальный пользователь, сохраняется через sudo/su)
+- **user** — эффективный пользователь (текущий uid)
+- **rule** — правило отслеживания
 
 Импорт: Grafana → Dashboards → Import → Upload JSON. Datasource — ClickHouse.
+
+## Systemd
+
+Включены два варианта systemd unit:
+
+| Файл | Описание |
+|------|----------|
+| [process_metrics.service](ci/process_metrics.service) | Современный (systemd >= 246): `AmbientCapabilities`, без root |
+| [process_metrics-legacy.service](ci/process_metrics-legacy.service) | Для старых systemd: через root + `User=` |
+
+### Ресурсы (по результатам стресс-тестирования)
+
+Тестовые условия: ~1600 PIDs, все коллекторы включены, snapshot_interval=3s, fork/exec storm.
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| CPUQuota | 25% | При 20% — 0 drops (граница), при 15% — 70% drops |
+| MemoryMax | 384M | RSS ~287 МБ стабильно. OOM при < 256 МБ |
+
+BPF ring buffers размещаются в ядре и не учитываются в cgroup memory. Userspace RSS ≈ 30 МБ + HTTP-буфер (max_buffer_size).
+
+### Hardening
+
+Основной unit включает: `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, `MemoryDenyWriteExecute=yes`, `RestrictNamespaces=yes`, `SystemCallFilter=@system-service bpf perf_event_open`.
 
 ## Capabilities и ядро
 
@@ -376,99 +338,37 @@ ORDER BY timestamp DESC;
 - `CONFIG_BPF_SYSCALL=y`
 - `CONFIG_BPF_EVENTS=y`
 - `CONFIG_DEBUG_INFO_BTF=y` (для CO-RE)
-- `kernel.perf_event_paranoid <= 2`
-- `kernel.unprivileged_bpf_disabled <= 1`
+- `kernel.perf_event_paranoid <= 2` (Debian default=3 блокирует CAP_PERFMON)
+- `kernel.unprivileged_bpf_disabled <= 1` (Debian default=2 блокирует CAP_BPF)
 
 ```bash
-sudo sysctl -w kernel.perf_event_paranoid=2
-sudo sysctl -w kernel.unprivileged_bpf_disabled=1
+# Или через sysctl.d (файл ci/99-process-metrics.conf)
+sudo cp ci/99-process-metrics.conf /etc/sysctl.d/
+sudo sysctl --system
 ```
 
 ### Совместимость ядер 5.15 / 6.x
 
 BPF верификатор ядра 5.15 требует инициализации каждого байта стековых переменных, включая padding. Ядро >= 6.0 допускает неинициализированный padding. Проект автоматически адаптируется: Makefile определяет `KERN_VER_MAJOR` и передаёт в BPF-компиляцию. Макрос `BPF_ZERO(var)` на ядрах < 6 выполняет `__builtin_memset`, на >= 6 — no-op.
 
-## Systemd
-
-Включены два варианта systemd unit:
-
-| Файл | Описание |
-|------|----------|
-| [process_metrics.service](ci/process_metrics.service) | Современный: `AmbientCapabilities`, без root |
-| [process_metrics-legacy.service](ci/process_metrics-legacy.service) | Для старых systemd: через root + `User=` |
-
-Hardening в основном unit: `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, `MemoryDenyWriteExecute=yes`, `MemoryMax=200M`, `CPUQuota=15%`.
-
-## Метрики (Prometheus)
-
-Отдаются через `GET /metrics?format=prom`. Обновляются каждые `snapshot_interval` секунд.
-
-Лейблы: `hostname`, `rule`, `root_pid`, `pid`. Метрика `_info` дополнительно содержит `comm`, `exec`, `args`, `cgroup`.
-
-### Per-process
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_info` | gauge | Метаданные в лейблах (всегда 1) |
-| `{prefix}_start_time_seconds` | gauge | Время запуска (unix epoch) |
-| `{prefix}_uptime_seconds` | gauge | Время работы |
-| `{prefix}_cpu_seconds_total` | counter | CPU-время (user + system) |
-| `{prefix}_cpu_usage_ratio` | gauge | Утилизация CPU (1.0 = 1 ядро) |
-| `{prefix}_rss_bytes` | gauge | Текущий RSS |
-| `{prefix}_rss_min_bytes` | gauge | Минимальный RSS |
-| `{prefix}_rss_max_bytes` | gauge | Максимальный RSS |
-| `{prefix}_vsize_bytes` | gauge | Виртуальная память |
-| `{prefix}_shmem_bytes` | gauge | Shared memory |
-| `{prefix}_swap_bytes` | gauge | Swap |
-| `{prefix}_io_read_bytes_total` | counter | Прочитано с диска |
-| `{prefix}_io_write_bytes_total` | counter | Записано на диск |
-| `{prefix}_major_page_faults_total` | counter | Major page faults |
-| `{prefix}_minor_page_faults_total` | counter | Minor page faults |
-| `{prefix}_voluntary_ctxsw_total` | counter | Добровольные переключения контекста |
-| `{prefix}_involuntary_ctxsw_total` | counter | Принудительные переключения контекста |
-| `{prefix}_net_tx_bytes_total` | counter | TCP+UDP отправлено |
-| `{prefix}_net_rx_bytes_total` | counter | TCP+UDP получено |
-| `{prefix}_threads` | gauge | Потоки |
-| `{prefix}_oom_score_adj` | gauge | OOM score adjustment |
-| `{prefix}_state` | gauge | Состояние (R/S/D/T/Z) |
-
-### Завершившиеся процессы
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_exited_exit_code` | gauge | Код завершения |
-| `{prefix}_exited_signal` | gauge | Сигнал |
-| `{prefix}_exited_cpu_seconds_total` | gauge | CPU-время |
-| `{prefix}_exited_rss_max_bytes` | gauge | Максимальный RSS |
-| `{prefix}_exited_net_tx_bytes_total` | gauge | Сетевой TX |
-| `{prefix}_exited_net_rx_bytes_total` | gauge | Сетевой RX |
-
-### Per-cgroup (cgroup v2)
-
-| Метрика | Тип | Описание |
-|---------|-----|----------|
-| `{prefix}_cgroup_memory_max_bytes` | gauge | memory.max |
-| `{prefix}_cgroup_memory_current_bytes` | gauge | memory.current |
-| `{prefix}_cgroup_memory_swap_current_bytes` | gauge | memory.swap.current |
-| `{prefix}_cgroup_cpu_weight` | gauge | cpu.weight |
-| `{prefix}_cgroup_pids_current` | gauge | pids.current |
-
 ## Структура проекта
 
 ```
 src/
   process_metrics.bpf.c        — BPF-программа (tracepoints, kprobes)
-  process_metrics.c            — userspace: загрузчик, конфиг, снапшоты
+  process_metrics.c            — userspace: загрузчик, конфиг, снапшоты, uid-кэш
   process_metrics_common.h     — общие типы (BPF <-> userspace)
-  event_file.c/h               — двухфазная доставка событий (swap/commit)
-  http_server.c/h              — встроенный HTTP/1.1 сервер
+  csv_format.c/h               — форматирование CSV (резолвинг uid → username)
+  event_file.c/h               — кольцевой буфер событий в памяти
+  http_server.c/h              — встроенный HTTP/1.1 сервер (TCP_CORK + 128KB буфер)
   vmlinux.h                    — типы ядра (CO-RE, генерируется)
   bpftool/                     — vendored bpftool
 examples/
-  process_metrics.conf         — пример конфигурации
+  process_metrics.conf         — пример конфигурации (все параметры)
   clickhouse_schema.sql        — DDL таблицы + materialized view
+  migrate.sql                  — миграция схемы ClickHouse
   grafana-dashboard.json       — основной Grafana-дашборд
-  grafana-security-dashboard.json — security-дашборд
+  grafana-dashboard-security.json — security-дашборд
 ci/
   process_metrics.service      — systemd unit (современный)
   process_metrics-legacy.service — systemd unit (legacy)
