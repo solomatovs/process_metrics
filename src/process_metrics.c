@@ -2142,6 +2142,105 @@ static void add_descendants(struct scan_entry *entries, int count,
 	}
 }
 
+/* ── seed_sock_map: заполнение sock_map существующими сокетами ─────── */
+/*
+ * После initial_scan tracked_map содержит все отслеживаемые PID.
+ * Для каждого из них сканируем /proc/<pid>/fd/ и находим socket-inode'ы.
+ * Затем запускаем BPF iter/tcp, который для каждого TCP-сокета ядра
+ * проверяет inode в seed_inode_map и добавляет найденные в sock_map.
+ */
+static void seed_sock_map(void)
+{
+	if (!cfg_net_tracking_enabled)
+		return;
+
+	int seed_fd = bpf_map__fd(skel->maps.seed_inode_map);
+	if (seed_fd < 0)
+		return;
+
+	/* Проход по tracked_map → для каждого PID сканируем /proc/<pid>/fd/ */
+	__u32 key = 0, next_key;
+	int seeded = 0;
+
+	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0) {
+		key = next_key;
+		__u32 pid = key;
+
+		char fd_dir[64];
+		snprintf(fd_dir, sizeof(fd_dir), "/proc/%u/fd", pid);
+		DIR *dd = opendir(fd_dir);
+		if (!dd)
+			continue;
+
+		struct dirent *de;
+		while ((de = readdir(dd)) != NULL) {
+			if (de->d_type != DT_LNK && de->d_type != DT_UNKNOWN)
+				continue;
+
+			char link_path[128], target[128];
+			snprintf(link_path, sizeof(link_path),
+				 "/proc/%u/fd/%s", pid, de->d_name);
+			ssize_t len = readlink(link_path, target,
+					       sizeof(target) - 1);
+			if (len <= 0)
+				continue;
+			target[len] = '\0';
+
+			/* socket:[12345] → inode=12345 */
+			if (strncmp(target, "socket:[", 8) != 0)
+				continue;
+			__u64 ino = (__u64)strtoull(target + 8, NULL, 10);
+			if (ino == 0)
+				continue;
+
+			bpf_map_update_elem(seed_fd, &ino, &pid, BPF_NOEXIST);
+			seeded++;
+		}
+		closedir(dd);
+	}
+
+	if (seeded == 0) {
+		log_ts("INFO", "seed_sock_map: no socket inodes found");
+		return;
+	}
+
+	/* Запускаем BPF iter/tcp */
+	struct bpf_link *link = bpf_program__attach_iter(
+		skel->progs.seed_sock_map_iter, NULL);
+	if (!link) {
+		log_ts("WARN", "seed_sock_map: attach_iter failed: %s",
+		       strerror(errno));
+		goto cleanup;
+	}
+
+	int iter_fd = bpf_iter_create(bpf_link__fd(link));
+	if (iter_fd < 0) {
+		log_ts("WARN", "seed_sock_map: iter_create failed: %s",
+		       strerror(errno));
+		bpf_link__destroy(link);
+		goto cleanup;
+	}
+
+	/* Читаем до EOF — это запускает BPF-программу для каждого TCP-сокета */
+	char drain[256];
+	while (read(iter_fd, drain, sizeof(drain)) > 0)
+		;
+
+	close(iter_fd);
+	bpf_link__destroy(link);
+
+	log_ts("INFO", "seed_sock_map: scanned %d socket inodes", seeded);
+
+cleanup:
+	/* Очищаем seed_inode_map */
+	key = 0;
+	__u64 ino_key = 0, ino_next;
+	while (bpf_map_get_next_key(seed_fd, &ino_key, &ino_next) == 0) {
+		bpf_map_delete_elem(seed_fd, &ino_next);
+		ino_key = ino_next;
+	}
+}
+
 static void initial_scan(void)
 {
 	log_ts("INFO", "initial scan: reading /proc...");
@@ -3869,6 +3968,119 @@ static void write_snapshot(void)
 	free(all_keys);
 	free(all_values);
 
+	/* ── conn_snapshot: метрики живых TCP-соединений ──────────────── */
+	int conn_count = 0;
+	if (cfg_net_tracking_enabled && g_http_cfg.enabled) {
+		int sm_fd = bpf_map__fd(skel->maps.sock_map);
+
+		struct timespec boot_ts;
+		clock_gettime(CLOCK_BOOTTIME, &boot_ts);
+		__u64 boot_ns = (__u64)boot_ts.tv_sec * 1000000000ULL
+			      + (__u64)boot_ts.tv_nsec;
+
+		__u64 sk_key;
+		int sk_err = bpf_map_get_next_key(sm_fd, NULL, &sk_key);
+		while (sk_err == 0) {
+			__u64 sk_next;
+			int sk_next_err = bpf_map_get_next_key(sm_fd,
+							       &sk_key,
+							       &sk_next);
+			struct sock_info si;
+			if (bpf_map_lookup_elem(sm_fd, &sk_key, &si) == 0) {
+				struct track_info ti;
+				if (bpf_map_lookup_elem(tracked_map_fd,
+							&si.tgid, &ti) == 0)
+				{
+					const char *rname =
+						(ti.rule_id < num_rules)
+						? rules[ti.rule_id].name
+						: RULE_NOT_MATCH;
+
+					struct metric_event cev;
+					memset(&cev, 0, sizeof(cev));
+					cev.timestamp_ns = snap_timestamp_ns;
+					snprintf(cev.event_type,
+						 sizeof(cev.event_type),
+						 "conn_snapshot");
+					snprintf(cev.rule,
+						 sizeof(cev.rule),
+						 "%s", rname);
+#ifndef NO_TAGS
+					snprintf(cev.tags,
+						 sizeof(cev.tags), "%s",
+						 tags_lookup_copy(
+							snap_tgid,
+							snap_data,
+							si.tgid));
+#endif
+					cev.root_pid = ti.root_pid;
+					cev.pid = si.tgid;
+					cev.uid = si.uid;
+					cev.is_root = ti.is_root;
+
+					/* comm, ppid из proc_map */
+					struct proc_info cpi;
+					if (bpf_map_lookup_elem(
+						proc_map_fd,
+						&si.tgid, &cpi) == 0) {
+						cev.ppid = cpi.ppid;
+						memcpy(cev.comm, cpi.comm,
+						       COMM_LEN);
+					}
+
+					/* IP-адреса */
+					if (si.af == 2) {
+						snprintf(cev.net_local_addr,
+							 sizeof(cev.net_local_addr),
+							 "%u.%u.%u.%u",
+							 si.local_addr[0],
+							 si.local_addr[1],
+							 si.local_addr[2],
+							 si.local_addr[3]);
+						snprintf(cev.net_remote_addr,
+							 sizeof(cev.net_remote_addr),
+							 "%u.%u.%u.%u",
+							 si.remote_addr[0],
+							 si.remote_addr[1],
+							 si.remote_addr[2],
+							 si.remote_addr[3]);
+					} else if (si.af == 10) {
+						inet_ntop(AF_INET6,
+							  si.local_addr,
+							  cev.net_local_addr,
+							  sizeof(cev.net_local_addr));
+						inet_ntop(AF_INET6,
+							  si.remote_addr,
+							  cev.net_remote_addr,
+							  sizeof(cev.net_remote_addr));
+					}
+
+					cev.net_local_port = si.local_port;
+					cev.net_remote_port = si.remote_port;
+					cev.net_conn_tx_bytes = si.tx_bytes;
+					cev.net_conn_rx_bytes = si.rx_bytes;
+
+					/* Длительность соединения */
+					if (si.start_ns > 0 &&
+					    boot_ns > si.start_ns)
+						cev.net_duration_ms =
+							(boot_ns - si.start_ns)
+							/ 1000000;
+
+					/* is_listener → state: 'L'=listener, 'E'=established */
+					cev.state = si.is_listener ? 'L' : 'E';
+
+					ef_append(&cev, cfg_hostname);
+					conn_count++;
+				}
+			}
+
+			if (sk_next_err != 0)
+				break;
+			sk_key = sk_next;
+		}
+	}
+
 	ef_batch_unlock();
 
 	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
@@ -3882,8 +4094,8 @@ static void write_snapshot(void)
 	}
 	dead_total += dead_count;
 
-	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events",
-	       pid_count, dead_total, snap_count);
+	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns",
+	       pid_count, dead_total, snap_count, conn_count);
 
 	/* Статистика ring buffer'ов */
 	{
@@ -4081,14 +4293,18 @@ int main(int argc, char *argv[])
 	/* Установка rodata перед загрузкой */
 	skel->rodata->max_exec_events_per_sec = (__u32)cfg_exec_rate_limit;
 
+	/* iter/tcp запускается вручную (seed_sock_map), не через autoattach */
+	BPF_PROG_DISABLE(skel->progs.seed_sock_map_iter);
+
 	/* Условное отключение программ отслеживания сети */
 	if (!cfg_net_tracking_enabled) {
-		/* Жизненный цикл соединения: connect/accept/close */
+		/* Жизненный цикл соединения: connect/accept/close/listen */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
 		BPF_PROG_DISABLE(skel->progs.krp_tcp_v4_connect);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v6_connect);
 		BPF_PROG_DISABLE(skel->progs.krp_tcp_v6_connect);
 		BPF_PROG_DISABLE(skel->progs.krp_inet_csk_accept);
+		BPF_PROG_DISABLE(skel->progs.kp_inet_csk_listen_start);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
 	}
 	if (!cfg_net_tracking_enabled || !cfg_net_track_bytes) {
@@ -4122,6 +4338,7 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_conn_request);
 	if (!cfg_sec_rst_tracking) {
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_send_reset);
+		BPF_PROG_DISABLE(skel->progs.kp_tcp_send_active_reset);
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_receive_reset);
 	}
 	if (!cfg_sec_udp_tracking) {
@@ -4242,6 +4459,8 @@ int main(int argc, char *argv[])
 
 	/* Однократное сканирование при запуске: поиск уже работающих процессов */
 	initial_scan();
+	/* Заполняем sock_map существующими TCP-сокетами отслеживаемых процессов */
+	seed_sock_map();
 	refresh_boot_to_wall();
 
 	/* Запуск HTTP-сервера, если включён */
@@ -4337,6 +4556,7 @@ int main(int argc, char *argv[])
 			cpu_prev_count = 0;
 			prev_snapshot_ts = (struct timespec){0};
 			initial_scan();
+			seed_sock_map();
 
 			/* Сбрасываем таймеры после перезагрузки */
 			last_refresh  = 0;

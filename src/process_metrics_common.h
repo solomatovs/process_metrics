@@ -419,6 +419,7 @@ struct sock_info {
 	__u64 tx_bytes;
 	__u64 rx_bytes;
 	__u64 start_ns;       /* время начала соединения (boot ns) */
+	__u8  is_listener;    /* 1 = слушающий сокет (не соединение) */
 };
 
 /*

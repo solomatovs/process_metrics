@@ -1634,6 +1634,15 @@ struct {
 	__type(value, __u64);
 } open_conn_map SEC(".maps");
 
+/* Временная карта для init-seed: inode сокета → tgid владельца.
+ * Заполняется из userspace при старте, используется iter/tcp. */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, NET_MAX_SOCKETS);
+	__type(key, __u64);           /* inode number */
+	__type(value, __u32);         /* tgid */
+} seed_inode_map SEC(".maps");
+
 /*
  * Чтение адресов сокета в sock_info.
  * Поддерживает AF_INET и AF_INET6.
@@ -1727,6 +1736,10 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
 	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
@@ -1771,6 +1784,10 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
 	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
@@ -1799,6 +1816,10 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u64 sk_ptr = (__u64)sk;
 
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
 	struct sock_info si; BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
@@ -1815,7 +1836,45 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	return 0;
 }
 
+/* ── inet_csk_listen_start: регистрация слушающих сокетов ─────────── */
+
+SEC("kprobe/inet_csk_listen_start")
+int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info si; BPF_ZERO(si);
+	si.tgid = tgid;
+	si.uid = (__u32)bpf_get_current_uid_gid();
+	si.start_ns = bpf_ktime_get_boot_ns();
+	si.is_listener = 1;
+	read_sock_addrs(sk, &si);
+
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	return 0;
+}
+
 /* ── tcp_close: отправка события NET_CLOSE ────────────────────────── */
+
+/*
+ * tcp_close:
+ *   kprobe  — эмитим NET_CLOSE + декремент open_conn, сохраняем sk_ptr
+ *             в per-CPU map для kretprobe. НЕ удаляем из sock_map, чтобы
+ *             tcp_send_active_reset (SO_LINGER=0) мог найти сокет.
+ *   kretprobe — удаляем из sock_map.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);	/* sk_ptr, 0 = не ожидаем kretprobe */
+} tcp_close_sk SEC(".maps");
 
 SEC("kprobe/tcp_close")
 int BPF_KPROBE(kp_tcp_close, struct sock *sk)
@@ -1825,12 +1884,35 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	if (!si)
 		return 0;
 
+	/* Слушающий сокет: удаляем из sock_map, без NET_CLOSE и open_conn */
+	if (si->is_listener) {
+		bpf_map_delete_elem(&sock_map, &sk_ptr);
+		return 0;
+	}
+
 	/* open_conn_count: декремент */
 	__u32 tgid = si->tgid;
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
 
 	emit_net_close(si, bpf_ktime_get_boot_ns());
+
+	/* Сохраняем sk_ptr для kretprobe (отложенное удаление из sock_map) */
+	__u32 zero = 0;
+	bpf_map_update_elem(&tcp_close_sk, &zero, &sk_ptr, BPF_ANY);
+	return 0;
+}
+
+SEC("kretprobe/tcp_close")
+int BPF_KRETPROBE(kretp_tcp_close)
+{
+	__u32 zero = 0;
+	__u64 *sk_ptr_p = bpf_map_lookup_elem(&tcp_close_sk, &zero);
+	if (!sk_ptr_p || !*sk_ptr_p)
+		return 0;
+
+	__u64 sk_ptr = *sk_ptr_p;
+	*sk_ptr_p = 0; /* сбрасываем */
 	bpf_map_delete_elem(&sock_map, &sk_ptr);
 	return 0;
 }
@@ -2019,6 +2101,12 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = const struct sock *sk, args[1] = const struct sk_buff *skb */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
+	/* Только для сокетов отслеживаемых процессов */
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
 	RB_STAT_TOTAL_SEC();
 	struct retransmit_event *re =
 		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
@@ -2030,15 +2118,17 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_TCP_RETRANSMIT;
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_get_current_comm(re->comm, sizeof(re->comm));
 
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	re->tgid = (__u32)(pid_tgid >> 32);
-	re->uid  = (__u32)bpf_get_current_uid_gid();
+	/* tgid/uid из sock_map (в softirq bpf_get_current_pid_tgid = 0) */
+	re->tgid = si->tgid;
+	re->uid  = si->uid;
 
-	/* cgroup процесса */
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+	/* comm и cgroup из proc_map */
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
+	if (pi) {
+		__builtin_memcpy(re->comm, pi->comm, COMM_LEN);
+		re->cgroup_id = pi->cgroup_id;
+	}
 
 	/* адреса из sock */
 	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
@@ -2060,6 +2150,12 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	if (!sec_enabled(SEC_SYN_TRACKING))
 		return 0;
 
+	/* Только для слушающих сокетов отслеживаемых процессов */
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
 	RB_STAT_TOTAL_SEC();
 	struct syn_event *se =
 		bpf_ringbuf_reserve(&events_sec, sizeof(*se), 0);
@@ -2071,14 +2167,17 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	__builtin_memset(se, 0, sizeof(*se));
 	se->type = EVENT_SYN_RECV;
 	se->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_get_current_comm(se->comm, sizeof(se->comm));
 
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	se->tgid = (__u32)(pid_tgid >> 32);
-	se->uid  = (__u32)bpf_get_current_uid_gid();
+	/* tgid/uid из sock_map (в softirq bpf_get_current_pid_tgid = 0) */
+	se->tgid = si->tgid;
+	se->uid  = si->uid;
 
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+	/* comm и cgroup из proc_map */
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
+	if (pi) {
+		__builtin_memcpy(se->comm, pi->comm, COMM_LEN);
+		se->cgroup_id = pi->cgroup_id;
+	}
 
 	/* Локальный адрес/порт слушающего сокета */
 	se->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
@@ -2130,6 +2229,12 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	if (!sk)
 		return 0;
 
+	/* Только для сокетов отслеживаемых процессов */
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
 	RB_STAT_TOTAL_SEC();
 	struct rst_event *re =
 		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
@@ -2142,14 +2247,59 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	re->type = EVENT_RST;
 	re->direction = 0; /* отправлен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_get_current_comm(re->comm, sizeof(re->comm));
 
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	re->tgid = (__u32)(pid_tgid >> 32);
-	re->uid  = (__u32)bpf_get_current_uid_gid();
+	/* tgid/uid из sock_map */
+	re->tgid = si->tgid;
+	re->uid  = si->uid;
 
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+	/* comm и cgroup из proc_map */
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
+	if (pi) {
+		__builtin_memcpy(re->comm, pi->comm, COMM_LEN);
+		re->cgroup_id = pi->cgroup_id;
+	}
+
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
+			   &re->local_port, &re->remote_port);
+
+	bpf_ringbuf_submit(re, 0);
+	return 0;
+}
+
+/* ── Отправка active RST (SO_LINGER=0 close): kprobe ─────────────── */
+
+SEC("kprobe/tcp_send_active_reset")
+int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
+{
+	if (!sec_enabled(SEC_RST_TRACKING))
+		return 0;
+
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
+	RB_STAT_TOTAL_SEC();
+	struct rst_event *re =
+		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
+	if (!re) {
+		RB_STAT_DROP_SEC();
+		return 0;
+	}
+
+	__builtin_memset(re, 0, sizeof(*re));
+	re->type = EVENT_RST;
+	re->direction = 0; /* отправлен */
+	re->timestamp_ns = bpf_ktime_get_boot_ns();
+
+	re->tgid = si->tgid;
+	re->uid  = si->uid;
+
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
+	if (pi) {
+		__builtin_memcpy(re->comm, pi->comm, COMM_LEN);
+		re->cgroup_id = pi->cgroup_id;
+	}
 
 	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
 			   &re->local_port, &re->remote_port);
@@ -2169,6 +2319,12 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = struct sock *sk */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
+	/* Только для сокетов отслеживаемых процессов */
+	__u64 sk_ptr = (__u64)sk;
+	struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+	if (!si)
+		return 0;
+
 	RB_STAT_TOTAL_SEC();
 	struct rst_event *re =
 		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
@@ -2181,14 +2337,17 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	re->type = EVENT_RST;
 	re->direction = 1; /* получен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_get_current_comm(re->comm, sizeof(re->comm));
 
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	re->tgid = (__u32)(pid_tgid >> 32);
-	re->uid  = (__u32)bpf_get_current_uid_gid();
+	/* tgid/uid из sock_map */
+	re->tgid = si->tgid;
+	re->uid  = si->uid;
 
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+	/* comm и cgroup из proc_map */
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
+	if (pi) {
+		__builtin_memcpy(re->comm, pi->comm, COMM_LEN);
+		re->cgroup_id = pi->cgroup_id;
+	}
 
 	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
 			   &re->local_port, &re->remote_port);
@@ -2213,6 +2372,10 @@ int BPF_KPROBE(kp_udp_sendmsg_sec, struct sock *sk)
 	if (!sec_enabled(SEC_UDP_TRACKING))
 		return 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
 	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
 	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
 	return 0;
@@ -2265,6 +2428,10 @@ int BPF_KPROBE(kp_udp_recvmsg_sec, struct sock *sk)
 	if (!sec_enabled(SEC_UDP_TRACKING))
 		return 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	/* Только для отслеживаемых процессов */
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
 	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
 	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
 	return 0;
@@ -2517,6 +2684,78 @@ SEC("tracepoint/cgroup/cgroup_notify_frozen")
 int handle_cgroup_frozen(void *ctx)
 {
 	return emit_cgroup_state(ctx, EVENT_CGROUP_FROZEN);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  Init-seed: заполнение sock_map существующими TCP-сокетами
+ *  отслеживаемых процессов при старте (bpf_iter/tcp).
+ *
+ *  Userspace:
+ *    1) для каждого tracked PID сканирует /proc/<pid>/fd/ → socket:[ino]
+ *    2) записывает ino → tgid в seed_inode_map
+ *    3) запускает этот итератор (attach + read до EOF)
+ *    4) очищает seed_inode_map
+ * ══════════════════════════════════════════════════════════════════════ */
+
+SEC("iter/tcp")
+int seed_sock_map_iter(struct bpf_iter__tcp *ctx)
+{
+	struct sock_common *sk_common = ctx->sk_common;
+	if (!sk_common)
+		return 0;
+
+	struct sock *sk = (struct sock *)sk_common;
+
+	/* Читаем inode файла сокета: sk→sk_socket→file→f_inode→i_ino */
+	struct socket *sock = BPF_CORE_READ(sk, sk_socket);
+	if (!sock)
+		return 0;
+	struct file *f = BPF_CORE_READ(sock, file);
+	if (!f)
+		return 0;
+	__u64 ino = BPF_CORE_READ(f, f_inode, i_ino);
+	if (!ino)
+		return 0;
+
+	/* Проверяем, принадлежит ли сокет отслеживаемому процессу */
+	__u32 *tgid_ptr = bpf_map_lookup_elem(&seed_inode_map, &ino);
+	if (!tgid_ptr)
+		return 0;
+
+	__u32 tgid = *tgid_ptr;
+	__u64 sk_ptr = (__u64)sk;
+
+	/* Уже в sock_map? (race с kprobe при параллельном connect) */
+	if (bpf_map_lookup_elem(&sock_map, &sk_ptr))
+		return 0;
+
+	struct sock_info si; BPF_ZERO(si);
+	si.tgid = tgid;
+	si.uid  = ctx->uid;
+	si.start_ns = bpf_ktime_get_boot_ns();
+
+	/* TCP_LISTEN = 10 */
+	__u8 state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	if (state == 10)
+		si.is_listener = 1;
+
+	read_sock_addrs(sk, &si);
+
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+
+	/* open_conn_count: инкремент (только для соединений, не listener) */
+	if (!si.is_listener) {
+		__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
+		if (cnt)
+			__sync_fetch_and_add(cnt, 1);
+		else {
+			__u64 one = 1;
+			bpf_map_update_elem(&open_conn_map, &tgid, &one,
+					    BPF_NOEXIST);
+		}
+	}
+
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

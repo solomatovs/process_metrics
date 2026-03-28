@@ -17,7 +17,7 @@
 
 /* ── размеры полей metric_event ──────────────────────────────────── */
 
-#define EV_EVENT_TYPE_LEN  12    /* "fork","exec","exit","oom_kill","snapshot","file_close" */
+#define EV_EVENT_TYPE_LEN  16    /* "fork","exec","exit","oom_kill","snapshot","conn_snapshot","file_close" */
 #define EV_RULE_LEN        64   /* имя правила */
 #define EV_TAGS_LEN        512  /* список всех сработавших правил, разделённых символом | */
 #define EV_CGROUP_LEN      512  /* путь cgroup */
