@@ -2007,6 +2007,24 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	return 0;
 }
 
+/* Лёгкое чтение ppid из /proc/PID/stat (только 2 поля после ')').
+ * Возвращает ppid или 0 при ошибке. */
+static __u32 read_proc_ppid(__u32 pid)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
+	char buf[512];
+	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
+	fclose(f);
+	char *rp = strrchr(buf, ')');
+	if (!rp) return 0;
+	int ppid = 0;
+	if (sscanf(rp + 2, "%*c %d", &ppid) != 1) return 0;
+	return ppid > 0 ? (__u32)ppid : 0;
+}
+
 static int read_proc_cmdline(__u32 pid, char *dst, int dstlen)
 {
 	char path[64];
@@ -3324,6 +3342,25 @@ static void refresh_processes(void)
 							    &pi, BPF_EXIST);
 				}
 				fclose(cf);
+			}
+		}
+
+		/* Обновление ppid из /proc — обнаружение reparent.
+		 * Когда ядро убивает промежуточный процесс в цепочке,
+		 * дочерние процессы переназначаются на init (или subreaper).
+		 * BPF не получает уведомлений о reparent, поэтому pidtree
+		 * и proc_info.ppid устаревают. Здесь сверяем с реальностью.
+		 * Не зависит от cfg_refresh_proc — это вопрос корректности
+		 * дерева процессов, а не опциональное обновление cmdline. */
+		if (pi.status == PROC_STATUS_ALIVE) {
+			__u32 real_ppid = read_proc_ppid(key);
+			if (real_ppid > 0 && real_ppid != pi.ppid) {
+				log_debug("REPARENT: pid=%u ppid %u→%u",
+					  key, pi.ppid, real_ppid);
+				pi.ppid = real_ppid;
+				bpf_map_update_elem(proc_map_fd, &key,
+						    &pi, BPF_EXIST);
+				pidtree_store_ts(key, real_ppid);
 			}
 		}
 
