@@ -126,31 +126,56 @@ static inline char *put_f64_4(char *p, double v)
 	return p + 4;
 }
 
-/* ── CSV field escaping (inline, no intermediate buffer) ──────────── */
+/* ── CSV field output — PostgreSQL-compatible ─────────────────────── */
 
 /*
- * Write CSV-escaped string field directly to *p.
- * Returns pointer past the last byte written.
- * Always wraps in double quotes; doubles internal quotes;
- * replaces \n \r with space.
+ * Write CSV field directly to *p, mirroring PostgreSQL's
+ * CopyAttributeOutCSV() logic (src/backend/commands/copyto.c).
+ *
+ * Two-pass algorithm:
+ *   Pass 1: scan for characters that require quoting
+ *            (delimiter, quote char, '\n', '\r')
+ *   Pass 2: output the field, quoting/escaping only when needed
+ *
+ * Escaping: quote character is doubled inside quoted fields (RFC 4180).
+ * Empty strings are always quoted to distinguish from NULL.
  *
  * limit: max source bytes to scan (strlen-safe for fixed-size fields).
+ * Returns pointer past the last byte written.
  */
 static inline char *put_str(char *p, const char *src, int limit)
 {
-	*p++ = '"';
-	for (int i = 0; i < limit && src[i]; i++) {
+	const char quotec  = '"';
+	const char escapec = '"';   /* same as quotec, per PostgreSQL default */
+	const char delimc  = ',';
+
+	/* effective length (stop at NUL or limit) */
+	int len = 0;
+	while (len < limit && src[len])
+		len++;
+
+	/* Pass 1: decide whether quoting is needed (PostgreSQL preliminary scan) */
+	int need_quote = (len == 0); /* empty → always quote (≠ NULL) */
+	for (int i = 0; !need_quote && i < len; i++) {
 		char c = src[i];
-		if (c == '"') {
-			*p++ = '"';
-			*p++ = '"';
-		} else if (c == '\n' || c == '\r') {
-			*p++ = ' ';
-		} else {
+		if (c == delimc || c == quotec || c == '\n' || c == '\r')
+			need_quote = 1;
+	}
+
+	if (need_quote) {
+		*p++ = quotec;
+		for (int i = 0; i < len; i++) {
+			char c = src[i];
+			if (c == quotec || c == escapec)
+				*p++ = escapec; /* double the quote/escape char */
 			*p++ = c;
 		}
+		*p++ = quotec;
+	} else {
+		memcpy(p, src, len);
+		p += len;
 	}
-	*p++ = '"';
+
 	return p;
 }
 
