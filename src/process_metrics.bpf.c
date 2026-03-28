@@ -143,8 +143,8 @@ struct {
 } exec_rate SEC(".maps");
 
 /*
- * Per-CPU scratch buffer for building proc_info on the stack
- * (proc_info exceeds 512-byte BPF stack limit).
+ * Per-CPU буфер для построения proc_info на стеке
+ * (proc_info превышает 512-байтовый лимит стека BPF).
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -671,7 +671,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	child_pi->start_ns  = BPF_CORE_READ(child, start_time);
 	bpf_get_current_comm(child_pi->comm, sizeof(child_pi->comm));
 
-	/* Inherit identity/scheduler/namespaces from parent */
+	/* Наследуем identity/планировщик/пространства имён от родителя */
 	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
 		      &child_pi->euid);
 	child_pi->tty_nr = read_tty_nr(child);
@@ -710,18 +710,18 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 /* ── SCHED_SWITCH — горячий путь, обновление метрик для отслеживаемых PID ── */
 
 /*
- * sched_switch tracepoint context layout (from /sys/kernel/tracing/events/sched/sched_switch/format):
- *   offset  0: common_type (u16), common_flags (u8), common_preempt_count (u8), common_pid (s32)
- *   offset  8: prev_comm[16]
- *   offset 24: prev_pid (s32)
- *   offset 28: prev_prio (s32)
- *   offset 32: prev_state (s64)
- *   offset 40: next_comm[16]
- *   offset 56: next_pid (s32)
- *   offset 60: next_prio (s32)
+ * Раскладка контекста tracepoint sched_switch (из /sys/kernel/tracing/events/sched/sched_switch/format):
+ *   смещение  0: common_type (u16), common_flags (u8), common_preempt_count (u8), common_pid (s32)
+ *   смещение  8: prev_comm[16]
+ *   смещение 24: prev_pid (s32)
+ *   смещение 28: prev_prio (s32)
+ *   смещение 32: prev_state (s64)
+ *   смещение 40: next_comm[16]
+ *   смещение 56: next_pid (s32)
+ *   смещение 60: next_prio (s32)
  */
 struct sched_switch_args {
-	/* first 8 bytes: common fields (type, flags, preempt_count, pid) */
+	/* первые 8 байт: общие поля (type, flags, preempt_count, pid) */
 	__u64 __pad;
 	char  prev_comm[16];
 	__s32 prev_pid;
@@ -854,21 +854,21 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
 	info->tty_nr = read_tty_nr(task);
 
-	/* Scheduling policy */
+	/* Политика планировщика */
 	info->sched_policy = BPF_CORE_READ(task, policy);
 
-	/* I/O accounting (includes page cache) */
+	/* Учёт ввода-вывода (включая page cache) */
 	read_io_accounting(task, &info->io_rchar, &info->io_wchar,
 			   &info->io_syscr, &info->io_syscw);
 
-	/* Namespace inode numbers */
+	/* Номера inode пространств имён */
 	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
 		      &info->net_ns_inum, &info->cgroup_ns_inum);
 
 	/*
-	 * Preemption tracking: prev_state == 0 means TASK_RUNNING,
-	 * i.e. this process was involuntarily preempted by `next`.
-	 * Record who preempted us (the "noisy neighbor").
+	 * Отслеживание вытеснения: prev_state == 0 означает TASK_RUNNING,
+	 * т.е. процесс был принудительно вытеснен процессом `next`.
+	 * Записываем, кто нас вытеснил («шумный сосед»).
 	 */
 	if (ctx->prev_state == 0 && ctx->next_pid > 0) {
 		__u32 next_tid = (__u32)ctx->next_pid;
@@ -981,7 +981,7 @@ int handle_exit(void *ctx)
 		e->net_rx_bytes  = info->net_rx_bytes;
 		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
-		/* Copy new fields from last sched_switch snapshot */
+		/* Копируем новые поля из последнего снимка sched_switch */
 		e->loginuid      = info->loginuid;
 		e->sessionid     = info->sessionid;
 		e->euid          = info->euid;
@@ -1085,14 +1085,14 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	struct task_struct *target = (struct task_struct *)ctx->args[2];
 	int target_pid = BPF_CORE_READ(target, tgid);
 
-	/* Read signal code from kernel_siginfo */
+	/* Читаем код сигнала из kernel_siginfo */
 	struct kernel_siginfo *sinfo = (struct kernel_siginfo *)ctx->args[1];
 	int code = 0;
 	bpf_probe_read_kernel(&code, sizeof(code), &sinfo->si_code);
 
-	/* Only user-initiated signals via kill() syscall: SI_USER=0
-	 * Skip SI_TKILL (-6) — too noisy from Go runtime SIGURG and pthread_kill.
-	 * Skip SI_KERNEL (128) and other kernel codes (>0). */
+	/* Только пользовательские сигналы через kill(): SI_USER=0.
+	 * Пропускаем SI_TKILL (-6) — слишком шумный от Go runtime SIGURG и pthread_kill.
+	 * Пропускаем SI_KERNEL (128) и другие ядерные коды (>0). */
 	if (code != 0)
 		return 0;
 
@@ -1100,7 +1100,7 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	__u32 sender_tgid = (__u32)(pid_tgid >> 32);
 	__u32 target_tgid = (__u32)target_pid;
 
-	/* Send event if sender OR target is tracked */
+	/* Отправляем событие, если отправитель ИЛИ получатель отслеживается */
 	if (!bpf_map_lookup_elem(&tracked_map, &sender_tgid) &&
 	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
 		return 0;
@@ -1123,7 +1123,7 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	se->sig_result   = result;
 	bpf_get_current_comm(se->sender_comm, sizeof(se->sender_comm));
 
-	/* cgroup id from sender */
+	/* cgroup id отправителя */
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 
@@ -1529,8 +1529,8 @@ struct {
 	__type(value, struct sendmsg_args);
 } sendmsg_args_map SEC(".maps");
 
-/* Open TCP connection counter per tgid (defined in security section,
- * declared here for use in connect/close hooks) */
+/* Счётчик открытых TCP-соединений по tgid (определён в секции безопасности,
+ * объявлен здесь для использования в хуках connect/close) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_PROCS);
@@ -1639,7 +1639,7 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
 
-	/* open_conn_count: increment */
+	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt) __sync_fetch_and_add(cnt, 1);
 	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
@@ -1683,7 +1683,7 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
 
-	/* open_conn_count: increment */
+	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt) __sync_fetch_and_add(cnt, 1);
 	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
@@ -1711,7 +1711,7 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
 
-	/* open_conn_count: increment */
+	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt) __sync_fetch_and_add(cnt, 1);
 	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
@@ -1729,7 +1729,7 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	if (!si)
 		return 0;
 
-	/* open_conn_count: decrement */
+	/* open_conn_count: декремент */
 	__u32 tgid = si->tgid;
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
@@ -1839,7 +1839,7 @@ int BPF_KRETPROBE(ret_udp_recvmsg, int ret)
 	return 0;
 }
 
-/* ── Security probes ─────────────────────────────────────────────── */
+/* ── Пробы безопасности ──────────────────────────────────────────── */
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -1848,7 +1848,7 @@ struct {
 	__type(value, struct sec_config);
 } sec_cfg SEC(".maps");
 
-/* UDP aggregation map — flushed by userspace on snapshot */
+/* Карта агрегации UDP — сбрасывается из userspace при snapshot */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
@@ -1856,7 +1856,7 @@ struct {
 	__type(value, struct udp_agg_val);
 } udp_agg_map SEC(".maps");
 
-/* ICMP aggregation map — flushed by userspace on snapshot */
+/* Карта агрегации ICMP — сбрасывается из userspace при snapshot */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -1864,10 +1864,10 @@ struct {
 	__type(value, struct icmp_agg_val);
 } icmp_agg_map SEC(".maps");
 
-/* open_conn_map already declared in net section above */
+/* open_conn_map уже объявлена в секции сети выше */
 
 /*
- * Helper: check if sec_config flag is enabled.
+ * Вспомогательная функция: проверяет, включён ли флаг sec_config.
  */
 static __always_inline int sec_enabled(int offset)
 {
@@ -1885,7 +1885,8 @@ static __always_inline int sec_enabled(int offset)
 #define SEC_OPEN_CONN_COUNT 5
 
 /*
- * Helper: read sock addresses into flat fields (reuses sock parsing logic).
+ * Вспомогательная функция: читает адреса сокета в плоские поля
+ * (переиспользует логику парсинга sock).
  */
 static __always_inline void read_sock_to_event(
 	struct sock *sk,
@@ -1939,22 +1940,22 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	re->tgid = (__u32)(pid_tgid >> 32);
 	re->uid  = (__u32)bpf_get_current_uid_gid();
 
-	/* cgroup */
+	/* cgroup процесса */
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	re->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 
-	/* addresses from sock */
+	/* адреса из sock */
 	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
 			   &re->local_port, &re->remote_port);
 
-	/* TCP state */
+	/* Состояние TCP */
 	re->state = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
 
 	bpf_ringbuf_submit(re, 0);
 	return 0;
 }
 
-/* ── SYN flood: kprobe/tcp_conn_request ──────────────────────────── */
+/* ── SYN flood: kprobe/tcp_conn_request ───────────────────────────── */
 
 SEC("kprobe/tcp_conn_request")
 int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
@@ -1983,7 +1984,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 
-	/* Listener local addr/port from sock */
+	/* Локальный адрес/порт слушающего сокета */
 	se->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	se->af = (__u8)family;
@@ -1996,7 +1997,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
 	}
 
-	/* Remote addr from skb IP header */
+	/* Удалённый адрес из IP-заголовка skb */
 	unsigned char *head = BPF_CORE_READ(skb, head);
 	__u16 nh_off = BPF_CORE_READ(skb, network_header);
 	if (family == 2) {
@@ -2009,7 +2010,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 		bpf_probe_read_kernel(se->remote_addr, 16, &ip6h->saddr);
 	}
 
-	/* Remote port from TCP header */
+	/* Удалённый порт из TCP-заголовка */
 	__u16 th_off = BPF_CORE_READ(skb, transport_header);
 	struct tcphdr *th = (struct tcphdr *)(head + th_off);
 	__be16 sport;
@@ -2020,7 +2021,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	return 0;
 }
 
-/* ── RST sent: raw_tracepoint/tcp_send_reset ─────────────────────── */
+/* ── Отправка RST: raw_tracepoint/tcp_send_reset ─────────────────── */
 
 SEC("raw_tracepoint/tcp_send_reset")
 int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
@@ -2028,7 +2029,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	if (!sec_enabled(SEC_RST_TRACKING))
 		return 0;
 
-	/* args[0] = const struct sock *sk (may be NULL), args[1] = struct sk_buff *skb */
+	/* args[0] = const struct sock *sk (может быть NULL), args[1] = struct sk_buff *skb */
 	struct sock *sk = (struct sock *)ctx->args[0];
 	if (!sk)
 		return 0;
@@ -2043,7 +2044,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_RST;
-	re->direction = 0; /* sent */
+	re->direction = 0; /* отправлен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(re->comm, sizeof(re->comm));
 
@@ -2061,7 +2062,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
-/* ── RST received: raw_tracepoint/tcp_receive_reset ──────────────── */
+/* ── Получение RST: raw_tracepoint/tcp_receive_reset ─────────────── */
 
 SEC("raw_tracepoint/tcp_receive_reset")
 int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
@@ -2082,7 +2083,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 
 	__builtin_memset(re, 0, sizeof(*re));
 	re->type = EVENT_RST;
-	re->direction = 1; /* received */
+	re->direction = 1; /* получен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
 	bpf_get_current_comm(re->comm, sizeof(re->comm));
 
@@ -2100,9 +2101,9 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
-/* ── UDP flood: kprobe entry + kretprobe aggregation ─────────────── */
+/* ── UDP flood: kprobe вход + kretprobe агрегация ────────────────── */
 
-/* Store sock pointer on entry for address extraction */
+/* Сохраняем указатель на sock при входе для извлечения адресов */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 8192);
@@ -2214,7 +2215,7 @@ int BPF_KRETPROBE(ret_udp_recvmsg_sec, int ret)
 	return 0;
 }
 
-/* ── ICMP flood: kprobe/icmp_rcv ─────────────────────────────────── */
+/* ── ICMP flood: kprobe/icmp_rcv ──────────────────────────────────── */
 
 SEC("kprobe/icmp_rcv")
 int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
@@ -2224,7 +2225,7 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 
 	struct icmp_agg_key key; BPF_ZERO(key);
 
-	/* Read source IP from IP header */
+	/* Читаем IP-адрес источника из IP-заголовка */
 	unsigned char *head = BPF_CORE_READ(skb, head);
 	__u16 nh_off = BPF_CORE_READ(skb, network_header);
 	struct iphdr *iph = (struct iphdr *)(head + nh_off);
@@ -2232,7 +2233,7 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 	bpf_probe_read_kernel(&saddr, 4, &iph->saddr);
 	__builtin_memcpy(key.src_addr, &saddr, 4);
 
-	/* Read ICMP type/code from transport header */
+	/* Читаем ICMP type/code из транспортного заголовка */
 	__u16 th_off = BPF_CORE_READ(skb, transport_header);
 	struct icmphdr *icmph = (struct icmphdr *)(head + th_off);
 	bpf_probe_read_kernel(&key.icmp_type, 1, &icmph->type);
@@ -2248,17 +2249,17 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 	return 0;
 }
 
-/* ── Open connection count: instrument existing connect/close ────── */
-/* Increment on successful connect/accept, decrement on tcp_close.
- * This is done via the open_conn_map, keyed by tgid.
- * Userspace reads during snapshot. */
+/* ── Счётчик открытых соединений: инструментирование connect/close ── */
+/* Инкремент при успешном connect/accept, декремент при tcp_close.
+ * Реализовано через open_conn_map с ключом tgid.
+ * Userspace читает при snapshot. */
 
-/* ── cgroup lifecycle tracepoints ─────────────────────────────────── */
+/* ── tracepoint'ы жизненного цикла cgroup ─────────────────────────── */
 
 /*
- * Helper: read __data_loc string from tracepoint context.
- * __data_loc is a __u32 where low 16 bits = offset from struct start,
- * high 16 bits = length.
+ * Вспомогательная функция: чтение строки __data_loc из контекста tracepoint.
+ * __data_loc — это __u32, где младшие 16 бит = смещение от начала структуры,
+ * старшие 16 бит = длина.
  */
 static __always_inline int read_data_loc_str(void *ctx, __u32 data_loc,
 					     char *buf, int buflen)
@@ -2268,7 +2269,7 @@ static __always_inline int read_data_loc_str(void *ctx, __u32 data_loc,
 }
 
 /* cgroup_mkdir / cgroup_rmdir / cgroup_rename / cgroup_release
- * All share struct trace_event_raw_cgroup layout:
+ * Все используют общую раскладку struct trace_event_raw_cgroup:
  *   int root, int level, u64 id, __data_loc path */
 static __always_inline int emit_cgroup_event(void *ctx, __u32 type)
 {
@@ -2320,14 +2321,14 @@ int handle_cgroup_release(void *ctx)
 }
 
 /* cgroup_attach_task / cgroup_transfer_tasks
- * Struct trace_event_raw_cgroup_migrate:
+ * Структура trace_event_raw_cgroup_migrate:
  *   int dst_root, int dst_level, u64 dst_id, int pid,
  *   __data_loc dst_path, __data_loc comm */
 static __always_inline int emit_cgroup_migrate(void *ctx, __u32 type)
 {
 	struct trace_event_raw_cgroup_migrate *tp = ctx;
 
-	/* Update cgroup_id in proc_map so snapshot sees the new cgroup */
+	/* Обновляем cgroup_id в proc_map, чтобы snapshot видел новую cgroup */
 	__u32 tgid = (__u32)tp->pid;
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (pi)
@@ -2370,7 +2371,7 @@ int handle_cgroup_transfer_tasks(void *ctx)
 }
 
 /* cgroup_notify_populated / cgroup_freeze / cgroup_unfreeze / cgroup_notify_frozen
- * Struct trace_event_raw_cgroup_event:
+ * Структура trace_event_raw_cgroup_event:
  *   int root, int level, u64 id, __data_loc path, int val */
 static __always_inline int emit_cgroup_state(void *ctx, __u32 type)
 {
