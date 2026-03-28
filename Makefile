@@ -79,7 +79,7 @@ MIN_CLANG_VER := 10
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
-.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum deps-pacman bpftool check-clang test test-unit test-http test-clickhouse compat
+.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum deps-pacman bpftool check-clang test test-unit test-http test-clickhouse compat stress-http stress-soak stress-pid stress-ringbuf stress
 
 help:
 	@echo "process_metrics — событийный BPF-коллектор метрик процессов"
@@ -232,6 +232,24 @@ test-clickhouse: $(BINARY)
 	tests/test_clickhouse_integration.sh
 
 test: test-unit
+
+# --- стресс-тесты ---
+# Требуют запущенный process_metrics:
+#   sudo ./build/process_metrics -c tests/stress_test.conf
+
+stress-http:
+	bash tests/stress_http.sh
+
+stress-soak:
+	bash tests/stress_soak.sh
+
+stress-pid:
+	bash tests/stress_pid_recycle.sh
+
+stress-ringbuf:
+	bash tests/stress_ringbuf.sh
+
+stress: stress-http stress-pid stress-ringbuf
 
 # --- проверка совместимости с ядрами ---
 
