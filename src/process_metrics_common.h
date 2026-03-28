@@ -69,6 +69,7 @@ struct ringbuf_stats {
 	__u64 total_file;      /* всего событий file */
 	__u64 total_net;       /* всего событий net */
 	__u64 total_cgroup;    /* всего событий cgroup */
+	__u64 drop_missed_exec; /* missed_exec_map overflow (ENOSPC) */
 };
 
 /*
@@ -105,6 +106,13 @@ enum event_type {
 	EVENT_CGROUP_FREEZE          = 27,
 	EVENT_CGROUP_UNFREEZE        = 28,
 	EVENT_CGROUP_FROZEN          = 29,
+};
+
+/* ── состояние жизненного цикла процесса ────────────────────────── */
+
+enum proc_status {
+	PROC_STATUS_ALIVE  = 0,   /* процесс жив (default после memset/BPF_ZERO) */
+	PROC_STATUS_EXITED = 1,   /* процесс завершился (exit/kill/oom) */
 };
 
 /* ── отслеживание cgroup ─────────────────────────────────────────── */
@@ -230,7 +238,11 @@ struct proc_info {
 	__u32 tgid;
 	__u32 ppid;
 	__u32 uid;               /* реальный UID процесса */
-	__u64 start_ns;          /* task->start_time (CLOCK_MONOTONIC, нс) */
+
+	/* ── жизненный цикл (event-driven) ─────────────────────── */
+	__u8  status;            /* enum proc_status: ALIVE=0 → EXITED=1 */
+	__u64 start_ns;          /* время рождения (CLOCK_MONOTONIC boot_ns) */
+	__u64 exit_ns;           /* время смерти (boot_ns), 0 = жив */
 	__u64 cpu_ns;            /* signal->{utime+stime} + leader->{utime+stime} */
 	__u64 rss_pages;         /* текущий RSS в страницах */
 	__u64 rss_min_pages;     /* минимальный наблюдаемый RSS в страницах */

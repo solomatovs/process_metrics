@@ -73,6 +73,7 @@ static int         num_rules;
 static const char *cfg_config_file     = NULL;
 static char        cfg_hostname[EF_HOSTNAME_LEN]    = "";
 static int         cfg_snapshot_interval           = 30;
+static int         cfg_refresh_interval            = 0;  /* 0 = использовать snapshot_interval */
 static int         cfg_cmdline_max_len             = 500;
 static int         cfg_exec_rate_limit             = 0;  /* 0 = без ограничений */
 static int         cfg_cgroup_metrics              = 1;  /* 1 = читать файлы cgroup */
@@ -124,7 +125,7 @@ static int cfg_file_exclude_count           = 0;
 static volatile sig_atomic_t g_running   = 1;
 static volatile sig_atomic_t g_reload    = 0;
 static struct process_metrics_bpf *skel;
-static int tracked_map_fd, proc_map_fd;
+static int tracked_map_fd, proc_map_fd, missed_exec_fd;
 
 /*
  * Две гранулярные RW-блокировки для общих данных:
@@ -141,6 +142,7 @@ static int tracked_map_fd, proc_map_fd;
 static pthread_rwlock_t g_tags_lock    = PTHREAD_RWLOCK_INITIALIZER;
 #endif
 static pthread_rwlock_t g_cgroup_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_pidtree_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Аргумент для потока poll */
 struct poll_thread_arg {
@@ -235,6 +237,7 @@ static void tags_store_ts(__u32 tgid, const char *tags)
 { (void)tgid; (void)tags; }
 static void tags_inherit_ts(__u32 child, __u32 parent)
 { (void)child; (void)parent; }
+static void tags_remove_ts(__u32 tgid) { (void)tgid; }
 static void tags_clear_ts(void) { }
 
 #else /* !NO_TAGS */
@@ -404,6 +407,13 @@ static void tags_inherit_ts(__u32 child, __u32 parent)
 	pthread_rwlock_unlock(&g_tags_lock);
 }
 
+static void tags_remove_ts(__u32 tgid)
+{
+	pthread_rwlock_wrlock(&g_tags_lock);
+	tags_remove(tgid);
+	pthread_rwlock_unlock(&g_tags_lock);
+}
+
 static void tags_clear_ts(void)
 {
 	pthread_rwlock_wrlock(&g_tags_lock);
@@ -412,6 +422,224 @@ static void tags_clear_ts(void)
 }
 
 #endif /* NO_TAGS */
+
+/* ── pid tree: глобальная хеш-таблица pid→ppid для цепочек предков ───
+ *
+ * Покрывает ВСЕ процессы системы (не только отслеживаемые), чтобы
+ * цепочки предков могли проходить через неотслеживаемых промежуточных.
+ *
+ * Open-addressing + linear probing + backward-shift deletion.
+ * Память: pt_pid[65536] + pt_ppid[65536] = 512 КБ.
+ */
+
+#define PIDTREE_HT_SIZE  65536  /* степень 2, покрывает pid_max с ~50% загрузкой */
+
+static __u32 pt_pid[PIDTREE_HT_SIZE];    /* ключи: pid   (0 = пустой слот) */
+static __u32 pt_ppid[PIDTREE_HT_SIZE];   /* значения: ppid                 */
+
+static inline __u32 pidtree_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (PIDTREE_HT_SIZE - 1);
+}
+
+static void pidtree_store(__u32 pid, __u32 ppid)
+{
+	__u32 idx = pidtree_hash(pid);
+	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[slot] == 0 || pt_pid[slot] == pid) {
+			pt_pid[slot] = pid;
+			pt_ppid[slot] = ppid;
+			return;
+		}
+	}
+}
+
+/* Lookup в массивах pid tree (работает и для живой таблицы, и для snapshot-копии) */
+static __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid,
+			       __u32 pid)
+{
+	__u32 idx = pidtree_hash(pid);
+	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (p_pid[slot] == pid)
+			return p_ppid[slot];
+		if (p_pid[slot] == 0)
+			return 0;
+	}
+	return 0;
+}
+
+static void pidtree_remove(__u32 pid)
+{
+	__u32 idx = pidtree_hash(pid);
+	__u32 slot;
+	int i;
+
+	for (i = 0; i < PIDTREE_HT_SIZE; i++) {
+		slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[slot] == pid)
+			goto found;
+		if (pt_pid[slot] == 0)
+			return;
+	}
+	return;
+
+found:
+	/* backward-shift deletion (Robin Hood) */
+	for (;;) {
+		__u32 next = (slot + 1) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[next] == 0)
+			break;
+
+		__u32 natural = pidtree_hash(pt_pid[next]);
+		__u32 d_natural_to_next = (next - natural) & (PIDTREE_HT_SIZE - 1);
+		__u32 d_natural_to_slot = (slot - natural) & (PIDTREE_HT_SIZE - 1);
+
+		if (d_natural_to_slot < d_natural_to_next) {
+			pt_pid[slot] = pt_pid[next];
+			pt_ppid[slot] = pt_ppid[next];
+			slot = next;
+		} else {
+			break;
+		}
+	}
+
+	pt_pid[slot] = 0;
+	pt_ppid[slot] = 0;
+}
+
+/* Счётчик поколений: увеличивается при каждой мутации дерева (fork/exec/exit).
+ * Используется для инвалидации кеша цепочек. */
+static __u64 pt_generation;
+
+static void pidtree_store_ts(__u32 pid, __u32 ppid)
+{
+	pthread_rwlock_wrlock(&g_pidtree_lock);
+	pidtree_store(pid, ppid);
+	pt_generation++;
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+static void pidtree_remove_ts(__u32 pid)
+{
+	pthread_rwlock_wrlock(&g_pidtree_lock);
+	pidtree_remove(pid);
+	pt_generation++;
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+/* ── кеш цепочек предков ─────────────────────────────────────────
+ *
+ * Кеширует вычисленные цепочки, чтобы не ходить по дереву повторно.
+ * Инвалидация через generation counter — любой fork/exec/exit
+ * делает все закешированные записи устаревшими.
+ */
+
+#define CHAIN_CACHE_SIZE 16384  /* степень 2 */
+
+static __u32 cc_pid[CHAIN_CACHE_SIZE];
+static __u32 cc_chain[CHAIN_CACHE_SIZE][EV_PARENT_PIDS_MAX];
+static __u8  cc_len[CHAIN_CACHE_SIZE];
+static __u64 cc_gen[CHAIN_CACHE_SIZE];
+
+static inline __u32 chain_cache_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (CHAIN_CACHE_SIZE - 1);
+}
+
+/*
+ * Обход pid tree вверх от pid, построение цепочки предков.
+ * Работает на переданных массивах (живая таблица или snapshot-копия).
+ */
+static int pidtree_walk_chain(const __u32 *p_pid, const __u32 *p_ppid,
+			      __u32 pid, __u32 *out, int max_depth)
+{
+	int len = 0;
+	__u32 cur = pidtree_lookup_in(p_pid, p_ppid, pid);
+
+	while (cur > 0 && len < max_depth) {
+		for (int j = 0; j < len; j++) {
+			if (out[j] == cur)
+				return len; /* цикл — прерываем */
+		}
+		out[len++] = cur;
+		if (cur == 1)
+			break; /* дошли до init */
+		cur = pidtree_lookup_in(p_pid, p_ppid, cur);
+	}
+	return len;
+}
+
+/*
+ * Получить цепочку предков для pid (потокобезопасно, с кешем).
+ * Берёт rdlock на g_pidtree_lock.
+ */
+static void pidtree_get_chain_ts(__u32 pid, __u32 *out, __u8 *out_len)
+{
+	pthread_rwlock_rdlock(&g_pidtree_lock);
+
+	__u64 gen = pt_generation;
+	__u32 slot = chain_cache_hash(pid);
+
+	/* Проверка кеша */
+	if (cc_pid[slot] == pid && cc_gen[slot] == gen) {
+		int n = cc_len[slot];
+		memcpy(out, cc_chain[slot], n * sizeof(__u32));
+		*out_len = (__u8)n;
+		pthread_rwlock_unlock(&g_pidtree_lock);
+		return;
+	}
+
+	/* Промах кеша — обход дерева */
+	__u32 chain[EV_PARENT_PIDS_MAX];
+	int n = pidtree_walk_chain(pt_pid, pt_ppid, pid, chain,
+				   EV_PARENT_PIDS_MAX);
+
+	/* Сохраняем в кеш (direct-mapped, перезаписывает предыдущего) */
+	cc_pid[slot] = pid;
+	cc_gen[slot] = gen;
+	cc_len[slot] = (__u8)n;
+	memcpy(cc_chain[slot], chain, n * sizeof(__u32));
+
+	memcpy(out, chain, n * sizeof(__u32));
+	*out_len = (__u8)n;
+
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+/*
+ * Получить цепочку предков из snapshot-копии pid tree (без lock).
+ * Используется в write_snapshot() чтобы не держать g_pidtree_lock
+ * на всю итерацию.
+ */
+static void pidtree_get_chain_copy(const __u32 *snap_pid,
+				   const __u32 *snap_ppid,
+				   __u32 pid, __u32 *out, __u8 *out_len)
+{
+	int n = pidtree_walk_chain(snap_pid, snap_ppid, pid, out,
+				   EV_PARENT_PIDS_MAX);
+	*out_len = (__u8)n;
+}
+
+/*
+ * Заполнить parent_pids в metric_event (потокобезопасно, для обработчиков событий).
+ */
+static void fill_parent_pids(struct metric_event *cev)
+{
+	pidtree_get_chain_ts(cev->pid, cev->parent_pids,
+			     &cev->parent_pids_len);
+}
 
 /* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
  *
@@ -689,6 +917,20 @@ struct cgroup_entry {
 static struct cgroup_entry cgroup_cache[MAX_CGROUPS];
 static int cgroup_cache_count;
 static char docker_data_root[PATH_MAX_LEN] = "";
+
+/* ── кэш cgroup-метрик (заполняется refresh, читается snapshot) ───── */
+
+struct cgroup_metrics {
+	char  path[EV_CGROUP_LEN];     /* отображаемое имя cgroup (ключ) */
+	long long mem_max, mem_cur, swap_cur;
+	long long cpu_weight, cpu_max, cpu_max_period;
+	long long cpu_nr_periods, cpu_nr_throttled, cpu_throttled_usec;
+	long long pids_cur;
+	int  valid;                     /* 1 = значения прочитаны из /sys/fs/cgroup */
+};
+
+static struct cgroup_metrics cg_metrics[MAX_CGROUPS];
+static int cg_metrics_count;
 
 /*
  * Определение data-root Docker. Приоритет:
@@ -1334,6 +1576,16 @@ static int load_config(const char *path)
 		gethostname(cfg_hostname, sizeof(cfg_hostname));
 	if (config_lookup_int(&cfg, "snapshot_interval", &int_val))
 		cfg_snapshot_interval = int_val;
+	if (config_lookup_int(&cfg, "refresh_interval", &int_val))
+		cfg_refresh_interval = int_val;
+
+	/* refresh_interval: если не задан — берётся snapshot_interval;
+	 * если больше snapshot_interval — приравнивается */
+	if (cfg_refresh_interval <= 0)
+		cfg_refresh_interval = cfg_snapshot_interval;
+	if (cfg_refresh_interval > cfg_snapshot_interval)
+		cfg_refresh_interval = cfg_snapshot_interval;
+
 	if (config_lookup_int(&cfg, "cmdline_max_len", &int_val))
 		cfg_cmdline_max_len = int_val;
 	if (config_lookup_int(&cfg, "exec_rate_limit", &int_val))
@@ -1912,6 +2164,10 @@ static void initial_scan(void)
 	}
 	closedir(pd);
 
+	/* Проход 1.5: заполняем глобальное дерево pid для ВСЕХ процессов */
+	for (int i = 0; i < count; i++)
+		pidtree_store(entries[i].pid, entries[i].ppid);
+
 	/* Проход 2: сопоставляем cmdline с правилами, находим корневые процессы */
 	int tracked = 0;
 	for (int i = 0; i < count; i++) {
@@ -2048,6 +2304,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 
 			/* Запись в буферный файл (1× write syscall) */
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2133,6 +2390,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.net_duration_ms = ne->duration_ns / 1000000;
 
 			pwd_lookup_ts(ne->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2235,6 +2493,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 
 			pwd_lookup_ts(se->sender_tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2309,6 +2568,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  sizeof(cev.sec_remote_addr));
 			}
 			pwd_lookup_ts(re->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2380,6 +2640,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  sizeof(cev.sec_remote_addr));
 			}
 			pwd_lookup_ts(se_syn->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2453,6 +2714,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  sizeof(cev.sec_remote_addr));
 			}
 			pwd_lookup_ts(rste->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2471,6 +2733,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	/* ── EXEC — вызов exec (запуск нового процесса) ──────────────── */
 	case EVENT_EXEC: {
+		/* Обновляем глобальное дерево pid (exec может быть первым появлением) */
+		pidtree_store_ts(e->tgid, e->ppid);
+
 		/* Уже отслеживается? BPF обновил proc_info, нам делать нечего */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
@@ -2526,6 +2791,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       tags_buf, cg_buf);
 				cev.is_root = 1;
 				pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
+				fill_parent_pids(&cev);
 				ef_append(&cev, cfg_hostname);
 			}
 		}
@@ -2534,6 +2800,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	/* ── FORK — создание дочернего процесса ──────────────────────── */
 	case EVENT_FORK: {
+		/* Обновляем глобальное дерево pid (покрывает ВСЕ процессы) */
+		pidtree_store_ts(e->tgid, e->ppid);
+
 		/* BPF handle_fork уже создал tracked_map и proc_info записи.
 		 * Здесь только наследуем tags (они живут в userspace hash table). */
 		struct track_info parent_ti;
@@ -2565,6 +2834,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.root_pid = parent_ti.root_pid;
 			cev.tty_nr = child_tty;
 			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2605,7 +2875,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				t = tags_lookup(e->tgid);
 			}
 			snprintf(exit_tags, sizeof(exit_tags), "%s", t);
-			tags_remove(e->tgid);
+			/* НЕ удаляем tags — snapshot зачистит вместе с картами */
 		}
 		pthread_rwlock_unlock(&g_tags_lock);
 #endif
@@ -2629,10 +2899,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg_buf);
 			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
-		/* BPF уже удалил запись из tracked_map и proc_map */
-		pwd_remove_ts(e->tgid);
+		/* Карты и кэши НЕ удаляем — proc_info помечен status=EXITED,
+		 * snapshot запишет финальный слепок и зачистит всё.
+		 * pidtree тоже НЕ удаляем — нужен для цепочек до снапшота. */
 		return 0;
 	}
 
@@ -2679,6 +2951,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			event_from_bpf(&cev, e, "oom_kill", rname,
 				       oom_tags, cg_buf);
 			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2915,90 +3188,58 @@ static const char *tags_lookup_copy(const __u32 *snap_tgid,
 }
 #endif
 
-static void write_snapshot(void)
+/*
+ * refresh_processes — тяжёлый I/O: обновление /proc, cgroup sysfs, flush агрегатов.
+ *
+ * Вызывается с периодом cfg_refresh_interval (≤ cfg_snapshot_interval).
+ * Обновляет:
+ *   - cmdline/comm из /proc (если cfg_refresh_proc=1)
+ *   - cgroup-метрики из /sys/fs/cgroup → cg_metrics[]
+ *   - Обнаружение мёртвых процессов (fallback kill(pid,0) для потерянных EXIT)
+ *   - Flush UDP/ICMP агрегатов → ef_append
+ *   - Disk usage → ef_append
+ */
+static void refresh_processes(void)
 {
-	/* Кэш cgroup'ов обновляется event-driven через BPF tracepoints
-	 * (cgroup_mkdir/rmdir/rename), периодический rebuild не нужен. */
 	refresh_boot_to_wall();
 
-#ifndef NO_TAGS
-	/* ┌───────────────────────────────────────────────────────────────┐
-	 * │  ОПТИМИЗАЦИЯ 4: Snapshot tags через memcpy (anti-starvation) │
-	 * ├───────────────────────────────────────────────────────────────┤
-	 * │  Проблема: write_snapshot итерирует ~1600 PID'ов с I/O       │
-	 * │  (fprintf, bpf_map_lookup) — это занимает секунды.           │
-	 * │  Если держать rdlock на g_tags_lock всё это время,           │
-	 * │  poll-потоки не могут получить wrlock для FORK/EXIT →        │
-	 * │  writer starvation → ring buffer переполняется.              │
-	 * │                                                               │
-	 * │  Решение: копируем tags_tgid (64KB) + tags_data (8MB) под   │
-	 * │  кратким rdlock (~1ms), затем работаем с локальной копией    │
-	 * │  через tags_lookup_copy() без каких-либо locks.             │
-	 * │                                                               │
-	 * │  Массивы объявлены static — аллоцируются один раз в BSS,    │
-	 * │  не на стеке (16 МБ на стеке вызвали бы stack overflow).    │
-	 * └───────────────────────────────────────────────────────────────┘ */
-	static __u32 snap_tgid[TAGS_HT_SIZE];
-	static char  snap_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
-	pthread_rwlock_rdlock(&g_tags_lock);
-	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
-	memcpy(snap_data, tags_data, sizeof(tags_data));
-	pthread_rwlock_unlock(&g_tags_lock);
-#endif
+	/* ── Drain missed_exec_map: восстановление процессов, потерянных
+	 * при ring buffer drop в handle_exec. BPF сохранил tgid→ppid,
+	 * здесь читаем cmdline из /proc и сопоставляем с правилами. */
+	{
+		__u32 tgid, next_tgid, ppid;
+		int err = bpf_map_get_next_key(missed_exec_fd, NULL, &tgid);
+		while (err == 0) {
+			/* Сохраняем следующий ключ до удаления текущего */
+			int has_next = (bpf_map_get_next_key(missed_exec_fd,
+					&tgid, &next_tgid) == 0);
 
-	long page_size = sysconf(_SC_PAGESIZE);
-	if (page_size <= 0) page_size = 4096;
+			if (bpf_map_lookup_elem(missed_exec_fd, &tgid,
+						&ppid) == 0) {
+				bpf_map_delete_elem(missed_exec_fd, &tgid);
+				pidtree_store_ts(tgid, ppid);
+				/* try_track_pid читает /proc/pid/cmdline,
+				 * сопоставляет с правилами и при совпадении
+				 * создаёт tracked_map + proc_info + tags */
+				int rule = try_track_pid(tgid);
+				if (rule >= 0) {
+					pwd_read_and_store(tgid);
+					log_ts("INFO",
+					       "EXEC_RECOVERY: pid=%u ppid=%u"
+					       " rule=%s (ring buffer drop)",
+					       tgid, ppid,
+					       rules[rule].name);
+				}
+			}
 
-	/* Вычисление смещения от загрузки: monotonic → epoch */
-	struct timespec mono;
-	clock_gettime(CLOCK_MONOTONIC, &mono);
-	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
-
-	/* Время, прошедшее с предыдущего снапшота (для cpu_usage_ratio) */
-	double elapsed_ns = 0;
-	if (prev_snapshot_ts.tv_sec > 0) {
-		elapsed_ns = (double)(mono.tv_sec - prev_snapshot_ts.tv_sec) * 1e9
-			   + (double)(mono.tv_nsec - prev_snapshot_ts.tv_nsec);
+			if (!has_next)
+				break;
+			tgid = next_tgid;
+			err = 0;
+		}
 	}
-	prev_snapshot_ts = mono;
 
-	/* Итерация по proc_map */
-	__u32 key = 0;
-	struct proc_info pi;
-	int pid_count = 0;
-
-	/* Сбор уникальных cgroup'ов для cgroup-метрик (с кэшированными ��начениями) */
-	struct {
-		char path[EV_CGROUP_LEN];
-		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
-		long long cpu_max, cpu_max_period;
-		long long cpu_nr_periods, cpu_nr_throttled, cpu_throttled_usec;
-		int read;  /* 1 = значения прочитаны из /sys/fs/cgroup */
-	} seen_cg[MAX_CGROUPS];
-	int seen_cg_count = 0;
-
-	/* Сбор ключей для удаления (мёртвые процессы, пропущенные из-за переполнения ringbuf) */
-	__u32 dead_keys[256];
-	int dead_count = 0;
-
-	/* Пакет снапшота для файла событий */
-	/* Одно событие на стеке для потоковой записи в файл событий */
-	int snap_count = 0;
-
-	/* Единая временная метка для всех событий снапшота в этом цикле */
-	struct timespec snap_ts;
-	clock_gettime(CLOCK_REALTIME, &snap_ts);
-	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
-				+ (__u64)snap_ts.tv_nsec;
-
-	/* Блокировка пакета, чтобы ef_read_begin() не увидел
-	 * частичный снапшот между двумя доставками */
-	ef_batch_lock();
-
-	/*
-	 * Пакетный lookup: чтение всех записей proc_map за один syscall.
-	 * Откатывается на поэлементную итерацию, если batch не поддерживается.
-	 */
+	/* Пакетное чтение proc_map */
 	__u32 *all_keys = NULL;
 	struct proc_info *all_values = NULL;
 	int all_keys_count = 0;
@@ -3010,18 +3251,15 @@ static void write_snapshot(void)
 
 		if (all_keys && all_values) {
 			DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts,
-				.elem_flags = 0,
-				.flags = 0,
+				.elem_flags = 0, .flags = 0,
 			);
 			__u32 out_batch = 0;
 			int ret = bpf_map_lookup_batch(proc_map_fd,
 				NULL, &out_batch,
 				all_keys, all_values, &batch_count, &opts);
 			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
-				/* ENOENT означает «последний пакет» — все записи прочитаны */
 				all_keys_count = (int)batch_count;
 			} else {
-				/* Batch не поддерживается — откат на итерацию */
 				all_keys_count = 0;
 				__u32 iter_key;
 				int err2 = bpf_map_get_next_key(proc_map_fd,
@@ -3031,17 +3269,21 @@ static void write_snapshot(void)
 					err2 = bpf_map_get_next_key(proc_map_fd,
 							&iter_key, &iter_key);
 				}
-				/* Значения не заполнены — будут запрошены поэлементно ниже */
 				free(all_values);
 				all_values = NULL;
 			}
 		}
 	}
 
-	for (int ki = 0; ki < all_keys_count; ki++) {
-		key = all_keys[ki];
+	/* Сброс cgroup-метрик — будут пересобраны ниже */
+	cg_metrics_count = 0;
 
-		/* Используем значение из batch, если доступно, иначе поэлементный lookup */
+	int refresh_count = 0;
+
+	for (int ki = 0; ki < all_keys_count; ki++) {
+		__u32 key = all_keys[ki];
+		struct proc_info pi;
+
 		if (all_values) {
 			pi = all_values[ki];
 		} else {
@@ -3049,22 +3291,19 @@ static void write_snapshot(void)
 				continue;
 		}
 
-		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
-			continue;
-
-		/* Проверяем, жив ли ещё процесс */
-		if (kill((pid_t)key, 0) != 0 && errno == ESRCH) {
-			if (dead_count < 256)
-				dead_keys[dead_count++] = key;
-			continue;
+		/* Fallback для потерянных EXIT: kill → ESRCH при status=ALIVE */
+		if (pi.status == PROC_STATUS_ALIVE &&
+		    kill((pid_t)key, 0) != 0 && errno == ESRCH) {
+			pi.status = PROC_STATUS_EXITED;
+			struct timespec mono;
+			clock_gettime(CLOCK_MONOTONIC, &mono);
+			pi.exit_ns = (__u64)mono.tv_sec * 1000000000ULL
+				   + (__u64)mono.tv_nsec;
+			bpf_map_update_elem(proc_map_fd, &key, &pi, BPF_EXIST);
 		}
 
-		const char *rule_name = (ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : RULE_NOT_MATCH;
-
-		/* Обновление cmdline + comm из /proc */
-		if (cfg_refresh_proc) {
+		/* Обновляем cmdline/comm только для живых процессов */
+		if (cfg_refresh_proc && pi.status == PROC_STATUS_ALIVE) {
 			char fresh[CMDLINE_MAX];
 			int flen = read_proc_cmdline(key, fresh, sizeof(fresh));
 			if (flen > 0) {
@@ -3081,176 +3320,74 @@ static void write_snapshot(void)
 				if (fgets(cbuf, sizeof(cbuf), cf)) {
 					cbuf[strcspn(cbuf, "\n")] = '\0';
 					memcpy(pi.comm, cbuf, COMM_LEN);
+					bpf_map_update_elem(proc_map_fd, &key,
+							    &pi, BPF_EXIST);
 				}
 				fclose(cf);
 			}
 		}
 
-		/* Разделение cmdline на exec + args */
-		char exec_path[CMDLINE_MAX], args[CMDLINE_MAX];
-		cmdline_split(pi.cmdline, pi.cmdline_len,
-			      exec_path, sizeof(exec_path),
-			      args, sizeof(args));
-		if ((int)strlen(args) > cfg_cmdline_max_len) {
-			args[cfg_cmdline_max_len] = '\0';
-			strcat(args, "...");
-		}
-
-		/* Разрешение cgroup: отображаемое имя + реальный путь ФС */
-		char cg_path[PATH_MAX_LEN], cg_fs_path[PATH_MAX_LEN];
-		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
-		resolve_cgroup_fs_ts(pi.cgroup_id, cg_fs_path, sizeof(cg_fs_path));
-
-		/* Вычисление времён */
-		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
-		if (uptime_sec < 0) uptime_sec = 0;
-		/* Коэффициент использования CPU */
-		double cpu_ratio = 0;
-		if (elapsed_ns > 0) {
-			__u64 prev_ns = cpu_prev_lookup(key);
-			cpu_ratio = (prev_ns > 0 && pi.cpu_ns >= prev_ns)
-				? (double)(pi.cpu_ns - prev_ns) / elapsed_ns : 0;
-		}
-		cpu_prev_update(key, pi.cpu_ns);
-
-		/* Сбор уникальных cgroup для cgroup-метрик + кэширование значений */
-		int cg_idx = -1;
-		if (cg_path[0] && seen_cg_count < MAX_CGROUPS) {
-			for (int i = 0; i < seen_cg_count; i++) {
-				if (strcmp(seen_cg[i].path, cg_path) == 0) {
-					cg_idx = i;
-					break;
+		/* Сбор уникальных cgroup → cg_metrics[] */
+		if (cfg_cgroup_metrics) {
+			char cg_path[PATH_MAX_LEN], cg_fs_path[PATH_MAX_LEN];
+			resolve_cgroup_ts(pi.cgroup_id, cg_path,
+					  sizeof(cg_path));
+			if (cg_path[0] && cg_metrics_count < MAX_CGROUPS) {
+				/* Проверяем, уже есть ли в кэше */
+				int found = 0;
+				for (int i = 0; i < cg_metrics_count; i++) {
+					if (strcmp(cg_metrics[i].path,
+						   cg_path) == 0) {
+						found = 1;
+						break;
+					}
+				}
+				if (!found) {
+					resolve_cgroup_fs_ts(pi.cgroup_id,
+							     cg_fs_path,
+							     sizeof(cg_fs_path));
+					int idx = cg_metrics_count;
+					snprintf(cg_metrics[idx].path,
+						 sizeof(cg_metrics[0].path),
+						 "%s", cg_path);
+					cg_metrics[idx].valid = 0;
+					if (cg_fs_path[0]) {
+						cg_metrics[idx].mem_max =
+							read_cgroup_value(cg_fs_path, "memory.max");
+						cg_metrics[idx].mem_cur =
+							read_cgroup_value(cg_fs_path, "memory.current");
+						cg_metrics[idx].swap_cur =
+							read_cgroup_value(cg_fs_path, "memory.swap.current");
+						cg_metrics[idx].cpu_weight =
+							read_cgroup_value(cg_fs_path, "cpu.weight");
+						read_cgroup_cpu_max(cg_fs_path,
+							&cg_metrics[idx].cpu_max,
+							&cg_metrics[idx].cpu_max_period);
+						read_cgroup_cpu_stat(cg_fs_path,
+							&cg_metrics[idx].cpu_nr_periods,
+							&cg_metrics[idx].cpu_nr_throttled,
+							&cg_metrics[idx].cpu_throttled_usec);
+						cg_metrics[idx].pids_cur =
+							read_cgroup_value(cg_fs_path, "pids.current");
+						cg_metrics[idx].valid = 1;
+					}
+					cg_metrics_count++;
 				}
 			}
-			if (cg_idx < 0) {
-				cg_idx = seen_cg_count;
-				snprintf(seen_cg[cg_idx].path,
-					 sizeof(seen_cg[0].path), "%s", cg_path);
-				seen_cg[cg_idx].read = 0;
-				if (cfg_cgroup_metrics && cg_fs_path[0]) {
-					seen_cg[cg_idx].mem_max =
-						read_cgroup_value(cg_fs_path, "memory.max");
-					seen_cg[cg_idx].mem_cur =
-						read_cgroup_value(cg_fs_path, "memory.current");
-					seen_cg[cg_idx].swap_cur =
-						read_cgroup_value(cg_fs_path, "memory.swap.current");
-					seen_cg[cg_idx].cpu_weight =
-						read_cgroup_value(cg_fs_path, "cpu.weight");
-					read_cgroup_cpu_max(cg_fs_path,
-						&seen_cg[cg_idx].cpu_max,
-						&seen_cg[cg_idx].cpu_max_period);
-					read_cgroup_cpu_stat(cg_fs_path,
-						&seen_cg[cg_idx].cpu_nr_periods,
-						&seen_cg[cg_idx].cpu_nr_throttled,
-						&seen_cg[cg_idx].cpu_throttled_usec);
-					seen_cg[cg_idx].pids_cur =
-						read_cgroup_value(cg_fs_path, "pids.current");
-					seen_cg[cg_idx].read = 1;
-				}
-				seen_cg_count++;
-			}
 		}
 
-		/* Потоковая запись события снапшота напрямую в файл событий (без буферизации) */
-		if (g_http_cfg.enabled) {
-			struct metric_event cev;
-			memset(&cev, 0, sizeof(cev));
-			cev.timestamp_ns = snap_timestamp_ns;
-			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
-			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
-#ifndef NO_TAGS
-			snprintf(cev.tags, sizeof(cev.tags), "%s", tags_lookup_copy(snap_tgid, snap_data, key));
-#endif
-			cev.root_pid = ti.root_pid;
-			cev.pid = pi.tgid;
-			cev.ppid = pi.ppid;
-			cev.uid = pi.uid;
-			memcpy(cev.comm, pi.comm, COMM_LEN);
-			cmdline_split(pi.cmdline, pi.cmdline_len,
-				      cev.exec_path, sizeof(cev.exec_path),
-				      cev.args, sizeof(cev.args));
-			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
-			cev.is_root = ti.is_root;
-			cev.state = pi.state;
-			cev.cpu_ns = pi.cpu_ns;
-			cev.cpu_usage_ratio = cpu_ratio;
-			cev.rss_bytes = pi.rss_pages * page_size;
-			cev.rss_min_bytes = pi.rss_min_pages * page_size;
-			cev.rss_max_bytes = pi.rss_max_pages * page_size;
-			cev.shmem_bytes = pi.shmem_pages * page_size;
-			cev.swap_bytes = pi.swap_pages * page_size;
-			cev.vsize_bytes = pi.vsize_pages * page_size;
-			cev.io_read_bytes = pi.io_read_bytes;
-			cev.io_write_bytes = pi.io_write_bytes;
-			cev.maj_flt = pi.maj_flt;
-			cev.min_flt = pi.min_flt;
-			cev.nvcsw = pi.nvcsw;
-			cev.nivcsw = pi.nivcsw;
-			cev.threads = pi.threads;
-			cev.oom_score_adj = pi.oom_score_adj;
-			cev.oom_killed = pi.oom_killed;
-			cev.net_tx_bytes = pi.net_tx_bytes;
-			cev.net_rx_bytes = pi.net_rx_bytes;
-			cev.start_time_ns = pi.start_ns;
-			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
-
-			/* Новые поля из proc_info */
-			cev.loginuid       = pi.loginuid;
-			cev.sessionid      = pi.sessionid;
-			cev.euid           = pi.euid;
-			cev.tty_nr         = pi.tty_nr;
-			cev.sched_policy   = pi.sched_policy;
-			cev.io_rchar       = pi.io_rchar;
-			cev.io_wchar       = pi.io_wchar;
-			cev.io_syscr       = pi.io_syscr;
-			cev.io_syscw       = pi.io_syscw;
-			cev.mnt_ns_inum    = pi.mnt_ns_inum;
-			cev.pid_ns_inum    = pi.pid_ns_inum;
-			cev.net_ns_inum    = pi.net_ns_inum;
-			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
-
-			/* Вытеснение: последний процесс, который принудительно вытеснил нас */
-			cev.preempted_by_pid = pi.preempted_by_pid;
-			memcpy(cev.preempted_by_comm,
-			       pi.preempted_by_comm, COMM_LEN);
-
-			/* pwd из userspace-кэша (заполняется при scan/fork/exec/chdir) */
-			pwd_lookup_ts(pi.tgid, cev.pwd, sizeof(cev.pwd));
-
-			/* Заполнение cgroup-метрик из кэша */
-			if (cg_idx >= 0 && seen_cg[cg_idx].read) {
-				cev.cgroup_memory_max = seen_cg[cg_idx].mem_max;
-				cev.cgroup_memory_current = seen_cg[cg_idx].mem_cur;
-				cev.cgroup_swap_current = seen_cg[cg_idx].swap_cur;
-				cev.cgroup_cpu_weight = seen_cg[cg_idx].cpu_weight;
-				cev.cgroup_cpu_max = seen_cg[cg_idx].cpu_max;
-				cev.cgroup_cpu_max_period = seen_cg[cg_idx].cpu_max_period;
-				cev.cgroup_cpu_nr_periods = seen_cg[cg_idx].cpu_nr_periods;
-				cev.cgroup_cpu_nr_throttled = seen_cg[cg_idx].cpu_nr_throttled;
-				cev.cgroup_cpu_throttled_usec = seen_cg[cg_idx].cpu_throttled_usec;
-				cev.cgroup_pids_current = seen_cg[cg_idx].pids_cur;
-			}
-
-			/* Количество открытых TCP-соединений */
-			if (cfg_sec_open_conn_count) {
-				__u64 conn_cnt = 0;
-				int occ_fd = bpf_map__fd(skel->maps.open_conn_map);
-				__u32 occ_key = pi.tgid;
-				if (bpf_map_lookup_elem(occ_fd, &occ_key,
-							&conn_cnt) == 0)
-					cev.open_tcp_conns = conn_cnt;
-			}
-
-			ef_append(&cev, cfg_hostname);
-			snap_count++;
-		}
-		pid_count++;
+		refresh_count++;
 	}
 	free(all_keys);
 	free(all_values);
 
-	/* Сброс карты агрегации UDP перед разблокировкой пакета */
+	/* Flush UDP агрегатов → ef_append */
 	if (cfg_sec_udp_tracking && g_http_cfg.enabled) {
+		struct timespec now_ts;
+		clock_gettime(CLOCK_REALTIME, &now_ts);
+		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+			    + (__u64)now_ts.tv_nsec;
+
 		int udp_fd = bpf_map__fd(skel->maps.udp_agg_map);
 		struct udp_agg_key ukey;
 		struct udp_agg_val uval;
@@ -3261,8 +3398,9 @@ static void write_snapshot(void)
 			    && (uval.tx_packets || uval.rx_packets)) {
 				struct metric_event cev;
 				memset(&cev, 0, sizeof(cev));
-				snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
-				cev.timestamp_ns = snap_timestamp_ns;
+				snprintf(cev.rule, sizeof(cev.rule), "%s",
+					 RULE_NOT_MATCH);
+				cev.timestamp_ns = ts_ns;
 				snprintf(cev.event_type, sizeof(cev.event_type),
 					 "udp_agg");
 				cev.pid = ukey.tgid;
@@ -3306,12 +3444,10 @@ static void write_snapshot(void)
 							 "%s",
 							 rules[uti.rule_id].name);
 					cev.root_pid = uti.root_pid;
-	#ifndef NO_TAGS
-				snprintf(cev.tags, sizeof(cev.tags),
-						 "%s", tags_lookup_copy(snap_tgid, snap_data, ukey.tgid));
-#endif
 				}
-				pwd_lookup_ts(ukey.tgid, cev.pwd, sizeof(cev.pwd));
+				pwd_lookup_ts(ukey.tgid, cev.pwd,
+					      sizeof(cev.pwd));
+				fill_parent_pids(&cev);
 				ef_append(&cev, cfg_hostname);
 				udp_count++;
 			}
@@ -3321,8 +3457,13 @@ static void write_snapshot(void)
 			log_debug("UDP flush: %d aggregates", udp_count);
 	}
 
-	/* Сброс карты агрегации ICMP перед разблокировкой пакета */
+	/* Flush ICMP агрегатов → ef_append */
 	if (cfg_sec_icmp_tracking && g_http_cfg.enabled) {
+		struct timespec now_ts;
+		clock_gettime(CLOCK_REALTIME, &now_ts);
+		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+			    + (__u64)now_ts.tv_nsec;
+
 		int icmp_fd = bpf_map__fd(skel->maps.icmp_agg_map);
 		struct icmp_agg_key ikey;
 		struct icmp_agg_val ival;
@@ -3333,8 +3474,9 @@ static void write_snapshot(void)
 			    && ival.count > 0) {
 				struct metric_event cev;
 				memset(&cev, 0, sizeof(cev));
-				snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
-				cev.timestamp_ns = snap_timestamp_ns;
+				snprintf(cev.rule, sizeof(cev.rule), "%s",
+					 RULE_NOT_MATCH);
+				cev.timestamp_ns = ts_ns;
 				snprintf(cev.event_type, sizeof(cev.event_type),
 					 "icmp_agg");
 				int is_v4 = 1;
@@ -3363,6 +3505,7 @@ static void write_snapshot(void)
 				cev.sec_tcp_state = ikey.icmp_type;
 				cev.sec_direction = ikey.icmp_code;
 				cev.open_tcp_conns = ival.count;
+				fill_parent_pids(&cev);
 				ef_append(&cev, cfg_hostname);
 				icmp_count++;
 			}
@@ -3372,38 +3515,350 @@ static void write_snapshot(void)
 			log_debug("ICMP flush: %d aggregates", icmp_count);
 	}
 
-	/* Генерация событий использования дисков */
+	/* Disk usage → ef_append */
 	if (g_http_cfg.enabled && cfg_disk_tracking_enabled) {
-		int disk_ev = emit_disk_usage_events(snap_timestamp_ns,
-						     cfg_hostname);
-		snap_count += disk_ev;
+		struct timespec now_ts;
+		clock_gettime(CLOCK_REALTIME, &now_ts);
+		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+			    + (__u64)now_ts.tv_nsec;
+		int disk_ev = emit_disk_usage_events(ts_ns, cfg_hostname);
+		if (disk_ev > 0)
+			log_debug("disk refresh: %d events", disk_ev);
 	}
 
-	/* Разблокировка пакета — снапшот завершён, безопасно для swap/snapshot_fd */
+	log_ts("INFO", "refresh: %d PIDs, %d cgroups",
+	       refresh_count, cg_metrics_count);
+}
+
+/*
+ * write_snapshot — лёгкий слепок: собрать из кэшей/карт, записать в event_file.
+ *
+ * Без файлового I/O. Все тяжёлые данные уже обновлены refresh_processes().
+ * Единственные syscall: bpf_map_lookup_batch (1×), bpf_map_lookup_elem (per-PID),
+ * ef_append (write в memory-mapped ring).
+ */
+static void write_snapshot(void)
+{
+	/* ── Восстановление после ring buffer drop на FORK ────────────
+	 * BPF handle_fork создаёт tracked_map + proc_map ДО резервирования
+	 * ring buffer. Если bpf_ringbuf_reserve не удался, userspace не
+	 * получил fork-событие и не вызвал pidtree_store_ts / tags_inherit_ts /
+	 * pwd_inherit_ts. Детектируем это по отсутствию pid в pidtree
+	 * и восстанавливаем наследование от родителя.
+	 */
+	{
+		__u32 key;
+		int err = bpf_map_get_next_key(tracked_map_fd, NULL, &key);
+		while (err == 0) {
+			__u32 next;
+			int next_err = bpf_map_get_next_key(tracked_map_fd,
+							    &key, &next);
+
+			/* Быстрая проверка: есть ли pid в pidtree? */
+			pthread_rwlock_rdlock(&g_pidtree_lock);
+			__u32 ppid_in_tree = pidtree_lookup_in(pt_pid, pt_ppid,
+							       key);
+			pthread_rwlock_unlock(&g_pidtree_lock);
+
+			if (ppid_in_tree == 0) {
+				/* Нет в pidtree → fork-событие было потеряно.
+				 * Берём ppid из proc_info и восстанавливаем. */
+				struct proc_info pi;
+				if (bpf_map_lookup_elem(proc_map_fd, &key,
+							&pi) == 0 &&
+				    pi.ppid > 0) {
+					pidtree_store_ts(key, pi.ppid);
+					tags_inherit_ts(key, pi.ppid);
+					pwd_inherit_ts(key, pi.ppid);
+					log_debug("FORK_RECOVERY: pid=%u ppid=%u"
+						  " (ring buffer drop)",
+						  key, pi.ppid);
+				}
+			}
+
+			if (next_err != 0)
+				break;
+			key = next;
+		}
+	}
+
+#ifndef NO_TAGS
+	/* ОПТИМИЗАЦИЯ 4: копируем tags под кратким rdlock */
+	static __u32 snap_tgid[TAGS_HT_SIZE];
+	static char  snap_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
+	pthread_rwlock_rdlock(&g_tags_lock);
+	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
+	memcpy(snap_data, tags_data, sizeof(tags_data));
+	pthread_rwlock_unlock(&g_tags_lock);
+#endif
+
+	/* Snapshot pid tree для цепочек предков (512 КБ, ~0.1ms) */
+	static __u32 snap_pt_pid[PIDTREE_HT_SIZE];
+	static __u32 snap_pt_ppid[PIDTREE_HT_SIZE];
+	pthread_rwlock_rdlock(&g_pidtree_lock);
+	memcpy(snap_pt_pid, pt_pid, sizeof(pt_pid));
+	memcpy(snap_pt_ppid, pt_ppid, sizeof(pt_ppid));
+	pthread_rwlock_unlock(&g_pidtree_lock);
+
+	long page_size = sysconf(_SC_PAGESIZE);
+	if (page_size <= 0) page_size = 4096;
+
+	struct timespec mono;
+	clock_gettime(CLOCK_MONOTONIC, &mono);
+	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
+
+	double elapsed_ns = 0;
+	if (prev_snapshot_ts.tv_sec > 0) {
+		elapsed_ns = (double)(mono.tv_sec - prev_snapshot_ts.tv_sec) * 1e9
+			   + (double)(mono.tv_nsec - prev_snapshot_ts.tv_nsec);
+	}
+	prev_snapshot_ts = mono;
+
+	struct timespec snap_ts;
+	clock_gettime(CLOCK_REALTIME, &snap_ts);
+	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
+				+ (__u64)snap_ts.tv_nsec;
+
+	#define DEAD_KEYS_CAP 256
+	__u32 dead_keys[DEAD_KEYS_CAP];
+	int dead_count = 0;
+	int dead_total = 0;
+	int pid_count = 0, snap_count = 0;
+
+	ef_batch_lock();
+
+	/* Пакетное чтение proc_map */
+	__u32 *all_keys = NULL;
+	struct proc_info *all_values = NULL;
+	int all_keys_count = 0;
+
+	{
+		__u32 batch_count = MAX_PROCS;
+		all_keys = malloc(batch_count * sizeof(__u32));
+		all_values = malloc(batch_count * sizeof(struct proc_info));
+
+		if (all_keys && all_values) {
+			DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts,
+				.elem_flags = 0, .flags = 0,
+			);
+			__u32 out_batch = 0;
+			int ret = bpf_map_lookup_batch(proc_map_fd,
+				NULL, &out_batch,
+				all_keys, all_values, &batch_count, &opts);
+			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
+				all_keys_count = (int)batch_count;
+			} else {
+				all_keys_count = 0;
+				__u32 iter_key;
+				int err2 = bpf_map_get_next_key(proc_map_fd,
+							NULL, &iter_key);
+				while (err2 == 0 && all_keys_count < (int)MAX_PROCS) {
+					all_keys[all_keys_count++] = iter_key;
+					err2 = bpf_map_get_next_key(proc_map_fd,
+							&iter_key, &iter_key);
+				}
+				free(all_values);
+				all_values = NULL;
+			}
+		}
+	}
+
+	for (int ki = 0; ki < all_keys_count; ki++) {
+		__u32 key = all_keys[ki];
+		struct proc_info pi;
+
+		if (all_values) {
+			pi = all_values[ki];
+		} else {
+			if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) != 0)
+				continue;
+		}
+
+		struct track_info ti;
+		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
+			continue;
+
+		int is_exited = (pi.status != PROC_STATUS_ALIVE);
+
+		/* Завершённые → в dead_keys, но НЕ пропускаются.
+		 * При переполнении буфера — flush и продолжаем сбор. */
+		if (is_exited) {
+			if (dead_count >= DEAD_KEYS_CAP) {
+				for (int d = 0; d < dead_count; d++) {
+					bpf_map_delete_elem(tracked_map_fd,
+							    &dead_keys[d]);
+					bpf_map_delete_elem(proc_map_fd,
+							    &dead_keys[d]);
+					cpu_prev_remove(dead_keys[d]);
+					pwd_remove_ts(dead_keys[d]);
+					tags_remove_ts(dead_keys[d]);
+					pidtree_remove_ts(dead_keys[d]);
+				}
+				dead_total += dead_count;
+				dead_count = 0;
+			}
+			dead_keys[dead_count++] = key;
+		}
+
+		const char *rule_name = (ti.rule_id < num_rules)
+			? rules[ti.rule_id].name : RULE_NOT_MATCH;
+
+		/* Разрешение cgroup из кэша */
+		char cg_path[PATH_MAX_LEN];
+		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
+
+		/* Вычисление времён */
+		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
+		if (uptime_sec < 0) uptime_sec = 0;
+		double cpu_ratio = 0;
+		if (elapsed_ns > 0) {
+			__u64 prev_ns = cpu_prev_lookup(key);
+			cpu_ratio = (prev_ns > 0 && pi.cpu_ns >= prev_ns)
+				? (double)(pi.cpu_ns - prev_ns) / elapsed_ns : 0;
+		}
+		cpu_prev_update(key, pi.cpu_ns);
+
+		/* Lookup cgroup-метрик из кэша (заполнен refresh) */
+		int cg_idx = -1;
+		if (cg_path[0]) {
+			for (int i = 0; i < cg_metrics_count; i++) {
+				if (strcmp(cg_metrics[i].path, cg_path) == 0) {
+					cg_idx = i;
+					break;
+				}
+			}
+		}
+
+		/* Формирование события snapshot */
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+			cev.timestamp_ns = snap_timestamp_ns;
+			snprintf(cev.event_type, sizeof(cev.event_type),
+				 "snapshot");
+			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
+#ifndef NO_TAGS
+			snprintf(cev.tags, sizeof(cev.tags), "%s",
+				 tags_lookup_copy(snap_tgid, snap_data, key));
+#endif
+			cev.root_pid = ti.root_pid;
+			cev.pid = pi.tgid;
+			cev.ppid = pi.ppid;
+			cev.uid = pi.uid;
+			memcpy(cev.comm, pi.comm, COMM_LEN);
+			cmdline_split(pi.cmdline, pi.cmdline_len,
+				      cev.exec_path, sizeof(cev.exec_path),
+				      cev.args, sizeof(cev.args));
+			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s",
+				 cg_path);
+			cev.is_root = ti.is_root;
+			cev.state = pi.state;
+			cev.cpu_ns = pi.cpu_ns;
+			cev.cpu_usage_ratio = cpu_ratio;
+			cev.rss_bytes = pi.rss_pages * page_size;
+			cev.rss_min_bytes = pi.rss_min_pages * page_size;
+			cev.rss_max_bytes = pi.rss_max_pages * page_size;
+			cev.shmem_bytes = pi.shmem_pages * page_size;
+			cev.swap_bytes = pi.swap_pages * page_size;
+			cev.vsize_bytes = pi.vsize_pages * page_size;
+			cev.io_read_bytes = pi.io_read_bytes;
+			cev.io_write_bytes = pi.io_write_bytes;
+			cev.maj_flt = pi.maj_flt;
+			cev.min_flt = pi.min_flt;
+			cev.nvcsw = pi.nvcsw;
+			cev.nivcsw = pi.nivcsw;
+			cev.threads = pi.threads;
+			cev.oom_score_adj = pi.oom_score_adj;
+			cev.oom_killed = pi.oom_killed;
+			cev.net_tx_bytes = pi.net_tx_bytes;
+			cev.net_rx_bytes = pi.net_rx_bytes;
+			cev.start_time_ns = pi.start_ns;
+			cev.uptime_seconds = (__u64)(uptime_sec > 0
+						     ? uptime_sec : 0);
+
+			cev.loginuid       = pi.loginuid;
+			cev.sessionid      = pi.sessionid;
+			cev.euid           = pi.euid;
+			cev.tty_nr         = pi.tty_nr;
+			cev.sched_policy   = pi.sched_policy;
+			cev.io_rchar       = pi.io_rchar;
+			cev.io_wchar       = pi.io_wchar;
+			cev.io_syscr       = pi.io_syscr;
+			cev.io_syscw       = pi.io_syscw;
+			cev.mnt_ns_inum    = pi.mnt_ns_inum;
+			cev.pid_ns_inum    = pi.pid_ns_inum;
+			cev.net_ns_inum    = pi.net_ns_inum;
+			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
+
+			cev.preempted_by_pid = pi.preempted_by_pid;
+			memcpy(cev.preempted_by_comm,
+			       pi.preempted_by_comm, COMM_LEN);
+
+			pwd_lookup_ts(pi.tgid, cev.pwd, sizeof(cev.pwd));
+
+			/* cgroup-метрики из кэша (заполнен refresh) */
+			if (cg_idx >= 0 && cg_metrics[cg_idx].valid) {
+				cev.cgroup_memory_max = cg_metrics[cg_idx].mem_max;
+				cev.cgroup_memory_current = cg_metrics[cg_idx].mem_cur;
+				cev.cgroup_swap_current = cg_metrics[cg_idx].swap_cur;
+				cev.cgroup_cpu_weight = cg_metrics[cg_idx].cpu_weight;
+				cev.cgroup_cpu_max = cg_metrics[cg_idx].cpu_max;
+				cev.cgroup_cpu_max_period = cg_metrics[cg_idx].cpu_max_period;
+				cev.cgroup_cpu_nr_periods = cg_metrics[cg_idx].cpu_nr_periods;
+				cev.cgroup_cpu_nr_throttled = cg_metrics[cg_idx].cpu_nr_throttled;
+				cev.cgroup_cpu_throttled_usec = cg_metrics[cg_idx].cpu_throttled_usec;
+				cev.cgroup_pids_current = cg_metrics[cg_idx].pids_cur;
+			}
+
+			/* open_conn_map — BPF map lookup, не файловый I/O */
+			if (cfg_sec_open_conn_count) {
+				__u64 conn_cnt = 0;
+				int occ_fd = bpf_map__fd(
+					skel->maps.open_conn_map);
+				__u32 occ_key = pi.tgid;
+				if (bpf_map_lookup_elem(occ_fd, &occ_key,
+							&conn_cnt) == 0)
+					cev.open_tcp_conns = conn_cnt;
+			}
+
+			pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid,
+					       cev.pid, cev.parent_pids,
+					       &cev.parent_pids_len);
+			ef_append(&cev, cfg_hostname);
+			snap_count++;
+		}
+		pid_count++;
+	}
+	free(all_keys);
+	free(all_values);
+
 	ef_batch_unlock();
 
-	/* Очистка мёртвых процессов (BPF-карты — без lock) */
+	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
 	for (int i = 0; i < dead_count; i++) {
 		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
 		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
 		cpu_prev_remove(dead_keys[i]);
+		pwd_remove_ts(dead_keys[i]);
+		tags_remove_ts(dead_keys[i]);
+		pidtree_remove_ts(dead_keys[i]);
 	}
+	dead_total += dead_count;
 
-	log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events",
-	       pid_count, seen_cg_count, snap_count);
+	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events",
+	       pid_count, dead_total, snap_count);
 
-	/* snap_count событий были потоково записаны через ef_append выше */
-
-	/* Логируем статистику ring buffer'ов */
+	/* Статистика ring buffer'ов */
 	{
 		__u32 key = 0;
 		struct ringbuf_stats rs = {0};
 		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
 		if (stats_fd >= 0 &&
 		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
-			if (rs.drop_proc || rs.drop_file || rs.drop_net || rs.drop_cgroup) {
+			if (rs.drop_proc || rs.drop_file || rs.drop_net ||
+			    rs.drop_cgroup || rs.drop_missed_exec) {
 				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu cgroup=%llu/%llu",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
@@ -3411,7 +3866,8 @@ static void write_snapshot(void)
 				       (unsigned long long)rs.drop_net,
 				       (unsigned long long)rs.total_net,
 				       (unsigned long long)rs.drop_cgroup,
-				       (unsigned long long)rs.total_cgroup);
+				       (unsigned long long)rs.total_cgroup,
+				       (unsigned long long)rs.drop_missed_exec);
 			} else if (cfg_log_level >= 2) {
 				log_ts("DEBUG",
 				       "ringbuf totals: proc=%llu file=%llu net=%llu cgroup=%llu",
@@ -3423,15 +3879,43 @@ static void write_snapshot(void)
 		}
 	}
 
-	if (dead_count > 0) {
-#ifndef NO_TAGS
-		/* Удаляем теги мёртвых процессов (wrlock) */
-		pthread_rwlock_wrlock(&g_tags_lock);
-		for (int i = 0; i < dead_count; i++)
-			tags_remove(dead_keys[i]);
-		pthread_rwlock_unlock(&g_tags_lock);
-#endif
-		log_ts("INFO", "cleaned up %d dead PIDs", dead_count);
+	/* ── GC pidtree: удаляем записи мёртвых неотслеживаемых PID ────
+	 * При начальном сканировании /proc ВСЕ процессы попадают в pidtree,
+	 * но EXIT-событие приходит только для tracked процессов. Без GC
+	 * записи неотслеживаемых мёртвых PID утекают и забивают хеш-таблицу.
+	 * Запускаем каждые 10 snapshot'ов чтобы не нагружать kill() syscall. */
+	{
+		static int gc_counter;
+		if (++gc_counter >= 10) {
+			gc_counter = 0;
+			int gc_removed = 0;
+			pthread_rwlock_wrlock(&g_pidtree_lock);
+			for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+				__u32 pid = pt_pid[i];
+				if (pid == 0)
+					continue;
+				/* Tracked процессы очищаются через dead_keys */
+				struct track_info ti_gc;
+				if (bpf_map_lookup_elem(tracked_map_fd, &pid,
+							&ti_gc) == 0)
+					continue;
+				/* Проверяем, жив ли процесс */
+				if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
+					continue;
+				/* Мёртвый и неотслеживаемый — удаляем.
+				 * Используем pidtree_remove (без _ts, т.к.
+				 * wrlock уже взят). После удаления слот мог
+				 * сдвинуться (Robin Hood), пересканим. */
+				pidtree_remove(pid);
+				pt_generation++;
+				gc_removed++;
+				i--;  /* re-check этот слот после сдвига */
+			}
+			pthread_rwlock_unlock(&g_pidtree_lock);
+			if (gc_removed)
+				log_debug("PIDTREE_GC: removed %d dead"
+					  " untracked entries", gc_removed);
+		}
 	}
 }
 
@@ -3684,6 +4168,7 @@ int main(int argc, char *argv[])
 	/* Получение файловых дескрипторов карт */
 	tracked_map_fd = bpf_map__fd(skel->maps.tracked_map);
 	proc_map_fd    = bpf_map__fd(skel->maps.proc_map);
+	missed_exec_fd = bpf_map__fd(skel->maps.missed_exec_map);
 
 	/* Ring buffers: по одному на каждый тип событий.
 	 * Каждый будет обслуживаться отдельным потоком poll. */
@@ -3728,13 +4213,13 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	log_ts("INFO", "started: %d rules, snapshot every %ds, "
+	log_ts("INFO", "started: %d rules, snapshot every %ds, refresh every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net_tracking=%s%s, file_tracking=%s%s, "
 	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s], "
 	       "disk_tracking=%s, ring_buffer_size=%lld",
-	       num_rules, cfg_snapshot_interval,
+	       num_rules, cfg_snapshot_interval, cfg_refresh_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
 	       cfg_cgroup_metrics ? "on" : "off",
@@ -3779,8 +4264,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Главный цикл — снапшот и перезагрузка конфигурации */
+	/* Главный цикл — refresh, снапшот и перезагрузка конфигурации */
 	time_t last_snapshot = 0;
+	time_t last_refresh  = 0;
 
 	while (g_running) {
 		sleep(1);
@@ -3805,13 +4291,23 @@ int main(int argc, char *argv[])
 			cpu_prev_count = 0;
 			prev_snapshot_ts = (struct timespec){0};
 			initial_scan();
+
+			/* Сбрасываем таймеры после перезагрузки */
+			last_refresh  = 0;
+			last_snapshot = 0;
 		}
 
-		/* Периодический снапшот */
 		time_t now = time(NULL);
+
+		/* Периодическое обновление: тяжёлый I/O (cmdline, cgroup sysfs,
+		 * kill-проверка, flush udp/icmp/disk) */
+		if (now - last_refresh >= cfg_refresh_interval) {
+			refresh_processes();
+			last_refresh = now;
+		}
+
+		/* Периодический снапшот: лёгкий, только чтение из кешей */
 		if (now - last_snapshot >= cfg_snapshot_interval) {
-			/* build_cgroup_cache и refresh_boot_to_wall вызываются
-			 * внутри write_snapshot под wrlock */
 			write_snapshot();
 			last_snapshot = now;
 		}

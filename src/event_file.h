@@ -23,6 +23,7 @@
 #define EV_CGROUP_LEN      512  /* путь cgroup */
 #define EV_ADDR_LEN        46   /* форматированная строка IP (INET6_ADDRSTRLEN) */
 #define EV_PWD_LEN         512  /* текущий рабочий каталог */
+#define EV_PARENT_PIDS_MAX 32   /* макс. глубина цепочки предков процесса */
 
 /*
  * Наихудший случай экранирования CSV: каждый символ удвоен + 2 кавычки + NUL.
@@ -153,6 +154,10 @@ struct metric_event {
 	__u64 disk_total_bytes;
 	__u64 disk_used_bytes;
 	__u64 disk_avail_bytes;
+
+	/* ── цепочка предков процесса ────────────────────────────────── */
+	__u32 parent_pids[EV_PARENT_PIDS_MAX]; /* [ppid, ppid's parent, ..., 1] */
+	__u8  parent_pids_len;                  /* число валидных элементов */
 };
 
 /* ── запись файла событий (hostname + событие) ───────────────────── */

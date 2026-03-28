@@ -42,7 +42,8 @@ static const char CSV_HEADER_STR[] =
 	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
 	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
 	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
-	"disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
+	"disk_total_bytes,disk_used_bytes,disk_avail_bytes,"
+	"parent_pids\n";
 
 const char *csv_header(int *len)
 {
@@ -431,11 +432,18 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->sec_direction);
 	U64(ev->open_tcp_conns);
 
-	/* ── использование диска (последние 3 поля — без запятой в конце) */
+	/* ── использование диска ────────────────────────────────────── */
 	U64(ev->disk_total_bytes);
 	U64(ev->disk_used_bytes);
-	/* последнее поле: вместо запятой — перенос строки */
-	p = put_u64(p, (unsigned long long)ev->disk_avail_bytes);
+	U64(ev->disk_avail_bytes);
+
+	/* ── parent_pids (последнее поле, разделённое символом |) ───── */
+	*p++ = '"';
+	for (int i = 0; i < ev->parent_pids_len && i < EV_PARENT_PIDS_MAX; i++) {
+		if (i > 0) *p++ = '|';
+		p = put_u32(p, ev->parent_pids[i]);
+	}
+	*p++ = '"';
 	*p++ = '\n';
 
 	/* Проверяем, что не вышли за пределы буфера */

@@ -153,6 +153,20 @@ struct {
 	__type(value, struct proc_info);
 } scratch_pi SEC(".maps");
 
+/*
+ * missed_exec_map: fallback при ring buffer drop в handle_exec.
+ * Когда ringbuf_reserve не удаётся для нового (не fork-наследованного)
+ * процесса, BPF сохраняет tgid → ppid в эту карту. Userspace периодически
+ * дрейнит её и вызывает try_track_pid() для восстановления.
+ * Без этого процесс полностью теряется — ни snapshot, ни exit не увидят его.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, __u32);           /* tgid */
+	__type(value, __u32);         /* ppid */
+} missed_exec_map SEC(".maps");
+
 /* ── ограничитель частоты ─────────────────────────────────────────── */
 
 /*
@@ -584,6 +598,13 @@ int handle_exec(void *ctx)
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e) {
 		RB_STAT_DROP_PROC();
+		/* Сохраняем tgid→ppid в fallback-карту, чтобы userspace мог
+		 * обнаружить и отследить процесс через try_track_pid().
+		 * Без этого процесс полностью теряется. */
+		if (bpf_map_update_elem(&missed_exec_map, &tgid, &ppid,
+					BPF_NOEXIST) != 0)
+			rb_stat_inc(__builtin_offsetof(
+				struct ringbuf_stats, drop_missed_exec));
 		return 0;
 	}
 
@@ -939,35 +960,54 @@ int handle_exit(void *ctx)
 	if (pid != tgid)
 		return 0;
 
-	/* Отправляем событие EXIT с финальными метриками */
+	/* Финальный снимок метрик из task_struct */
+	struct mem_info exit_mi = read_mem_pages(task);
+	__u64 final_vsize    = read_vsize_pages(task);
+	__u32 final_threads  = read_nr_threads(task);
+	__s16 final_oom_adj  = read_oom_score_adj(task);
+	__u32 final_exit_code = BPF_CORE_READ(task, exit_code);
+	__u64 exit_ts        = bpf_ktime_get_boot_ns();
+
+	/* Помечаем proc_info как завершённый + обновляем финальные метрики.
+	 * Карты НЕ удаляем — snapshot прочитает и зачистит */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (info) {
+		info->status        = PROC_STATUS_EXITED;
+		info->exit_ns       = exit_ts;
+		info->exit_code     = final_exit_code;
+		info->rss_pages     = exit_mi.rss_pages;
+		info->vsize_pages   = final_vsize;
+		info->threads       = final_threads;
+		info->oom_score_adj = final_oom_adj;
+	}
+
+	/* Отправляем событие EXIT в ring buffer */
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e) {
 		RB_STAT_DROP_PROC();
-		goto cleanup;
+		return 0;
 	}
 
 	__builtin_memset(e, 0, sizeof(*e));
 	e->type         = EVENT_EXIT;
 	e->tgid         = tgid;
 	e->uid          = (__u32)bpf_get_current_uid_gid();
-	e->timestamp_ns = bpf_ktime_get_boot_ns();
+	e->timestamp_ns = exit_ts;
 	bpf_get_current_comm(e->comm, sizeof(e->comm));
 
-	/* Копируем данные отслеживания перед удалением из карт */
+	/* Данные отслеживания */
 	e->root_pid = ti->root_pid;
 	e->rule_id  = ti->rule_id;
 
-	/* Финальный снимок метрик (cpu_ns уже накоплен через дельта-трекинг) */
-	struct mem_info exit_mi = read_mem_pages(task);
+	/* Финальные метрики */
 	e->rss_pages     = exit_mi.rss_pages;
-	e->vsize_pages   = read_vsize_pages(task);
-	e->threads       = read_nr_threads(task);
-	e->oom_score_adj = read_oom_score_adj(task);
-	e->exit_code     = BPF_CORE_READ(task, exit_code);
+	e->vsize_pages   = final_vsize;
+	e->threads       = final_threads;
+	e->oom_score_adj = final_oom_adj;
+	e->exit_code     = final_exit_code;
 
-	/* Переносим накопленные метрики из proc_info */
-	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	/* Накопленные метрики из proc_info */
 	if (info) {
 		e->cpu_ns        = info->cpu_ns;
 		e->rss_min_pages = info->rss_min_pages;
@@ -981,7 +1021,6 @@ int handle_exit(void *ctx)
 		e->net_rx_bytes  = info->net_rx_bytes;
 		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
-		/* Копируем новые поля из последнего снимка sched_switch */
 		e->loginuid      = info->loginuid;
 		e->sessionid     = info->sessionid;
 		e->euid          = info->euid;
@@ -998,10 +1037,6 @@ int handle_exit(void *ctx)
 	}
 
 	bpf_ringbuf_submit(e, 0);
-
-cleanup:
-	bpf_map_delete_elem(&tracked_map, &tgid);
-	bpf_map_delete_elem(&proc_map, &tgid);
 	return 0;
 }
 
