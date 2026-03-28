@@ -1,12 +1,12 @@
 /*
- * csv_format.c — fast CSV formatting without snprintf
+ * csv_format.c — быстрое CSV-форматирование без snprintf
  *
- * Replaces the single giant snprintf() call in format_csv_row() with
- * direct buffer writes: memcpy for strings, hand-rolled u64/i64/u32/i32
- * to decimal, and a fixed-point double→string for cpu_usage_ratio.
+ * Заменяет единственный гигантский вызов snprintf() в format_csv_row()
+ * прямой записью в буфер: memcpy для строк, ручная конвертация u64/i64/u32/i32
+ * в десятичное представление, фиксированная точка double→string для cpu_usage_ratio.
  *
- * Profiling showed snprintf + _IO_default_xsputn + _itoa_word + __printf_fp_l
- * consuming ~48% of total CPU.  This file eliminates all of that.
+ * Профилирование показало, что snprintf + _IO_default_xsputn + _itoa_word +
+ * __printf_fp_l потребляют ~48% CPU.  Этот файл полностью устраняет эти затраты.
  */
 
 #define _GNU_SOURCE
@@ -16,7 +16,7 @@
 #include "csv_format.h"
 #include "event_file.h"
 
-/* ── CSV header (identical to the old one in http_server.c) ───────── */
+/* ── Заголовок CSV (идентичен прежнему в http_server.c) ───────────── */
 
 static const char CSV_HEADER_STR[] =
 	"timestamp,hostname,event_type,rule,tags,"
@@ -51,16 +51,16 @@ const char *csv_header(int *len)
 	return CSV_HEADER_STR;
 }
 
-/* ── fast integer → decimal ───────────────────────────────────────── */
+/* ── быстрая конвертация целого → десятичное ─────────────────────── */
 
 /*
- * Write unsigned 64-bit integer as decimal into buf.
- * Returns pointer to one past last written byte.
- * Caller must ensure at least 20 bytes available.
+ * Записывает беззнаковое 64-битное целое в десятичном виде в buf.
+ * Возвращает указатель на байт после последнего записанного.
+ * Вызывающий должен обеспечить минимум 20 байт в буфере.
  */
 static inline char *put_u64(char *p, unsigned long long v)
 {
-	/* Reverse digits into tmp, then copy forward */
+	/* Разворачиваем цифры в tmp, затем копируем в прямом порядке */
 	char tmp[20];
 	int i = 0;
 	if (v == 0) {
@@ -76,24 +76,24 @@ static inline char *put_u64(char *p, unsigned long long v)
 	return p;
 }
 
-/* Signed 64-bit */
+/* Знаковое 64-битное */
 static inline char *put_i64(char *p, long long v)
 {
 	if (v < 0) {
 		*p++ = '-';
-		/* Handle LLONG_MIN safely */
+		/* Безопасная обработка LLONG_MIN */
 		return put_u64(p, (unsigned long long)(-(v + 1)) + 1);
 	}
 	return put_u64(p, (unsigned long long)v);
 }
 
-/* Unsigned 32-bit (same code, narrower type avoids cast at call site) */
+/* Беззнаковое 32-битное (тот же код, узкий тип избавляет от приведения н�� месте вызова) */
 static inline char *put_u32(char *p, unsigned int v)
 {
 	return put_u64(p, v);
 }
 
-/* Signed 32-bit */
+/* Знаковое 32-битное */
 static inline char *put_i32(char *p, int v)
 {
 	if (v < 0) {
@@ -103,7 +103,7 @@ static inline char *put_i32(char *p, int v)
 	return put_u32(p, (unsigned int)v);
 }
 
-/* ── fast double → "N.NNNN" (4 decimals, matching %.4f) ──────────── */
+/* ── быстрая конвертация double → "N.NNNN" (4 знака, аналог %.4f) ─ */
 
 static inline char *put_f64_4(char *p, double v)
 {
@@ -111,14 +111,14 @@ static inline char *put_f64_4(char *p, double v)
 		*p++ = '-';
 		v = -v;
 	}
-	/* integer part */
+	/* целая часть */
 	unsigned long long ipart = (unsigned long long)v;
 	p = put_u64(p, ipart);
 	*p++ = '.';
-	/* fractional part: 4 digits */
+	/* дробная часть: 4 цифры */
 	double frac = v - (double)ipart;
 	unsigned int f4 = (unsigned int)(frac * 10000.0 + 0.5);
-	if (f4 >= 10000) { f4 = 9999; }  /* clamp rounding overflow */
+	if (f4 >= 10000) { f4 = 9999; }  /* ограничиваем переполнение округления */
 	p[0] = '0' + (char)(f4 / 1000); f4 %= 1000;
 	p[1] = '0' + (char)(f4 / 100);  f4 %= 100;
 	p[2] = '0' + (char)(f4 / 10);   f4 %= 10;
@@ -126,36 +126,36 @@ static inline char *put_f64_4(char *p, double v)
 	return p + 4;
 }
 
-/* ── CSV field output — PostgreSQL-compatible ─────────────────────── */
+/* ── вывод CSV-поля — совместимо с PostgreSQL ─────────────────────── */
 
 /*
- * Write CSV field directly to *p, mirroring PostgreSQL's
- * CopyAttributeOutCSV() logic (src/backend/commands/copyto.c).
+ * Записывает CSV-поле напрямую в *p, повторяя логику PostgreSQL
+ * CopyAttributeOutCSV() (src/backend/commands/copyto.c).
  *
- * Two-pass algorithm:
- *   Pass 1: scan for characters that require quoting
- *            (delimiter, quote char, '\n', '\r')
- *   Pass 2: output the field, quoting/escaping only when needed
+ * Двухпроходный алгоритм:
+ *   Проход 1: сканирование на символы, требующие квотирования
+ *              (разделитель, символ кавычки, '\n', '\r')
+ *   Проход 2: запись поля с квотированием/эскейпингом при необходимости
  *
- * Escaping: quote character is doubled inside quoted fields (RFC 4180).
- * Empty strings are always quoted to distinguish from NULL.
+ * Эскейпинг: символ кавычки удваивается внутри квотированных полей (RFC 4180).
+ * Пустые строки всегда квотируются для отличия от NULL.
  *
- * limit: max source bytes to scan (strlen-safe for fixed-size fields).
- * Returns pointer past the last byte written.
+ * limit: макс. байт исходной строки (безопасно для полей фиксированного размера).
+ * Возвращает указатель на байт после последнего записанного.
  */
 static inline char *put_str(char *p, const char *src, int limit)
 {
 	const char quotec  = '"';
-	const char escapec = '"';   /* same as quotec, per PostgreSQL default */
+	const char escapec = '"';   /* совпадает с quotec, как в PostgreSQL по умолчанию */
 	const char delimc  = ',';
 
-	/* effective length (stop at NUL or limit) */
+	/* эффективная длина (до NUL или limit) */
 	int len = 0;
 	while (len < limit && src[len])
 		len++;
 
-	/* Pass 1: decide whether quoting is needed (PostgreSQL preliminary scan) */
-	int need_quote = (len == 0); /* empty → always quote (≠ NULL) */
+	/* Проход 1: определяем необходимость квотирования (предварительное сканирование как в PostgreSQL) */
+	int need_quote = (len == 0); /* пустая строка → всегда квотируем (≠ NULL) */
 	for (int i = 0; !need_quote && i < len; i++) {
 		char c = src[i];
 		if (c == delimc || c == quotec || c == '\n' || c == '\r')
@@ -167,7 +167,7 @@ static inline char *put_str(char *p, const char *src, int limit)
 		for (int i = 0; i < len; i++) {
 			char c = src[i];
 			if (c == quotec || c == escapec)
-				*p++ = escapec; /* double the quote/escape char */
+				*p++ = escapec; /* удваиваем символ кавычки/эскейпа */
 			*p++ = c;
 		}
 		*p++ = quotec;
@@ -179,11 +179,11 @@ static inline char *put_str(char *p, const char *src, int limit)
 	return p;
 }
 
-/* ── timestamp formatting ─────────────────────────────────────────── */
+/* ── форматирование метки времени ─────────────────────────────────── */
 
 /*
- * Format timestamp_ns as "YYYY-MM-DD HH:MM:SS.mmm" (23 bytes).
- * Returns pointer past the last byte written.
+ * Форматирует timestamp_ns как "YYYY-MM-DD HH:MM:SS.mmm" (23 байта).
+ * Возвращает указатель на байт после последнего записанного.
  */
 static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 {
@@ -225,41 +225,41 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 	return p + 23;
 }
 
-/* ── helpers ──────────────────────────────────────────────────────── */
+/* ── вспомогательные макросы ──────────────────────────────────────── */
 
-/* Append comma */
+/* Добавить запятую */
 #define COMMA() (*p++ = ',')
 
-/* Append string field + comma */
+/* Добавить строковое поле + запятую */
 #define STR(field, maxlen) do { p = put_str(p, (field), (maxlen)); COMMA(); } while(0)
 
-/* Append unsigned 64-bit + comma */
+/* Добавить беззнаковое 64-бит + запятую */
 #define U64(v) do { p = put_u64(p, (unsigned long long)(v)); COMMA(); } while(0)
 
-/* Append signed 64-bit + comma */
+/* Добавить знаковое 64-бит + запятую */
 #define I64(v) do { p = put_i64(p, (long long)(v)); COMMA(); } while(0)
 
-/* Append unsigned 32-bit + comma */
+/* Добавить беззнаковое 32-бит + запятую */
 #define U32(v) do { p = put_u32(p, (unsigned int)(v)); COMMA(); } while(0)
 
-/* Append signed 32-bit + comma */
+/* Добавить знаковое 32-бит + запятую */
 #define I32(v) do { p = put_i32(p, (int)(v)); COMMA(); } while(0)
 
-/* Append double (4 decimals) + comma */
+/* Добавить double (4 знака после точки) + запятую */
 #define F64(v) do { p = put_f64_4(p, (v)); COMMA(); } while(0)
 
-/* ── main formatting function ─────────────────────────────────────── */
+/* ── основная функция форматирования ─────────────────────────────── */
 
 int csv_format_row(char *buf, int buflen,
 		   const struct ef_record *rec,
 		   const struct csv_resolvers *resolvers)
 {
 	/*
-	 * Worst-case row size estimate:
-	 *   ~90 fields × average 20 chars = ~1800 bytes
-	 *   String fields with escaping could expand to 2×, but the largest
-	 *   (args, exec, tags, cgroup, pwd) are bounded by EV_ESC_SIZE.
-	 *   Total worst case: ~6000 bytes.  8192-byte buf is safe.
+	 * Оценка максимального размера строки:
+	 *   ~90 полей × в среднем 20 символов = ~1800 байт
+	 *   Строковые поля с эскейпингом могут вырасти в 2×, но самые большие
+	 *   (args, exec, tags, cgroup, pwd) ограничены EV_ESC_SIZE.
+	 *   Итого в худшем случае: ~6000 байт.  Буфер 8192 байт безопасен.
 	 */
 	if (buflen < 4096)
 		return -1;
@@ -267,11 +267,11 @@ int csv_format_row(char *buf, int buflen,
 	const struct metric_event *ev = &rec->event;
 	char *p = buf;
 
-	/* ── timestamp ──────────────────────────────────────────────── */
+	/* ── метка времени ────────────────────────────────────────── */
 	p = put_timestamp(p, ev->timestamp_ns);
 	COMMA();
 
-	/* ── identification ─────────────────────────────────────────── */
+	/* ── идентификация ─────────────────────────────────────────── */
 	STR(rec->hostname, EF_HOSTNAME_LEN);
 	STR(ev->event_type, EV_EVENT_TYPE_LEN);
 	STR(ev->rule, EV_RULE_LEN);
@@ -281,7 +281,7 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->pid);
 	U32(ev->ppid);
 	U32(ev->uid);
-	/* user_name (resolved from uid) */
+	/* user_name (разрешается из uid) */
 	if (resolvers && resolvers->resolve_uid) {
 		char uname[64];
 		resolvers->resolve_uid(ev->uid, uname, sizeof(uname));
@@ -290,7 +290,7 @@ int csv_format_row(char *buf, int buflen,
 		*p++ = '"'; *p++ = '"'; COMMA();
 	}
 	U32(ev->loginuid);
-	/* login_name (resolved from loginuid) */
+	/* login_name (разрешается из loginuid) */
 	if (ev->loginuid == 4294967295U) {
 		STR("AUDIT_UID_UNSET", 64);
 	} else if (resolvers && resolvers->resolve_uid) {
@@ -302,7 +302,7 @@ int csv_format_row(char *buf, int buflen,
 	}
 	U32(ev->sessionid);
 	U32(ev->euid);
-	/* euser_name (resolved from euid) */
+	/* euser_name (разрешается из euid) */
 	if (resolvers && resolvers->resolve_uid) {
 		char ename[64];
 		resolvers->resolve_uid(ev->euid, ename, sizeof(ename));
@@ -312,12 +312,12 @@ int csv_format_row(char *buf, int buflen,
 	}
 	U32(ev->tty_nr);
 
-	/* ── process metadata ───────────────────────────────────────── */
+	/* ── метаданные процесса ──────────────────────────────────── */
 	STR(ev->comm, COMM_LEN);
 	STR(ev->exec_path, CMDLINE_MAX);
 	STR(ev->args, CMDLINE_MAX);
 
-	/* cgroup: resolve docker names if callback provided */
+	/* cgroup: разрешаем имена docker-контейнеров если callback задан */
 	if (resolvers && resolvers->resolve_cgroup) {
 		char cg_resolved[EV_CGROUP_LEN];
 		resolvers->resolve_cgroup(ev->cgroup, cg_resolved,
@@ -330,7 +330,7 @@ int csv_format_row(char *buf, int buflen,
 	STR(ev->pwd, EV_PWD_LEN);
 	U32(ev->is_root);
 
-	/* state: single char field */
+	/* state: однобайтовое поле */
 	{
 		char state_raw[2] = { (char)(ev->state ? ev->state : '\0'), '\0' };
 		STR(state_raw, 2);
@@ -339,11 +339,11 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->exit_code);
 	U32(ev->sched_policy);
 
-	/* ── CPU ─────────────────────────────────────────────────────── */
+	/* ── ЦПУ ─────────────────────────────────────────────────────── */
 	U64(ev->cpu_ns);
 	F64(ev->cpu_usage_ratio);
 
-	/* ── memory ──────────────────────────────────────────────────── */
+	/* ── память ──────────────────────────────────────────────────── */
 	U64(ev->rss_bytes);
 	U64(ev->rss_min_bytes);
 	U64(ev->rss_max_bytes);
@@ -361,28 +361,28 @@ int csv_format_row(char *buf, int buflen,
 	U64(ev->maj_flt);
 	U64(ev->min_flt);
 
-	/* ── scheduler / threads / OOM ───────────────────────────────── */
+	/* ── планировщик / потоки / OOM ──────────────────────────────── */
 	U64(ev->nvcsw);
 	U64(ev->nivcsw);
 	U32(ev->threads);
 	I32(ev->oom_score_adj);
 	U32(ev->oom_killed);
 
-	/* ── process network ─────────────────────────────────────────── */
+	/* ── сеть процесса ──────────────────────────────────────────── */
 	U64(ev->net_tx_bytes);
 	U64(ev->net_rx_bytes);
 
-	/* ── time ────────────────────────────────────────────────────── */
+	/* ── время ───────────────────────────────────────────────────── */
 	U64(ev->start_time_ns);
 	U64(ev->uptime_seconds);
 
-	/* ── namespaces ──────────────────────────────────────────────── */
+	/* ── пространства имён ──────────────────────────────────────── */
 	U32(ev->mnt_ns_inum);
 	U32(ev->pid_ns_inum);
 	U32(ev->net_ns_inum);
 	U32(ev->cgroup_ns_inum);
 
-	/* ── preemption ──────────────────────────────────────────────── */
+	/* ── вытеснение ─────────────────────────────────────────────── */
 	U32(ev->preempted_by_pid);
 	STR(ev->preempted_by_comm, COMM_LEN);
 
@@ -398,14 +398,14 @@ int csv_format_row(char *buf, int buflen,
 	I64(ev->cgroup_cpu_throttled_usec);
 	I64(ev->cgroup_pids_current);
 
-	/* ── file tracking ───────────────────────────────────────────── */
+	/* ── отслеживание файлов ────────────────────────────────────── */
 	STR(ev->file_path, FILE_PATH_MAX);
 	U32(ev->file_flags);
 	U64(ev->file_read_bytes);
 	U64(ev->file_write_bytes);
 	U32(ev->file_open_count);
 
-	/* ── network tracking ────────────────────────────────────────── */
+	/* ── отслеживание сетевых соединений ─────────────────────────── */
 	STR(ev->net_local_addr, EV_ADDR_LEN);
 	STR(ev->net_remote_addr, EV_ADDR_LEN);
 	U32(ev->net_local_port);
@@ -414,14 +414,14 @@ int csv_format_row(char *buf, int buflen,
 	U64(ev->net_conn_rx_bytes);
 	U64(ev->net_duration_ms);
 
-	/* ── signals ─────────────────────────────────────────────────── */
+	/* ── сигналы ────────────────────────────────────────────────── */
 	U32(ev->sig_num);
 	U32(ev->sig_target_pid);
 	STR(ev->sig_target_comm, COMM_LEN);
 	I32(ev->sig_code);
 	I32(ev->sig_result);
 
-	/* ── security tracking ───────────────────────────────────────── */
+	/* ── отслеживание безопасности ───────────────────────────────── */
 	STR(ev->sec_local_addr, EV_ADDR_LEN);
 	STR(ev->sec_remote_addr, EV_ADDR_LEN);
 	U32(ev->sec_local_port);
@@ -431,14 +431,14 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->sec_direction);
 	U64(ev->open_tcp_conns);
 
-	/* ── disk usage (last 3 fields — no trailing comma on last) ── */
+	/* ── использование диска (последние 3 поля — без запятой в конце) */
 	U64(ev->disk_total_bytes);
 	U64(ev->disk_used_bytes);
-	/* last field: no trailing comma, newline instead */
+	/* последнее поле: вместо запятой — перенос строки */
 	p = put_u64(p, (unsigned long long)ev->disk_avail_bytes);
 	*p++ = '\n';
 
-	/* Check we didn't overflow */
+	/* Проверяем, что не вышли за пределы буфера */
 	int written = (int)(p - buf);
 	if (written >= buflen)
 		return -1;

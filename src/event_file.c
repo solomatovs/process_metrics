@@ -1,12 +1,13 @@
 /*
- * event_file.c — in-memory ring buffer for metric events
+ * event_file.c — кольцевой буфер в памяти для событий метрик
  *
- * Fixed-size ring buffer of ef_record structs. No disk I/O on the hot path:
- *   ef_append()     → memcpy into ring slot (mutex-protected)
- *   ef_read_begin() → snapshot head/tail for iteration
- *   ef_read_end()   → optionally advance tail (clear consumed records)
+ * Кольцевой буфер фиксированного размера из структур ef_record.
+ * На горячем пути нет дисковых операций:
+ *   ef_append()     → memcpy в слот кольца (защищено мьютексом)
+ *   ef_read_begin() → снимок head/tail для итерации
+ *   ef_read_end()   → опционально сдвигает tail (очистка прочитанных записей)
  *
- * When the ring is full, the oldest record is silently overwritten.
+ * При заполнении кольца самая старая запись молча перезаписывается.
  */
 
 #define _GNU_SOURCE
@@ -17,19 +18,19 @@
 
 #include "event_file.h"
 
-/* ── state ───────────────────────────────────────────────────────── */
+/* ── состояние ───────────────────────────────────────────────────── */
 
-static struct ef_record *g_ring;        /* ring buffer array */
-static __u32             g_capacity;    /* number of slots */
-static __u32             g_head;        /* next write position */
-static __u32             g_tail;        /* oldest unread position */
-static int               g_full;        /* head caught up with tail */
+static struct ef_record *g_ring;        /* массив кольцевого буфера */
+static __u32             g_capacity;    /* количество слотов */
+static __u32             g_head;        /* следующая позиция записи */
+static __u32             g_tail;        /* позиция самой старой непрочитанной записи */
+static int               g_full;        /* head догнал tail */
 static int               g_initialized;
 
 static pthread_mutex_t   g_mutex       = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t   g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ── helpers ─────────────────────────────────────────────────────── */
+/* ── вспомогательные функции ──────────────────────────────────────── */
 
 static __u32 ring_count(void)
 {
@@ -40,18 +41,18 @@ static __u32 ring_count(void)
 		: g_capacity - g_tail + g_head;
 }
 
-/* ── public API ──────────────────────────────────────────────────── */
+/* ── публичный API ───────────────────────────────────────────────── */
 
 int ef_init(__u64 max_size_bytes)
 {
 	if (max_size_bytes == 0)
-		max_size_bytes = 256ULL * 1024 * 1024; /* 256 MB default */
+		max_size_bytes = 256ULL * 1024 * 1024; /* 256 МБ по умолчанию */
 
 	__u64 cap = max_size_bytes / sizeof(struct ef_record);
 	if (cap < 64)
 		cap = 64;
 	if (cap > 1000000)
-		cap = 1000000; /* sanity cap: ~2.7 GB */
+		cap = 1000000; /* предельное ограничение: ~2.7 ГБ */
 
 	g_ring = calloc((size_t)cap, sizeof(struct ef_record));
 	if (!g_ring) {
@@ -81,7 +82,7 @@ void ef_append(const struct metric_event *ev, const char *hostname)
 
 	g_head = (g_head + 1) % g_capacity;
 	if (g_full) {
-		/* Overwrite oldest — advance tail */
+		/* Перезапись самой старой записи — сдвигаем tail */
 		g_tail = g_head;
 	}
 	if (g_head == g_tail)
@@ -103,7 +104,7 @@ int ef_read_begin(struct ef_iter *it)
 	it->read     = 0;
 
 	pthread_mutex_unlock(&g_mutex);
-	/* g_batch_mutex stays held — prevents new batches during iteration */
+	/* g_batch_mutex остаётся захваченным — не допускает новые пакеты во время итерации */
 	return (int)n;
 }
 
@@ -122,8 +123,8 @@ void ef_read_end(struct ef_iter *it, int clear)
 {
 	if (clear && it->count > 0) {
 		pthread_mutex_lock(&g_mutex);
-		/* Advance tail past everything we read.
-		 * New records appended during iteration are preserved. */
+		/* Сдвигаем tail за все прочитанные записи.
+		 * Новые записи, добавленные во время итерации, сохраняются. */
 		g_tail = it->end;
 		g_full = 0;
 		pthread_mutex_unlock(&g_mutex);
