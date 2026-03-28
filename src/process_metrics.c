@@ -1,14 +1,14 @@
 /*
- * process_metrics — event-driven process metrics collector
+ * process_metrics — событийный сборщик метрик процессов
  *
- * Loads BPF programs, listens to ring buffer events, matches exec'd
- * processes against config rules, and periodically writes metrics.
- * Serves metrics via built-in HTTP server (CSV format for ClickHouse).
+ * Загружает BPF-программы, слушает события кольцевого буфера, сопоставляет
+ * exec-процессы с правилами конфигурации и периодически записывает метрики.
+ * Отдаёт метрики через встроенный HTTP-сервер (формат CSV для ClickHouse).
  *
- * Usage:
+ * Использование:
  *   ./process_metrics -c config.conf
  *
- * Requires: root (CAP_BPF + CAP_PERFMON)
+ * Требования: root (CAP_BPF + CAP_PERFMON)
  */
 
 #define _GNU_SOURCE
@@ -40,12 +40,12 @@
 #include "http_server.h"
 
 /*
- * bpf_program__set_autoload  — libbpf >= 0.6 (skips load + attach)
- * bpf_program__set_autoattach — libbpf >= 0.8 (loads but skips attach)
+ * bpf_program__set_autoload  — libbpf >= 0.6 (пропускает загрузку + подключение)
+ * bpf_program__set_autoattach — libbpf >= 0.8 (загружает, но пропускает подключение)
  *
- * For disabling optional programs we need set_autoload (don't even
- * send to verifier).  Astra Linux ships libbpf 0.7 which has
- * set_autoload but not set_autoattach.
+ * Для отключения опциональных программ нужен set_autoload (не отправлять
+ * даже на верификатор). Astra Linux поставляет libbpf 0.7, в котором есть
+ * set_autoload, но нет set_autoattach.
  */
 #if LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 8
 #define BPF_PROG_DISABLE(prog) bpf_program__set_autoattach((prog), false)
@@ -53,7 +53,7 @@
 #define BPF_PROG_DISABLE(prog) bpf_program__set_autoload((prog), false)
 #endif
 
-/* ── configuration ────────────────────────────────────────────────── */
+/* ── конфигурация ─────────────────────────────────────────────────── */
 
 #define MAX_RULES       64
 #define RULE_NOT_MATCH  "NOT_MATCH"
@@ -69,35 +69,35 @@ struct rule {
 static struct rule rules[MAX_RULES];
 static int         num_rules;
 
-/* Configuration values (loaded from libconfig) */
+/* Значения конфигурации (загружаются из libconfig) */
 static const char *cfg_config_file     = NULL;
 static char        cfg_hostname[EF_HOSTNAME_LEN]    = "";
 static int         cfg_snapshot_interval           = 30;
 static int         cfg_cmdline_max_len             = 500;
-static int         cfg_exec_rate_limit             = 0;  /* 0 = unlimited */
-static int         cfg_cgroup_metrics              = 1;  /* 1 = read cgroup files */
-static int         cfg_refresh_proc                = 1;  /* 1 = refresh cmdline/comm from /proc */
+static int         cfg_exec_rate_limit             = 0;  /* 0 = без ограничений */
+static int         cfg_cgroup_metrics              = 1;  /* 1 = читать файлы cgroup */
+static int         cfg_refresh_proc                = 1;  /* 1 = обновлять cmdline/comm из /proc */
 static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=debug */
 
-/* HTTP server config */
+/* Конфигурация HTTP-сервера */
 static struct http_config g_http_cfg;
 static long long cfg_max_data_size          = 256LL * 1024 * 1024; /* 256 MB ring buffer */
 
-/* Network tracking config */
+/* Конфигурация отслеживания сети */
 static int cfg_net_tracking_enabled         = 0;
 static int cfg_net_track_bytes              = 0;
 
-/* File tracking config */
+/* Конфигурация отслеживания файлов */
 static int cfg_file_tracking_enabled        = 0;
 static int cfg_file_track_bytes             = 0;
 
-/* Docker resolve config */
-static int cfg_docker_resolve_names         = 0;  /* resolve docker-<hash>.scope → container name */
+/* Конфигурация резолвинга Docker */
+static int cfg_docker_resolve_names         = 0;  /* резолвить docker-<hash>.scope → имя контейнера */
 static char cfg_docker_data_root[PATH_MAX_LEN] = "";
 static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
 
-/* Disk tracking config */
-static int cfg_disk_tracking_enabled       = 1;  /* enabled by default */
+/* Конфигурация отслеживания дисков */
+static int cfg_disk_tracking_enabled       = 1;  /* включено по умолчанию */
 #define DISK_MAX_PREFIXES 32
 #define DISK_PREFIX_MAX   256
 static char cfg_disk_include[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
@@ -107,7 +107,7 @@ static int  cfg_disk_exclude_count         = 0;
 static char cfg_disk_fs_types[DISK_MAX_PREFIXES][32];
 static int  cfg_disk_fs_types_count        = 0;
 
-/* Security tracking config */
+/* Конфигурация отслеживания безопасности */
 static int cfg_sec_tcp_retransmit  = 0;
 static int cfg_sec_syn_tracking    = 0;
 static int cfg_sec_rst_tracking    = 0;
@@ -119,7 +119,7 @@ static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
 static int cfg_file_exclude_count           = 0;
 
-/* ── globals ──────────────────────────────────────────────────────── */
+/* ── глобальные переменные ─────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_running   = 1;
 static volatile sig_atomic_t g_reload    = 0;
@@ -148,13 +148,13 @@ struct poll_thread_arg {
 	const char *name;
 };
 
-/* Forward declarations */
+/* Предварительные объявления */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
 static void log_ts(const char *level, const char *fmt, ...);
 
-/* Boot-time to wall-clock offset (computed once at startup,
- * refreshed each snapshot). BPF sends bpf_ktime_get_boot_ns(),
+/* Смещение от boot-time к wall-clock (вычисляется однократно при старте,
+ * обновляется каждый snapshot). BPF отправляет bpf_ktime_get_boot_ns(),
  * wall_ns = boot_ns + g_boot_to_wall_ns. */
 static __s64 g_boot_to_wall_ns;
 
@@ -221,7 +221,7 @@ static void refresh_boot_to_wall(void)
  */
 
 #define TAGS_MAX_LEN EV_TAGS_LEN
-#define TAGS_HT_SIZE 16384  /* must be power of 2 */
+#define TAGS_HT_SIZE 16384  /* должно быть степенью 2 */
 
 #ifdef NO_TAGS
 /*
@@ -239,8 +239,8 @@ static void tags_clear_ts(void) { }
 
 #else /* !NO_TAGS */
 
-static __u32 tags_tgid[TAGS_HT_SIZE];              /*  64 KB — compact index */
-static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — payload      */
+static __u32 tags_tgid[TAGS_HT_SIZE];              /*  64 KB — компактный индекс */
+static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
 
 /*
  * Murmurhash3 finalizer (32-bit).
@@ -266,7 +266,7 @@ static inline __u32 tags_hash(__u32 h)
 	return h & (TAGS_HT_SIZE - 1);
 }
 
-/* Forward declaration — used by tags_inherit() */
+/* Предварительное объявление — используется в tags_inherit() */
 static int try_track_pid(__u32 pid);
 
 static void tags_store(__u32 tgid, const char *tags)
@@ -414,8 +414,9 @@ static void tags_clear_ts(void)
 #endif /* NO_TAGS */
 
 /*
- * Match cmdline against ALL rules, build pipe-separated tags string.
- * Returns the index of the first matching rule, or -1 if no match.
+ * Сопоставляет cmdline со ВСЕМИ правилами, формирует строку тегов
+ * через разделитель '|'. Возвращает индекс первого совпавшего правила
+ * или -1, если совпадений нет.
  */
 static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 {
@@ -438,7 +439,7 @@ static int match_rules_all(const char *cmdline, char *tags, int tags_size)
 	return first;
 }
 
-/* Forward declarations for try_track_pid */
+/* Предварительные объявления для try_track_pid */
 static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
 static int read_proc_cmdline(__u32 pid, char *dst, int dstlen);
 static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
@@ -446,11 +447,11 @@ static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
 static void log_debug(const char *fmt, ...);
 
 /*
- * Try to track an unknown PID by reading /proc/<pid>/cmdline.
- * Called when file_close/net_close/oom_kill/exit arrives for a PID
- * not in tracked_map. Reads cmdline, matches against all rules,
- * and adds to tracked_map + tags hash if matched.
- * Returns the first matched rule index, or -1 if no match / process gone.
+ * Попытка начать отслеживание неизвестного PID через чтение /proc/<pid>/cmdline.
+ * Вызывается, когда file_close/net_close/oom_kill/exit приходит для PID,
+ * которого нет в tracked_map. Читает cmdline, сопоставляет со всеми правилами
+ * и добавляет в tracked_map + хеш-таблицу тегов при совпадении.
+ * Возвращает индекс первого совпавшего правила или -1, если нет совпадения / процесс завершён.
  */
 static int try_track_pid(__u32 pid)
 {
@@ -477,7 +478,7 @@ static int try_track_pid(__u32 pid)
 	return first;
 }
 
-/* ── CPU usage cache (for computing per-interval ratio) ───────────── */
+/* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
 
 #define MAX_CPU_PREV 8192
 
@@ -523,12 +524,12 @@ static void cpu_prev_remove(__u32 tgid)
 	}
 }
 
-/* ── cgroup cache ─────────────────────────────────────────────────── */
+/* ── кэш cgroup ──────────────────────────────────────────────────── */
 
 struct cgroup_entry {
 	__u64 id;
-	char  path[EV_CGROUP_LEN];    /* display name (docker/xxx or original) */
-	char  fs_path[EV_CGROUP_LEN]; /* real filesystem path under /sys/fs/cgroup */
+	char  path[EV_CGROUP_LEN];    /* отображаемое имя (docker/xxx или оригинал) */
+	char  fs_path[EV_CGROUP_LEN]; /* реальный путь в файловой системе под /sys/fs/cgroup */
 };
 
 static struct cgroup_entry cgroup_cache[MAX_CGROUPS];
@@ -536,24 +537,24 @@ static int cgroup_cache_count;
 static char docker_data_root[PATH_MAX_LEN] = "";
 
 /*
- * Detect Docker data-root. Priority:
- *   1. cfg_docker_data_root (from config file)
- *   2. Parsed from cfg_docker_daemon_json ("data-root" key)
- *   3. Fallback: /var/lib/docker
+ * Определение data-root Docker. Приоритет:
+ *   1. cfg_docker_data_root (из файла конфигурации)
+ *   2. Распарсенный из cfg_docker_daemon_json (ключ "data-root")
+ *   3. Запасной вариант: /var/lib/docker
  */
 static void detect_docker_data_root(void)
 {
 	if (docker_data_root[0])
 		return;
 
-	/* Use explicit config value if set */
+	/* Используем явное значение из конфигурации, если задано */
 	if (cfg_docker_data_root[0]) {
 		snprintf(docker_data_root, sizeof(docker_data_root),
 			 "%s", cfg_docker_data_root);
 		return;
 	}
 
-	/* Try to parse from daemon.json */
+	/* Пробуем распарсить из daemon.json */
 	FILE *f = fopen(cfg_docker_daemon_json, "r");
 	if (f) {
 		char buf[4096];
@@ -583,13 +584,13 @@ static void detect_docker_data_root(void)
 }
 
 /*
- * Try to resolve a Docker container name from cgroup path.
- * Looks for pattern "docker-<64hex>.scope" and reads the container name
- * from config.v2.json. Returns 1 on success (dst filled), 0 otherwise.
+ * Попытка резолвить имя Docker-контейнера из пути cgroup.
+ * Ищет паттерн "docker-<64hex>.scope" и читает имя контейнера
+ * из config.v2.json. Возвращает 1 при успехе (dst заполнен), 0 — иначе.
  */
 static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 {
-	/* Find "docker-" prefix in the last path component */
+	/* Ищем префикс "docker-" в последнем компоненте пути */
 	const char *last = strrchr(rel, '/');
 	const char *base = last ? last + 1 : rel;
 
@@ -615,11 +616,11 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 	if (!f)
 		return 0;
 
-	/* config.v2.json can be large (>40KB if State section is big),
-	 * so read in chunks searching for "Name":" pattern */
+	/* config.v2.json может быть большим (>40KB если секция State велика),
+	 * поэтому читаем частями, ища паттерн "Name":" */
 	char *q1 = NULL, *q2 = NULL;
 	char buf[4096];
-	char overlap[256] = "";  /* overlap from previous chunk */
+	char overlap[256] = "";  /* перекрытие с предыдущим чанком */
 	int found = 0;
 
 	while (!found) {
@@ -628,7 +629,7 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 			break;
 		buf[n] = '\0';
 
-		/* Search in overlap+buf to handle boundary splits */
+		/* Ищем в overlap+buf для обработки разрывов на границе */
 		char combined[sizeof(overlap) + sizeof(buf)];
 		size_t olen = strlen(overlap);
 		memcpy(combined, overlap, olen);
@@ -651,7 +652,7 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 		}
 
 		if (!found) {
-			/* Keep last 255 bytes as overlap for boundary */
+			/* Сохраняем последние 255 байт как перекрытие для границы */
 			size_t total = olen + n;
 			size_t keep = total < sizeof(overlap) - 1 ?
 				      total : sizeof(overlap) - 1;
@@ -664,7 +665,7 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 	if (!found)
 		return 0;
 
-	/* Build path: "docker/<container_name>" */
+	/* Формируем путь: "docker/<имя_контейнера>" */
 	size_t name_len = q2 - q1;
 	if (name_len + 8 > dstlen)  /* "docker/" + name + NUL */
 		return 0;
@@ -673,21 +674,21 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 }
 
 /*
- * In-memory cache for docker name resolution.
- * Maps container ID (64 hex chars) → "docker/<name>".
- * Avoids repeated fopen/fread of config.v2.json per event.
+ * Кэш в памяти для резолвинга имён Docker-контейнеров.
+ * Отображает ID контейнера (64 hex символа) → "docker/<имя>".
+ * Избавляет от повторного fopen/fread файла config.v2.json на каждое событие.
  */
 #define DOCKER_NAME_CACHE_SIZE 256
 
 static struct {
 	char container_id[65];       /* 64 hex + NUL */
 	char resolved[EV_CGROUP_LEN];
-	int  negative;               /* 1 = tried and failed, don't retry */
+	int  negative;               /* 1 = попытка была неудачной, не повторять */
 } docker_name_cache[DOCKER_NAME_CACHE_SIZE];
 static int docker_name_cache_count;
 static pthread_rwlock_t g_docker_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 
-/* Extract container ID from cgroup path, returns pointer to 64-char hex or NULL */
+/* Извлекает ID контейнера из пути cgroup, возвращает указатель на 64-символьный hex или NULL */
 static const char *extract_docker_id(const char *path)
 {
 	const char *last = strrchr(path, '/');
@@ -702,10 +703,10 @@ static const char *extract_docker_id(const char *path)
 }
 
 /*
- * Resolve cgroup for HTTP output: if docker resolve is enabled and
- * path contains docker-<hash>.scope, resolve to docker/<name>.
- * Uses in-memory cache to avoid repeated filesystem reads.
- * Otherwise, copy raw path as-is.
+ * Резолвит cgroup для HTTP-вывода: если включён резолв Docker и путь
+ * содержит docker-<hash>.scope, преобразует в docker/<имя>.
+ * Использует кэш в памяти, чтобы избежать повторных чтений файловой системы.
+ * Иначе копирует исходный путь как есть.
  */
 void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 {
@@ -720,12 +721,12 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 		return;
 	}
 
-	/* Lookup in cache (rdlock) */
+	/* Поиск в кэше (rdlock) */
 	pthread_rwlock_rdlock(&g_docker_cache_lock);
 	for (int i = 0; i < docker_name_cache_count; i++) {
 		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
 			if (docker_name_cache[i].negative) {
-				/* Previously failed — pass raw path */
+				/* Предыдущая попытка неудачна — передаём исходный путь */
 				snprintf(buf, buflen, "%s", raw);
 			} else {
 				snprintf(buf, buflen, "%s",
@@ -737,13 +738,13 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 	}
 	pthread_rwlock_unlock(&g_docker_cache_lock);
 
-	/* Cache miss — resolve from filesystem */
+	/* Промах кэша — резолвим из файловой системы */
 	char resolved[EV_CGROUP_LEN];
 	int ok = resolve_docker_name(raw, resolved, sizeof(resolved));
 
-	/* Store in cache (wrlock) */
+	/* Сохраняем в кэш (wrlock) */
 	pthread_rwlock_wrlock(&g_docker_cache_lock);
-	/* Double-check: another thread may have added it */
+	/* Двойная проверка: другой поток мог уже добавить */
 	for (int i = 0; i < docker_name_cache_count; i++) {
 		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
 			pthread_rwlock_unlock(&g_docker_cache_lock);
@@ -771,8 +772,8 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 }
 
 /*
- * In-memory cache for UID → username resolution.
- * Uses getpwuid_r() on cache miss, caches result.
+ * Кэш в памяти для резолвинга UID → имя пользователя.
+ * При промахе кэша использует getpwuid_r(), результат кэшируется.
  */
 #define UID_NAME_CACHE_SIZE 512
 #define UID_NAME_MAX 64
@@ -780,17 +781,17 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 static struct {
 	__u32 uid;
 	char  name[UID_NAME_MAX];
-	int   valid;   /* 1 = entry used */
+	int   valid;   /* 1 = запись используется */
 } uid_name_cache[UID_NAME_CACHE_SIZE];
 static int uid_name_cache_count;
 static pthread_rwlock_t g_uid_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /*
- * UID → username resolution via getpwuid_r (NSS).
+ * Резолвинг UID → имя пользователя через getpwuid_r (NSS).
  *
- * Binary is linked with glibc dynamically (-Wl,-Bdynamic -lc),
- * so the full NSS stack (files, sss, ldap, nis) works natively.
- * Results are cached in uid_name_cache so each UID is resolved at most once.
+ * Бинарник слинкован с glibc динамически (-Wl,-Bdynamic -lc),
+ * поэтому полный стек NSS (files, sss, ldap, nis) работает нативно.
+ * Результаты кэшируются в uid_name_cache, каждый UID резолвится не более одного раза.
  */
 static int resolve_uid_to_name(__u32 uid, char *name, int namelen)
 {
@@ -810,7 +811,7 @@ void http_resolve_uid(__u32 uid, char *buf, int buflen)
 	if (buflen <= 0) return;
 	buf[0] = '\0';
 
-	/* Lookup in cache (rdlock) */
+	/* Поиск в кэше (rdlock) */
 	pthread_rwlock_rdlock(&g_uid_cache_lock);
 	for (int i = 0; i < uid_name_cache_count; i++) {
 		if (uid_name_cache[i].uid == uid) {
@@ -821,13 +822,13 @@ void http_resolve_uid(__u32 uid, char *buf, int buflen)
 	}
 	pthread_rwlock_unlock(&g_uid_cache_lock);
 
-	/* Cache miss — resolve via NSS or /etc/passwd */
+	/* Промах кэша — резолвим через NSS или /etc/passwd */
 	char name[UID_NAME_MAX] = "";
 	resolve_uid_to_name(uid, name, sizeof(name));
 
-	/* Store in cache (wrlock) */
+	/* Сохраняем в кэш (wrlock) */
 	pthread_rwlock_wrlock(&g_uid_cache_lock);
-	/* Double-check */
+	/* Двойная проверка */
 	for (int i = 0; i < uid_name_cache_count; i++) {
 		if (uid_name_cache[i].uid == uid) {
 			pthread_rwlock_unlock(&g_uid_cache_lock);
@@ -857,7 +858,7 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 	if (stat(full, &st) == 0 && cgroup_cache_count < MAX_CGROUPS) {
 		cgroup_cache[cgroup_cache_count].id = (__u64)st.st_ino;
 
-		/* Store raw filesystem path (docker names resolved lazily on output) */
+		/* Сохраняем реальный путь файловой системы (имена Docker резолвятся лениво при выводе) */
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
 			 sizeof(cgroup_cache[0].fs_path), "%s", rel);
 		snprintf(cgroup_cache[cgroup_cache_count].path,
@@ -893,8 +894,8 @@ static void build_cgroup_cache(void)
 }
 
 
-/* Fast cgroup resolve for hot path — no cache rebuild on miss.
- * Cache is rebuilt every snapshot_interval anyway. */
+/* Быстрый резолв cgroup на горячем пути — без пересборки кэша при промахе.
+ * Кэш всё равно пересобирается каждый snapshot_interval. */
 static const char *resolve_cgroup_fast(__u64 cgroup_id)
 {
 	if (cgroup_id == 0)
@@ -905,7 +906,7 @@ static const char *resolve_cgroup_fast(__u64 cgroup_id)
 	return "";
 }
 
-/* Thread-safe обёртка для resolve_cgroup_fast */
+/* Потокобезопасная обёртка для resolve_cgroup_fast */
 static void resolve_cgroup_fast_ts(__u64 cgroup_id, char *buf, int buflen)
 {
 	pthread_rwlock_rdlock(&g_cgroup_lock);
@@ -914,7 +915,7 @@ static void resolve_cgroup_fast_ts(__u64 cgroup_id, char *buf, int buflen)
 	pthread_rwlock_unlock(&g_cgroup_lock);
 }
 
-/* Thread-safe обёртка для resolve_cgroup (без rebuild на промах —
+/* Потокобезопасная обёртка для resolve_cgroup (без rebuild на промах —
  * кэш обновляется event-driven через BPF cgroup tracepoints). */
 static void resolve_cgroup_ts(__u64 cgroup_id, char *buf, int buflen)
 {
@@ -924,7 +925,7 @@ static void resolve_cgroup_ts(__u64 cgroup_id, char *buf, int buflen)
 	pthread_rwlock_unlock(&g_cgroup_lock);
 }
 
-/* Thread-safe обёртка для resolve_cgroup_fs */
+/* Потокобезопасная обёртка для resolve_cgroup_fs */
 static void resolve_cgroup_fs_ts(__u64 cgroup_id, char *buf, int buflen)
 {
 	if (cgroup_id == 0) { buf[0] = '\0'; return; }
@@ -947,22 +948,22 @@ static void build_cgroup_cache_ts(void)
 	pthread_rwlock_unlock(&g_cgroup_lock);
 }
 
-/* ── cgroup event handling (BPF → userspace) ─────────────────────── */
+/* ── обработка cgroup-событий (BPF → userspace) ──────────────────── */
 
 /*
- * Add cgroup entry to cache under wrlock.
- * If the cgroup id already exists, update its path.
+ * Добавляет запись cgroup в кэш под wrlock.
+ * Если cgroup id уже существует, обновляет путь.
  */
 static void cgroup_cache_add(__u64 id, const char *path)
 {
-	/* BPF tracepoint paths have leading '/' (e.g. "/test_cg"),
-	 * but scan_cgroup_dir stores relative paths ("test_cg").
-	 * Normalize by stripping leading '/'. */
+	/* Пути из BPF tracepoint начинаются с '/' (напр. "/test_cg"),
+	 * а scan_cgroup_dir хранит относительные пути ("test_cg").
+	 * Нормализуем, убирая ведущий '/'. */
 	if (path[0] == '/')
 		path++;
 
 	pthread_rwlock_wrlock(&g_cgroup_lock);
-	/* Check if already present — update path */
+	/* Проверяем, есть ли уже — обновляем путь */
 	for (int i = 0; i < cgroup_cache_count; i++) {
 		if (cgroup_cache[i].id == id) {
 			snprintf(cgroup_cache[i].fs_path,
@@ -973,7 +974,7 @@ static void cgroup_cache_add(__u64 id, const char *path)
 			return;
 		}
 	}
-	/* Add new entry */
+	/* Добавление новой записи */
 	if (cgroup_cache_count < MAX_CGROUPS) {
 		cgroup_cache[cgroup_cache_count].id = id;
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
@@ -986,8 +987,8 @@ static void cgroup_cache_add(__u64 id, const char *path)
 }
 
 /*
- * Remove cgroup entry from cache by id under wrlock.
- * Swaps with last entry for O(1) removal.
+ * Удаление записи cgroup из кэша по id под wrlock.
+ * Меняет местами с последней записью для удаления за O(1).
  */
 static void cgroup_cache_remove(__u64 id)
 {
@@ -1003,8 +1004,8 @@ static void cgroup_cache_remove(__u64 id)
 }
 
 /*
- * Ring buffer callback for events_cgroup.
- * Updates cgroup cache on mkdir/rmdir/rename, logs other events.
+ * Callback кольцевого буфера для events_cgroup.
+ * Обновляет кэш cgroup при mkdir/rmdir/rename, логирует остальные события.
  */
 static int handle_cgroup_event(void *ctx, void *data, size_t size)
 {
@@ -1031,7 +1032,7 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 		break;
 
 	case EVENT_CGROUP_RENAME:
-		/* Update path for existing entry */
+		/* Обновляем путь для существующей записи */
 		cgroup_cache_add(ce->id, ce->path);
 		if (cfg_log_level >= 2)
 			log_ts("DEBUG", "cgroup rename: id=%llu path=%s",
@@ -1089,7 +1090,7 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 	return 0;
 }
 
-/* ── rules parser (from libconfig) ────────────────────────────────── */
+/* ── парсер правил (из libconfig) ─────────────────────────────────── */
 
 static void free_rules(void)
 {
@@ -1153,7 +1154,7 @@ static int parse_rules_from_config(const char *path)
 	return num_rules;
 }
 
-/* ── libconfig configuration loader ───────────────────────────────── */
+/* ── загрузчик конфигурации libconfig ─────────────────────────────── */
 
 static int load_config(const char *path)
 {
@@ -1172,7 +1173,7 @@ static int load_config(const char *path)
 	const char *str_val;
 	int int_val;
 
-	/* General settings */
+	/* Общие настройки */
 	if (config_lookup_string(&cfg, "hostname", &str_val))
 		snprintf(cfg_hostname, sizeof(cfg_hostname), "%s", str_val);
 	if (!cfg_hostname[0])
@@ -1192,7 +1193,7 @@ static int load_config(const char *path)
 	if (config_lookup_int(&cfg, "log_level", &int_val))
 		cfg_log_level = int_val;
 
-	/* HTTP server settings (enabled if section with port exists) */
+	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
 	g_http_cfg.port = 9091;
 	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "0.0.0.0");
@@ -1211,7 +1212,7 @@ static int load_config(const char *path)
 			cfg_max_data_size = ll_val;
 	}
 
-	/* net_tracking settings */
+	/* Настройки отслеживания сети */
 	config_setting_t *nt = config_lookup(&cfg, "net_tracking");
 	if (nt) {
 		if (config_setting_lookup_bool(nt, "enabled", &bool_val))
@@ -1220,7 +1221,7 @@ static int load_config(const char *path)
 			cfg_net_track_bytes = bool_val;
 	}
 
-	/* File tracking settings */
+	/* Настройки отслеживания файлов */
 	config_setting_t *ft = config_lookup(&cfg, "file_tracking");
 	if (ft) {
 		if (config_setting_lookup_bool(ft, "enabled", &bool_val))
@@ -1228,7 +1229,7 @@ static int load_config(const char *path)
 		if (config_setting_lookup_bool(ft, "track_bytes", &bool_val))
 			cfg_file_track_bytes = bool_val;
 
-		/* Include prefixes */
+		/* Включающие префиксы */
 		config_setting_t *inc = config_setting_lookup(ft, "include");
 		if (inc && config_setting_is_list(inc)) {
 			int n = config_setting_length(inc);
@@ -1247,7 +1248,7 @@ static int load_config(const char *path)
 			}
 		}
 
-		/* Exclude prefixes */
+		/* Исключающие префиксы */
 		config_setting_t *exc = config_setting_lookup(ft, "exclude");
 		if (exc && config_setting_is_list(exc)) {
 			int n = config_setting_length(exc);
@@ -1267,7 +1268,7 @@ static int load_config(const char *path)
 		}
 	}
 
-	/* Docker resolve settings */
+	/* Настройки определения имён Docker */
 	config_setting_t *dk = config_lookup(&cfg, "docker");
 	if (dk) {
 		if (config_setting_lookup_bool(dk, "resolve_names", &bool_val))
@@ -1280,7 +1281,7 @@ static int load_config(const char *path)
 				 "%s", str_val);
 	}
 
-	/* Security tracking settings */
+	/* Настройки отслеживания безопасности */
 	config_setting_t *st = config_lookup(&cfg, "security_tracking");
 	if (st) {
 		if (config_setting_lookup_bool(st, "tcp_retransmit", &bool_val))
@@ -1297,13 +1298,13 @@ static int load_config(const char *path)
 			cfg_sec_open_conn_count = bool_val;
 	}
 
-	/* Disk tracking settings */
+	/* Настройки отслеживания дисков */
 	config_setting_t *dt = config_lookup(&cfg, "disk_tracking");
 	if (dt) {
 		if (config_setting_lookup_bool(dt, "enabled", &bool_val))
 			cfg_disk_tracking_enabled = bool_val;
 
-		/* Filesystem types to include (overrides built-in list) */
+		/* Типы файловых систем для включения (переопределяют встроенный список) */
 		config_setting_t *fst = config_setting_lookup(dt, "fs_types");
 		if (fst && config_setting_is_list(fst)) {
 			int n = config_setting_length(fst);
@@ -1318,7 +1319,7 @@ static int load_config(const char *path)
 			}
 		}
 
-		/* Mount point include prefixes */
+		/* Включающие префиксы точек монтирования */
 		config_setting_t *inc = config_setting_lookup(dt, "include");
 		if (inc && config_setting_is_list(inc)) {
 			int n = config_setting_length(inc);
@@ -1333,7 +1334,7 @@ static int load_config(const char *path)
 			}
 		}
 
-		/* Mount point exclude prefixes */
+		/* Исключающие префиксы точек монтирования */
 		config_setting_t *exc = config_setting_lookup(dt, "exclude");
 		if (exc && config_setting_is_list(exc)) {
 			int n = config_setting_length(exc);
@@ -1353,22 +1354,22 @@ static int load_config(const char *path)
 	return 0;
 }
 
-/* ── helpers ──────────────────────────────────────────────────────── */
+/* ── вспомогательные функции ──────────────────────────────────────── */
 
 static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen)
 {
 	int n = len < outlen - 1 ? len : outlen - 1;
 	for (int i = 0; i < n; i++)
 		out[i] = (raw[i] == '\0') ? ' ' : raw[i];
-	/* trim trailing space */
+	/* убираем завершающий пробел */
 	while (n > 0 && out[n-1] == ' ')
 		n--;
 	out[n] = '\0';
 }
 
 /*
- * Split raw cmdline (null-separated argv) into exec_path and args.
- * exec_path = argv[0], args = argv[1..] joined with spaces.
+ * Разделение сырой cmdline (argv, разделённых NUL) на exec_path и args.
+ * exec_path = argv[0], args = argv[1..], объединённые пробелами.
  */
 static void cmdline_split(const char *raw, __u16 len,
 			  char *exec_out, int exec_len,
@@ -1380,7 +1381,7 @@ static void cmdline_split(const char *raw, __u16 len,
 	if (len == 0)
 		return;
 
-	/* argv[0]: up to first NUL */
+	/* argv[0]: до первого NUL */
 	int first_nul = -1;
 	for (int i = 0; i < len; i++) {
 		if (raw[i] == '\0') {
@@ -1390,7 +1391,7 @@ static void cmdline_split(const char *raw, __u16 len,
 	}
 
 	if (first_nul < 0) {
-		/* No NUL found — entire cmdline is exec */
+		/* NUL не найден — вся cmdline является exec */
 		int n = len < exec_len - 1 ? len : exec_len - 1;
 		memcpy(exec_out, raw, n);
 		exec_out[n] = '\0';
@@ -1402,7 +1403,7 @@ static void cmdline_split(const char *raw, __u16 len,
 	memcpy(exec_out, raw, elen);
 	exec_out[elen] = '\0';
 
-	/* args = raw[first_nul+1..len), NULs → spaces */
+	/* args = raw[first_nul+1..len), NUL заменяются пробелами */
 	int start = first_nul + 1;
 	int alen = len - start;
 	if (alen <= 0)
@@ -1411,7 +1412,7 @@ static void cmdline_split(const char *raw, __u16 len,
 		alen = args_len - 1;
 	for (int i = 0; i < alen; i++)
 		args_out[i] = (raw[start + i] == '\0') ? ' ' : raw[start + i];
-	/* trim trailing spaces */
+	/* убираем завершающие пробелы */
 	while (alen > 0 && args_out[alen - 1] == ' ')
 		alen--;
 	args_out[alen] = '\0';
@@ -1427,7 +1428,7 @@ static void log_ts(const char *level, const char *fmt, ...)
 	fprintf(stderr, "\n");
 }
 
-/* Debug log — only printed when log_level >= 2 */
+/* Отладочный лог — выводится только при log_level >= 2 */
 static void log_debug(const char *fmt, ...)
 {
 	if (cfg_log_level < 2)
@@ -1440,15 +1441,15 @@ static void log_debug(const char *fmt, ...)
 	fprintf(stderr, "\n");
 }
 
-/* ── event builder ────────────────────────────────────────────────── */
+/* ── построитель событий ──────────────────────────────────────────── */
 
-/* Build a metric_event from a BPF ring buffer event */
+/* Построение metric_event из события кольцевого буфера BPF */
 static void event_from_bpf(struct metric_event *out, const struct event *e,
 			    const char *event_type, const char *rule_name,
 			    const char *tags, const char *cgroup)
 {
 	memset(out, 0, sizeof(*out));
-	/* Use wall-clock time instead of boot-relative BPF timestamp */
+	/* Используем реальное время вместо BPF-метки относительно загрузки */
 	struct timespec ts_now;
 	clock_gettime(CLOCK_REALTIME, &ts_now);
 	out->timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
@@ -1467,7 +1468,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 		      out->args, sizeof(out->args));
 	if (cgroup)
 		snprintf(out->cgroup, sizeof(out->cgroup), "%s", cgroup);
-	/* exit-specific fields */
+	/* поля, специфичные для exit */
 	out->exit_code = (e->exit_code >> 8) & 0xff;
 	out->cpu_ns = e->cpu_ns;
 	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
@@ -1476,7 +1477,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->net_tx_bytes = e->net_tx_bytes;
 	out->net_rx_bytes = e->net_rx_bytes;
 	out->start_time_ns = e->start_ns;
-	/* new fields */
+	/* новые поля */
 	out->loginuid      = e->loginuid;
 	out->sessionid     = e->sessionid;
 	out->euid          = e->euid;
@@ -1492,10 +1493,10 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->cgroup_ns_inum = e->cgroup_ns_inum;
 }
 
-/* ── initial process scan (one-time /proc read at startup) ────────── */
+/* ── начальное сканирование процессов (однократное чтение /proc при старте) ── */
 
 /*
- * Parse /proc/PID/stat: extract comm, state, ppid, utime, stime,
+ * Парсинг /proc/PID/stat: извлечение comm, state, ppid, utime, stime,
  * threads, starttime, vsize, rss.
  */
 static int read_proc_stat(__u32 pid, struct proc_info *pi)
@@ -1508,7 +1509,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
 	fclose(f);
 
-	/* comm: between first '(' and last ')' */
+	/* comm: между первой '(' и последней ')' */
 	char *lp = strchr(buf, '(');
 	char *rp = strrchr(buf, ')');
 	if (!lp || !rp || rp <= lp) return -1;
@@ -1517,7 +1518,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	memcpy(pi->comm, lp + 1, clen);
 	pi->comm[clen] = '\0';
 
-	/* fields after ") " :
+	/* поля после ") " :
 	 * state ppid pgrp session tty_nr tpgid flags
 	 * minflt cminflt majflt cmajflt utime stime cutime cstime
 	 * priority nice num_threads itrealvalue starttime vsize rss */
@@ -1558,7 +1559,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	pi->cpu_ns = ((__u64)(utime + stime) * 1000000000ULL) / (__u64)clk_tck;
 	pi->start_ns = ((__u64)starttime * 1000000000ULL) / (__u64)clk_tck;
 
-	/* Read extra fields from /proc/PID/status */
+	/* Чтение дополнительных полей из /proc/PID/status */
 	char spath[64];
 	snprintf(spath, sizeof(spath), "/proc/%u/status", pid);
 	FILE *sf = fopen(spath, "r");
@@ -1581,7 +1582,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 		fclose(sf);
 	}
 
-	/* Read IO from /proc/PID/io (requires root or ptrace) */
+	/* Чтение IO из /proc/PID/io (требует root или ptrace) */
 	char iopath[64];
 	snprintf(iopath, sizeof(iopath), "/proc/%u/io", pid);
 	FILE *iof = fopen(iopath, "r");
@@ -1620,7 +1621,7 @@ static __u64 read_proc_cgroup_id(__u32 pid)
 	FILE *f = fopen(path, "r");
 	if (!f) return 0;
 
-	/* Find cgroup v2 line "0::/path" or fallback to first line */
+	/* Ищем строку cgroup v2 "0::/path" или берём первую строку как запасной вариант */
 	char cg_path[EV_CGROUP_LEN] = "";
 	while (fgets(buf, sizeof(buf), f)) {
 		buf[strcspn(buf, "\n")] = '\0';
@@ -1638,11 +1639,11 @@ static __u64 read_proc_cgroup_id(__u32 pid)
 	if (cg_path[0] == '\0' || strcmp(cg_path, "/") == 0)
 		return 0;
 
-	/* Strip leading / */
+	/* Убираем ведущий / */
 	char *rel = cg_path;
 	if (*rel == '/') rel++;
 
-	/* stat the cgroup dir to get inode = cgroup_id */
+	/* stat директории cgroup для получения inode = cgroup_id */
 	char full[PATH_MAX_LEN];
 	snprintf(full, sizeof(full), "/sys/fs/cgroup/%s", rel);
 	struct stat st;
@@ -1664,8 +1665,8 @@ static __s16 read_proc_oom(__u32 pid)
 
 
 /*
- * One-time startup scan: read /proc, match rules, populate BPF maps.
- * After this, all tracking is event-driven via BPF.
+ * Однократное сканирование при запуске: чтение /proc, сопоставление правил,
+ * заполнение BPF-карт. После этого всё отслеживание управляется событиями BPF.
  */
 
 struct scan_entry {
@@ -1703,7 +1704,7 @@ static void add_descendants(struct scan_entry *entries, int count,
 		if (entries[i].ppid != parent)
 			continue;
 		__u32 child = entries[i].pid;
-		/* Skip if already tracked */
+		/* Пропускаем, если уже отслеживается */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &child, &ti) == 0)
 			continue;
@@ -1728,7 +1729,7 @@ static void initial_scan(void)
 	int count = 0;
 	__u32 our_pid = (__u32)getpid();
 
-	/* Pass 1: collect all PIDs and ppids */
+	/* Проход 1: собираем все PID и ppid */
 	struct dirent *de;
 	while ((de = readdir(pd)) != NULL && count < MAX_SCAN) {
 		if (de->d_type != DT_DIR && de->d_type != DT_UNKNOWN)
@@ -1754,7 +1755,7 @@ static void initial_scan(void)
 	}
 	closedir(pd);
 
-	/* Pass 2: match cmdlines against rules, find roots */
+	/* Проход 2: сопоставляем cmdline с правилами, находим корневые процессы */
 	int tracked = 0;
 	for (int i = 0; i < count; i++) {
 		__u32 pid = entries[i].pid;
@@ -1774,7 +1775,7 @@ static void initial_scan(void)
 		int first = match_rules_all(cmdline_str, tags_buf,
 					    sizeof(tags_buf));
 		if (first >= 0 && !rules[first].ignore) {
-			/* Root match */
+			/* Корневое совпадение */
 			track_pid_from_proc(pid, first, pid, 1);
 			tags_store_ts(pid, tags_buf);
 			tracked++;
@@ -1782,7 +1783,7 @@ static void initial_scan(void)
 				  pid, rules[first].name, tags_buf,
 				  cmdline_str);
 
-			/* Find all descendants */
+			/* Находим всех потомков */
 			add_descendants(entries, count, pid, first, pid,
 					&tracked);
 		}
@@ -1792,7 +1793,7 @@ static void initial_scan(void)
 	       count, tracked);
 }
 
-/* ── ring buffer event handler ────────────────────────────────────── */
+/* ── обработчик событий кольцевого буфера ─────────────────────────── */
 
 /*
  * handle_event — callback для каждого BPF-события из ring buffer.
@@ -2508,7 +2509,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 }
 
 
-/* ── snapshot: collect metrics ────────────────────────────────────── */
+/* ── снапшот: сбор метрик ─────────────────────────────────────────── */
 
 static long long read_cgroup_value(const char *cg_path, const char *file)
 {
@@ -2529,8 +2530,8 @@ static long long read_cgroup_value(const char *cg_path, const char *file)
 }
 
 /*
- * Read cpu.max: "$MAX $PERIOD" or "max $PERIOD".
- * Sets *quota (usec, 0 if "max") and *period (usec).
+ * Чтение cpu.max: "$MAX $PERIOD" или "max $PERIOD".
+ * Устанавливает *quota (мкс, 0 если "max") и *period (мкс).
  */
 static void read_cgroup_cpu_max(const char *cg_path,
 				long long *quota, long long *period)
@@ -2545,7 +2546,7 @@ static void read_cgroup_cpu_max(const char *cg_path,
 	char buf[64];
 	if (fgets(buf, sizeof(buf), f)) {
 		if (strncmp(buf, "max", 3) == 0) {
-			*quota = 0;  /* unlimited */
+			*quota = 0;  /* без ограничений */
 			if (sscanf(buf + 3, " %lld", period) != 1)
 				*period = 100000;
 		} else {
@@ -2559,7 +2560,7 @@ static void read_cgroup_cpu_max(const char *cg_path,
 }
 
 /*
- * Read cpu.stat: parse nr_periods, nr_throttled, throttled_usec.
+ * Чтение cpu.stat: парсинг nr_periods, nr_throttled, throttled_usec.
  */
 static void read_cgroup_cpu_stat(const char *cg_path,
 				 long long *nr_periods,
@@ -2587,13 +2588,13 @@ static void read_cgroup_cpu_stat(const char *cg_path,
 }
 
 /*
- * Emit disk_usage events for each unique real filesystem.
- * Reads /proc/mounts, applies fs_type/include/exclude filters,
- * deduplicates by device, calls statvfs().
+ * Генерация событий disk_usage для каждой уникальной реальной файловой системы.
+ * Читает /proc/mounts, применяет фильтры fs_type/include/exclude,
+ * дедуплицирует по устройству, вызывает statvfs().
  */
 static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 {
-	/* Default fs types if none configured */
+	/* Типы ФС по умолчанию, если не заданы в конфигурации */
 	static const char *default_fs[] = {
 		"ext2", "ext3", "ext4", "xfs", "btrfs", "vfat",
 		"zfs", "ntfs", "fuseblk", "f2fs", NULL
@@ -2609,7 +2610,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 
 	struct mntent *ent;
 	while ((ent = getmntent(mf)) != NULL) {
-		/* Filter by filesystem type */
+		/* Фильтрация по типу файловой системы */
 		int is_real = 0;
 		if (cfg_disk_fs_types_count > 0) {
 			for (int i = 0; i < cfg_disk_fs_types_count; i++) {
@@ -2631,7 +2632,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 		if (!is_real)
 			continue;
 
-		/* Exclude filter (mount point prefix) */
+		/* Фильтр исключения (префикс точки монтирования) */
 		int excluded = 0;
 		for (int i = 0; i < cfg_disk_exclude_count; i++) {
 			if (strncmp(ent->mnt_dir, cfg_disk_exclude[i],
@@ -2643,7 +2644,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 		if (excluded)
 			continue;
 
-		/* Include filter (mount point prefix) — if set, only matching */
+		/* Фильтр включения (префикс точки монтирования) — если задан, только совпадающие */
 		if (cfg_disk_include_count > 0) {
 			int included = 0;
 			for (int i = 0; i < cfg_disk_include_count; i++) {
@@ -2657,7 +2658,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 				continue;
 		}
 
-		/* Skip duplicate devices */
+		/* Пропускаем дублирующиеся устройства */
 		int dup = 0;
 		for (int i = 0; i < seen_count; i++) {
 			if (strcmp(seen_devs[i], ent->mnt_fsname) == 0) {
@@ -2681,16 +2682,16 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 		cev.timestamp_ns = timestamp_ns;
 		snprintf(cev.event_type, sizeof(cev.event_type), "disk_usage");
 
-		/* mount point */
+		/* точка монтирования */
 		snprintf(cev.file_path, sizeof(cev.file_path),
 			 "%s", ent->mnt_dir);
 
-		/* device basename in comm */
+		/* имя устройства (basename) в comm */
 		const char *devname = strrchr(ent->mnt_fsname, '/');
 		devname = devname ? devname + 1 : ent->mnt_fsname;
 		snprintf(cev.comm, sizeof(cev.comm), "%s", devname);
 
-		/* fs type */
+		/* тип ФС */
 		snprintf(cev.sec_remote_addr, sizeof(cev.sec_remote_addr),
 			 "%s", ent->mnt_type);
 
@@ -2765,12 +2766,12 @@ static void write_snapshot(void)
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0) page_size = 4096;
 
-	/* Compute boot offset: monotonic → epoch */
+	/* Вычисление смещения от загрузки: monotonic → epoch */
 	struct timespec mono;
 	clock_gettime(CLOCK_MONOTONIC, &mono);
 	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
 
-	/* Elapsed time since previous snapshot (for cpu_usage_ratio) */
+	/* Время, прошедшее с предыдущего снапшота (для cpu_usage_ratio) */
 	double elapsed_ns = 0;
 	if (prev_snapshot_ts.tv_sec > 0) {
 		elapsed_ns = (double)(mono.tv_sec - prev_snapshot_ts.tv_sec) * 1e9
@@ -2778,42 +2779,42 @@ static void write_snapshot(void)
 	}
 	prev_snapshot_ts = mono;
 
-	/* Iterate proc_map */
+	/* Итерация по proc_map */
 	__u32 key = 0;
 	struct proc_info pi;
 	int pid_count = 0;
 
-	/* Collect unique cgroups for cgroup metrics (with cached values) */
+	/* Сбор уникальных cgroup'ов для cgroup-метрик (с кэшированными ��начениями) */
 	struct {
 		char path[EV_CGROUP_LEN];
 		long long mem_max, mem_cur, swap_cur, cpu_weight, pids_cur;
 		long long cpu_max, cpu_max_period;
 		long long cpu_nr_periods, cpu_nr_throttled, cpu_throttled_usec;
-		int read;  /* 1 = values read from /sys/fs/cgroup */
+		int read;  /* 1 = значения прочитаны из /sys/fs/cgroup */
 	} seen_cg[MAX_CGROUPS];
 	int seen_cg_count = 0;
 
-	/* Collect keys to delete (dead processes missed due to ringbuf overflow) */
+	/* Сбор ключей для удаления (мёртвые процессы, пропущенные из-за переполнения ringbuf) */
 	__u32 dead_keys[256];
 	int dead_count = 0;
 
-	/* Event file snapshot batch */
-	/* Single stack-based event for streaming to event file */
+	/* Пакет снапшота для файла событий */
+	/* Одно событие на стеке для потоковой записи в файл событий */
 	int snap_count = 0;
 
-	/* Single timestamp for all snapshot events in this cycle */
+	/* Единая временная метка для всех событий снапшота в этом цикле */
 	struct timespec snap_ts;
 	clock_gettime(CLOCK_REALTIME, &snap_ts);
 	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
 				+ (__u64)snap_ts.tv_nsec;
 
-	/* Lock batch to prevent ef_read_begin() from seeing
-	 * a partial snapshot across two deliveries */
+	/* Блокировка пакета, чтобы ef_read_begin() не увидел
+	 * частичный снапшот между двумя доставками */
 	ef_batch_lock();
 
 	/*
-	 * Batch lookup: read all proc_map entries in one syscall.
-	 * Falls back to per-key iteration if batch is not supported.
+	 * Пакетный lookup: чтение всех записей proc_map за один syscall.
+	 * Откатывается на поэлементную итерацию, если batch не поддерживается.
 	 */
 	__u32 *all_keys = NULL;
 	struct proc_info *all_values = NULL;
@@ -2834,10 +2835,10 @@ static void write_snapshot(void)
 				NULL, &out_batch,
 				all_keys, all_values, &batch_count, &opts);
 			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
-				/* ENOENT means "last batch" — all entries read */
+				/* ENOENT означает «последний пакет» — все записи прочитаны */
 				all_keys_count = (int)batch_count;
 			} else {
-				/* Batch not supported — fall back to iteration */
+				/* Batch не поддерживается — откат на итерацию */
 				all_keys_count = 0;
 				__u32 iter_key;
 				int err2 = bpf_map_get_next_key(proc_map_fd,
@@ -2847,7 +2848,7 @@ static void write_snapshot(void)
 					err2 = bpf_map_get_next_key(proc_map_fd,
 							&iter_key, &iter_key);
 				}
-				/* Values not filled — will lookup per-key below */
+				/* Значения не заполнены — будут запрошены поэлементно ниже */
 				free(all_values);
 				all_values = NULL;
 			}
@@ -2857,7 +2858,7 @@ static void write_snapshot(void)
 	for (int ki = 0; ki < all_keys_count; ki++) {
 		key = all_keys[ki];
 
-		/* Use batch-fetched value if available, otherwise per-key lookup */
+		/* Используем значение из batch, если доступно, иначе поэлементный lookup */
 		if (all_values) {
 			pi = all_values[ki];
 		} else {
@@ -2869,7 +2870,7 @@ static void write_snapshot(void)
 		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
 			continue;
 
-		/* Check if process is still alive */
+		/* Проверяем, жив ли ещё процесс */
 		if (kill((pid_t)key, 0) != 0 && errno == ESRCH) {
 			if (dead_count < 256)
 				dead_keys[dead_count++] = key;
@@ -2879,7 +2880,7 @@ static void write_snapshot(void)
 		const char *rule_name = (ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
-		/* Refresh cmdline + comm from /proc */
+		/* Обновление cmdline + comm из /proc */
 		if (cfg_refresh_proc) {
 			char fresh[CMDLINE_MAX];
 			int flen = read_proc_cmdline(key, fresh, sizeof(fresh));
@@ -2902,7 +2903,7 @@ static void write_snapshot(void)
 			}
 		}
 
-		/* Split cmdline into exec + args */
+		/* Разделение cmdline на exec + args */
 		char exec_path[CMDLINE_MAX], args[CMDLINE_MAX];
 		cmdline_split(pi.cmdline, pi.cmdline_len,
 			      exec_path, sizeof(exec_path),
@@ -2912,15 +2913,15 @@ static void write_snapshot(void)
 			strcat(args, "...");
 		}
 
-		/* Resolve cgroup: display name + real fs path */
+		/* Разрешение cgroup: отображаемое имя + реальный путь ФС */
 		char cg_path[PATH_MAX_LEN], cg_fs_path[PATH_MAX_LEN];
 		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
 		resolve_cgroup_fs_ts(pi.cgroup_id, cg_fs_path, sizeof(cg_fs_path));
 
-		/* Compute times */
+		/* Вычисление времён */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
 		if (uptime_sec < 0) uptime_sec = 0;
-		/* CPU usage ratio */
+		/* Коэффициент использования CPU */
 		double cpu_ratio = 0;
 		if (elapsed_ns > 0) {
 			__u64 prev_ns = cpu_prev_lookup(key);
@@ -2929,7 +2930,7 @@ static void write_snapshot(void)
 		}
 		cpu_prev_update(key, pi.cpu_ns);
 
-		/* Collect unique cgroup for cgroup-level metrics + cache values */
+		/* Сбор уникальных cgroup для cgroup-метрик + кэширование значений */
 		int cg_idx = -1;
 		if (cg_path[0] && seen_cg_count < MAX_CGROUPS) {
 			for (int i = 0; i < seen_cg_count; i++) {
@@ -2967,7 +2968,7 @@ static void write_snapshot(void)
 			}
 		}
 
-		/* Stream snapshot event directly to event file (no buffering) */
+		/* Потоковая запись события снапшота напрямую в файл событий (без буферизации) */
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
@@ -3010,7 +3011,7 @@ static void write_snapshot(void)
 			cev.start_time_ns = pi.start_ns;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
 
-			/* New fields from proc_info */
+			/* Новые поля из proc_info */
 			cev.loginuid       = pi.loginuid;
 			cev.sessionid      = pi.sessionid;
 			cev.euid           = pi.euid;
@@ -3025,12 +3026,12 @@ static void write_snapshot(void)
 			cev.net_ns_inum    = pi.net_ns_inum;
 			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
 
-			/* Preemption: last process that involuntarily preempted us */
+			/* Вытеснение: последний процесс, который принудительно вытеснил нас */
 			cev.preempted_by_pid = pi.preempted_by_pid;
 			memcpy(cev.preempted_by_comm,
 			       pi.preempted_by_comm, COMM_LEN);
 
-			/* pwd via readlink /proc/PID/cwd (userspace only) */
+			/* pwd через readlink /proc/PID/cwd (только в userspace) */
 			{
 				char cwd_path[64];
 				snprintf(cwd_path, sizeof(cwd_path),
@@ -3041,7 +3042,7 @@ static void write_snapshot(void)
 					cev.pwd[cwd_len] = '\0';
 			}
 
-			/* Fill cgroup metrics from cache */
+			/* Заполнение cgroup-метрик из кэша */
 			if (cg_idx >= 0 && seen_cg[cg_idx].read) {
 				cev.cgroup_memory_max = seen_cg[cg_idx].mem_max;
 				cev.cgroup_memory_current = seen_cg[cg_idx].mem_cur;
@@ -3055,7 +3056,7 @@ static void write_snapshot(void)
 				cev.cgroup_pids_current = seen_cg[cg_idx].pids_cur;
 			}
 
-			/* Open TCP connections count */
+			/* Количество открытых TCP-соединений */
 			if (cfg_sec_open_conn_count) {
 				__u64 conn_cnt = 0;
 				int occ_fd = bpf_map__fd(skel->maps.open_conn_map);
@@ -3073,7 +3074,7 @@ static void write_snapshot(void)
 	free(all_keys);
 	free(all_values);
 
-	/* Flush UDP aggregation map before unlocking batch */
+	/* Сброс карты агрегации UDP перед разблокировкой пакета */
 	if (cfg_sec_udp_tracking && g_http_cfg.enabled) {
 		int udp_fd = bpf_map__fd(skel->maps.udp_agg_map);
 		struct udp_agg_key ukey;
@@ -3144,7 +3145,7 @@ static void write_snapshot(void)
 			log_debug("UDP flush: %d aggregates", udp_count);
 	}
 
-	/* Flush ICMP aggregation map before unlocking batch */
+	/* Сброс карты агрегации ICMP перед разблокировкой пакета */
 	if (cfg_sec_icmp_tracking && g_http_cfg.enabled) {
 		int icmp_fd = bpf_map__fd(skel->maps.icmp_agg_map);
 		struct icmp_agg_key ikey;
@@ -3195,17 +3196,17 @@ static void write_snapshot(void)
 			log_debug("ICMP flush: %d aggregates", icmp_count);
 	}
 
-	/* Emit disk usage events */
+	/* Генерация событий использования дисков */
 	if (g_http_cfg.enabled && cfg_disk_tracking_enabled) {
 		int disk_ev = emit_disk_usage_events(snap_timestamp_ns,
 						     cfg_hostname);
 		snap_count += disk_ev;
 	}
 
-	/* Unlock batch — snapshot is complete, safe for swap/snapshot_fd */
+	/* Разблокировка пакета — снапшот завершён, безопасно для swap/snapshot_fd */
 	ef_batch_unlock();
 
-	/* Clean up dead processes (BPF maps — без lock) */
+	/* Очистка мёртвых процессов (BPF-карты — без lock) */
 	for (int i = 0; i < dead_count; i++) {
 		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
 		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
@@ -3215,7 +3216,7 @@ static void write_snapshot(void)
 	log_ts("INFO", "snapshot: %d PIDs, %d cgroups, %d events",
 	       pid_count, seen_cg_count, snap_count);
 
-	/* snap_count events were streamed directly via ef_append above */
+	/* snap_count событий были потоково записаны через ef_append выше */
 
 	/* Логируем статистику ring buffer'ов */
 	{
@@ -3258,12 +3259,12 @@ static void write_snapshot(void)
 	}
 }
 
-/* ── signals ──────────────────────────────────────────────────────── */
+/* ── сигналы ──────────────────────────────────────────────────────── */
 
 static void sig_term(int sig) { (void)sig; g_running = 0; }
 static void sig_hup(int sig)  { (void)sig; g_reload = 1; }
 
-/* ── libbpf log ───────────────────────────────────────────────────── */
+/* ── лог libbpf ───────────────────────────────────────────────────── */
 
 static int libbpf_print(enum libbpf_print_level level,
 			const char *fmt, va_list args)
@@ -3273,7 +3274,7 @@ static int libbpf_print(enum libbpf_print_level level,
 	return vfprintf(stderr, fmt, args);
 }
 
-/* ── main ─────────────────────────────────────────────────────────── */
+/* ── главная функция ──────────────────────────────────────────────── */
 
 static void usage(const char *prog)
 {
@@ -3318,7 +3319,7 @@ static void *poll_thread_fn(void *arg)
 
 int main(int argc, char *argv[])
 {
-	/* Parse command line — only -c and -h */
+	/* Разбор командной строки — только -c и -h */
 	int opt;
 	while ((opt = getopt(argc, argv, "c:h")) != -1) {
 		switch (opt) {
@@ -3328,9 +3329,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Find config file */
+	/* Поиск файла конфигурации */
 	if (!cfg_config_file) {
-		/* Try directory of binary, then cwd */
+		/* Пробуем директорию бинарника, затем cwd */
 		static char cfgbuf[PATH_MAX_LEN];
 		char *slash = strrchr(argv[0], '/');
 		if (slash) {
@@ -3343,11 +3344,11 @@ int main(int argc, char *argv[])
 		cfg_config_file = cfgbuf;
 	}
 
-	/* Load configuration (libconfig) */
+	/* Загрузка конфигурации (libconfig) */
 	if (load_config(cfg_config_file) < 0)
 		return 1;
 
-	/* Load rules from config */
+	/* Загрузка правил из конфигурации */
 	if (parse_rules_from_config(cfg_config_file) < 0)
 		return 1;
 	if (num_rules == 0) {
@@ -3355,7 +3356,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Initialize in-memory event ring buffer */
+	/* Инициализация кольцевого буфера событий в памяти */
 	if (g_http_cfg.enabled) {
 		if (ef_init((__u64)cfg_max_data_size) < 0) {
 			fprintf(stderr, "FATAL: event ring buffer init failed\n");
@@ -3363,25 +3364,25 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Build cgroup cache */
+	/* Построение кэша cgroup */
 	build_cgroup_cache();
 
-	/* Setup libbpf */
+	/* Настройка libbpf */
 	libbpf_set_print(libbpf_print);
 
-	/* Open BPF skeleton */
+	/* Открытие BPF-скелета */
 	skel = process_metrics_bpf__open();
 	if (!skel) {
 		fprintf(stderr, "FATAL: failed to open BPF skeleton\n");
 		return 1;
 	}
 
-	/* Set rodata before loading */
+	/* Установка rodata перед загрузкой */
 	skel->rodata->max_exec_events_per_sec = (__u32)cfg_exec_rate_limit;
 
-	/* Conditionally disable network tracking programs */
+	/* Условное отключение программ отслеживания сети */
 	if (!cfg_net_tracking_enabled) {
-		/* Connection lifecycle: connect/accept/close */
+		/* Жизненный цикл соединения: connect/accept/close */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
 		BPF_PROG_DISABLE(skel->progs.krp_tcp_v4_connect);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v6_connect);
@@ -3390,19 +3391,19 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
 	}
 	if (!cfg_net_tracking_enabled || !cfg_net_track_bytes) {
-		/* Per-connection byte counting (kprobe enter + kretprobe) */
+		/* Подсчёт байтов на соединение (kprobe enter + kretprobe) */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_recvmsg);
 	}
 	if (!cfg_net_tracking_enabled) {
-		/* Per-process aggregate byte counting (TCP + UDP kretprobes) */
+		/* Агрегированный подсчёт байтов на процесс (TCP + UDP kretprobes) */
 		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
 		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg);
 	}
 
-	/* Conditionally disable file tracking programs */
+	/* Условное отключение программ отслеживания файлов */
 	if (!cfg_file_tracking_enabled) {
 		BPF_PROG_DISABLE(skel->progs.handle_openat_enter);
 		BPF_PROG_DISABLE(skel->progs.handle_openat_exit);
@@ -3413,7 +3414,7 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.handle_write_exit);
 	}
 
-	/* Conditionally disable security tracking programs */
+	/* Условное отключение программ отслеживания безопасности */
 	if (!cfg_sec_tcp_retransmit)
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_retransmit);
 	if (!cfg_sec_syn_tracking)
@@ -3431,21 +3432,21 @@ int main(int argc, char *argv[])
 	if (!cfg_sec_icmp_tracking)
 		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
 
-	/* cgroup_freeze/cgroup_unfreeze tracepoints use a different
-	 * layout (trace_event_raw_cgroup, no val field) and may not
-	 * support BPF attach on some kernels (e.g. 6.1).
-	 * Disable them — cgroup_notify_frozen covers the same info. */
+	/* Tracepoints cgroup_freeze/cgroup_unfreeze используют другой
+	 * layout (trace_event_raw_cgroup, без поля val) и могут не
+	 * поддерживать BPF attach на некоторых ядрах (например, 6.1).
+	 * Отключаем — cgroup_notify_frozen покрывает ту же информацию. */
 	BPF_PROG_DISABLE(skel->progs.handle_cgroup_freeze);
 	BPF_PROG_DISABLE(skel->progs.handle_cgroup_unfreeze);
 
-	/* Load BPF programs */
+	/* Загрузка BPF-программ */
 	if (process_metrics_bpf__load(skel)) {
 		fprintf(stderr, "FATAL: failed to load BPF programs\n");
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
 
-	/* Push file tracking config to BPF maps */
+	/* Передача конфигурац��и отслеживания файлов в BPF-карты */
 	if (cfg_file_tracking_enabled) {
 		int file_cfg_fd = bpf_map__fd(skel->maps.file_cfg);
 		__u32 key0 = 0;
@@ -3472,7 +3473,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Push net tracking config to BPF maps */
+	/* Передача конфигурации отслеживания сети в BPF-карты */
 	if (cfg_net_tracking_enabled) {
 		int net_cfg_fd = bpf_map__fd(skel->maps.net_cfg);
 		__u32 key0 = 0;
@@ -3483,7 +3484,7 @@ int main(int argc, char *argv[])
 		bpf_map_update_elem(net_cfg_fd, &key0, &nc, BPF_ANY);
 	}
 
-	/* Push security tracking config to BPF maps */
+	/* Передача конфигурации отслеживания безопасности в BPF-карты */
 	{
 		int sec_cfg_fd = bpf_map__fd(skel->maps.sec_cfg);
 		__u32 key0 = 0;
@@ -3504,7 +3505,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Get map FDs */
+	/* Получение файловых дескрипторов карт */
 	tracked_map_fd = bpf_map__fd(skel->maps.tracked_map);
 	proc_map_fd    = bpf_map__fd(skel->maps.proc_map);
 
@@ -3529,16 +3530,16 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Signals */
+	/* Сигналы */
 	signal(SIGTERM, sig_term);
 	signal(SIGINT,  sig_term);
 	signal(SIGHUP,  sig_hup);
 
-	/* One-time startup scan: find already-running processes */
+	/* Однократное сканирование при запуске: поиск уже работающих процессов */
 	initial_scan();
 	refresh_boot_to_wall();
 
-	/* Start HTTP server if enabled */
+	/* Запуск HTTP-сервера, если включён */
 	if (g_http_cfg.enabled) {
 		if (http_server_start(&g_http_cfg) < 0) {
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
@@ -3602,18 +3603,18 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Main loop — snapshot и config reload */
+	/* Главный цикл — снапшот и перезагрузка конфигурации */
 	time_t last_snapshot = 0;
 
 	while (g_running) {
 		sleep(1);
 
-		/* Config reload on SIGHUP */
+		/* Перезагрузка конфигурации по SIGHUP */
 		if (g_reload) {
 			g_reload = 0;
 			log_ts("INFO", "SIGHUP: reloading rules...");
 
-			/* Clear all tracking — delete from beginning each time */
+			/* Очистка всего отслеживания — удаляем с начала каждый раз */
 			__u32 del_key;
 			while (bpf_map_get_next_key(tracked_map_fd, NULL, &del_key) == 0) {
 				bpf_map_delete_elem(tracked_map_fd, &del_key);
@@ -3629,7 +3630,7 @@ int main(int argc, char *argv[])
 			initial_scan();
 		}
 
-		/* Periodic snapshot */
+		/* Периодический снапшот */
 		time_t now = time(NULL);
 		if (now - last_snapshot >= cfg_snapshot_interval) {
 			/* build_cgroup_cache и refresh_boot_to_wall вызываются
@@ -3643,10 +3644,10 @@ int main(int argc, char *argv[])
 	for (int i = 0; i < 4; i++)
 		pthread_join(poll_threads[i], NULL);
 
-	/* Stop HTTP server */
+	/* Остановка HTTP-сервера */
 	http_server_stop();
 
-	/* Clean up event file */
+	/* Очистка файла событий */
 	ef_cleanup();
 
 	ring_buffer__free(rb_proc);

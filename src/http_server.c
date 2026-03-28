@@ -1,15 +1,15 @@
 /*
- * http_server.c — embedded HTTP server for process_metrics
+ * http_server.c — встроенный HTTP-сервер для process_metrics
  *
- * Minimal HTTP/1.1 server with these endpoints:
+ * Минимальный HTTP/1.1-сервер со следующими эндпоинтами:
  *
- *   GET /metrics                     — returns accumulated events as CSV (read-only).
- *   GET /metrics?format=csv         — same as above (explicit format).
+ *   GET /metrics                     — возвращает накопленные события в CSV (только чтение).
+ *   GET /metrics?format=csv         — то же самое (явное указание формата).
  *
- *   GET /metrics?format=csv&clear=1 — returns accumulated events as CSV AND clears
- *                                     the buffer after successful delivery.
- *                                     Intended for ClickHouse materialized views.
- *                                     If delivery fails, events are preserved.
+ *   GET /metrics?format=csv&clear=1 — возвращает накопленные события в CSV И очищает
+ *                                     буфер после успешной доставки.
+ *                                     Предназначено для материализованных представлений ClickHouse.
+ *                                     При ошибке доставки события сохраняются.
  */
 
 #define _GNU_SOURCE
@@ -31,13 +31,13 @@
 #include "event_file.h"
 #include "csv_format.h"
 
-/* ── state ───────────────────────────────────────────────────────── */
+/* ── состояние ───────────────────────────────────────────────────── */
 
 static int           g_listen_fd = -1;
 static pthread_t     g_thread;
 static volatile int  g_running;
 
-/* ── CSV formatting (delegated to csv_format.c) ──────────────────── */
+/* ── форматирование CSV (делегировано csv_format.c) ──────────────── */
 
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
@@ -49,7 +49,7 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 }
 
 /*
- * Send full HTTP response. Returns 0 on success, -1 on error.
+ * Отправляет полный HTTP-ответ. Возвращает 0 при успехе, -1 при ошибке.
  */
 static int send_response(int fd, int status, const char *content_type,
 			 const char *body, int body_len)
@@ -64,12 +64,12 @@ static int send_response(int fd, int status, const char *content_type,
 		"\r\n",
 		status, status_text, content_type, body_len);
 
-	/* Send header */
+	/* Отправляем заголовок */
 	ssize_t sent = send(fd, header, hlen, MSG_NOSIGNAL);
 	if (sent != hlen)
 		return -1;
 
-	/* Send body in chunks */
+	/* Отправляем тело по частям */
 	ssize_t total = 0;
 	while (total < body_len) {
 		ssize_t n = send(fd, body + total, body_len - total,
@@ -83,8 +83,8 @@ static int send_response(int fd, int status, const char *content_type,
 }
 
 /*
- * Send HTTP header without Content-Length.
- * With Connection: close, the client reads until EOF.
+ * Отправляет HTTP-заголовок без Content-Length.
+ * При Connection: close клиент читает до EOF.
  */
 static int send_stream_header(int fd, const char *content_type)
 {
@@ -100,7 +100,7 @@ static int send_stream_header(int fd, const char *content_type)
 }
 
 /*
- * Send all bytes to socket. Returns 0 on success, -1 on error.
+ * Отправляет все байты в сокет. Возвращает 0 при успехе, -1 при ошибке.
  */
 static int send_all(int fd, const char *buf, int len)
 {
@@ -115,7 +115,7 @@ static int send_all(int fd, const char *buf, int len)
 }
 
 /*
- * Flush send buffer to socket. Returns 0 on success, -1 on error.
+ * Сбрасывает буфер отправки в сокет. Возвращает 0 при успехе, -1 при ошибке.
  */
 static int flush_sendbuf(int fd, char *buf, int *used)
 {
@@ -127,8 +127,8 @@ static int flush_sendbuf(int fd, char *buf, int *used)
 }
 
 /*
- * Append data to send buffer, flushing when full.
- * Returns 0 on success, -1 on send error.
+ * Добавляет данные в буфер отправки, сбрасывая при заполнении.
+ * Возвращает 0 при успехе, -1 при ошибке отправки.
  */
 static int buf_append(int fd, char *buf, int bufsize, int *used,
 		      const char *data, int len)
@@ -151,20 +151,20 @@ static int buf_append(int fd, char *buf, int bufsize, int *used,
 #define SEND_BUF_SIZE (128 * 1024)
 
 /*
- * Stream records from ring buffer as CSV to client_fd.
- * Uses TCP_CORK + 128 KB userspace buffer to minimize syscalls.
- * If clear=1, consumed records are discarded after successful delivery.
+ * Потоково передаёт записи из кольцевого буфера в CSV на client_fd.
+ * Использует TCP_CORK + 128 КБ пользовательский буфер для минимизации системных вызовов.
+ * Если clear=1, прочитанные записи удаляются после успешной доставки.
  */
 static void handle_csv_stream(int client_fd, int clear)
 {
 	struct ef_iter iter;
 	int n = ef_read_begin(&iter);
 
-	/* TCP_CORK: hold small segments until uncorked or buffer full */
+	/* TCP_CORK: удерживаем мелкие сегменты до снятия пробки или заполнения буфера */
 	int cork = 1;
 	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 
-	/* Send HTTP header (no Content-Length — stream until close) */
+	/* Отправляем HTTP-заголовок (без Content-Length — поток до закрытия) */
 	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
 		ef_read_end(&iter, 0);
 		goto uncork;
@@ -177,7 +177,7 @@ static void handle_csv_stream(int client_fd, int clear)
 	}
 	int used = 0;
 
-	/* CSV column header */
+	/* Заголовок столбцов CSV */
 	int hdr_len;
 	const char *hdr = csv_header(&hdr_len);
 	if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
@@ -205,7 +205,7 @@ static void handle_csv_stream(int client_fd, int clear)
 		}
 	}
 
-	/* Flush remaining data */
+	/* Сбрасываем оставшиеся данные */
 	if (ok && flush_sendbuf(client_fd, sendbuf, &used) < 0)
 		ok = 0;
 
@@ -217,14 +217,14 @@ uncork:
 	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 }
 
-/* ── HTTP response ───────────────────────────────────────────────── */
+/* ── HTTP-ответ ──────────────────────────────────────────────────── */
 
 static int parse_format_csv(const char *request)
 {
-	/* Default to CSV; explicit format=csv also accepted */
+	/* По умолчанию CSV; явный format=csv тоже принимается */
 	const char *fmt = strstr(request, "format=");
 	if (!fmt)
-		return 1;  /* no format specified → CSV */
+		return 1;  /* формат не указан → CSV */
 	return strncmp(fmt + 7, "csv", 3) == 0;
 }
 
@@ -233,7 +233,7 @@ static int parse_clear(const char *request)
 	return strstr(request, "clear=1") != NULL;
 }
 
-/* ── request handler ─────────────────────────────────────────────── */
+/* ── обработчик запросов ─────────────────────────────────────────── */
 
 static void handle_request(int client_fd,
 			   const struct sockaddr_in *peer)
@@ -247,7 +247,7 @@ static void handle_request(int client_fd,
 	char peer_ip[INET_ADDRSTRLEN] = "?";
 	inet_ntop(AF_INET, &peer->sin_addr, peer_ip, sizeof(peer_ip));
 
-	/* Handle HEAD /metrics — ClickHouse url() sends HEAD to check availability */
+	/* Обработка HEAD /metrics — ClickHouse url() отправляет HEAD для проверки доступности */
 	if (strncmp(buf, "HEAD /metrics", 13) == 0) {
 		fprintf(stderr, "[INFO] http: HEAD /metrics from %s\n", peer_ip);
 		send_response(client_fd, 200, "text/csv; charset=utf-8",
@@ -255,7 +255,7 @@ static void handle_request(int client_fd,
 		return;
 	}
 
-	/* Only handle GET /metrics */
+	/* Обрабатываем только GET /metrics */
 	if (strncmp(buf, "GET /metrics", 12) != 0) {
 		fprintf(stderr, "[WARN] http: 404 from %s: %.40s\n",
 			peer_ip, buf);
@@ -287,7 +287,7 @@ static void handle_request(int client_fd,
 	handle_csv_stream(client_fd, do_clear);
 }
 
-/* ── server thread ───────────────────────────────────────────────── */
+/* ── серверный поток ─────────────────────────────────────────────── */
 
 static void *server_thread(void *arg)
 {
@@ -335,7 +335,7 @@ static void *server_thread(void *arg)
 	return NULL;
 }
 
-/* ── public API ──────────────────────────────────────────────────── */
+/* ── публичный API ───────────────────────────────────────────────── */
 
 int http_server_start(const struct http_config *cfg)
 {
@@ -404,8 +404,8 @@ void http_server_stop(void)
 
 	g_running = 0;
 
-	/* shutdown() wakes accept() blocked in another thread;
-	 * close() alone does not guarantee this on Linux. */
+	/* shutdown() будит accept(), заблокированный в другом потоке;
+	 * close() в одиночку не гарантирует этого в Linux. */
 	if (g_listen_fd >= 0) {
 		shutdown(g_listen_fd, SHUT_RDWR);
 		close(g_listen_fd);

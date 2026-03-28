@@ -1,10 +1,10 @@
 /*
- * http_server.h — embedded HTTP server for process_metrics
+ * http_server.h — встроенный HTTP-сервер для process_metrics
  *
- * Serves metrics via HTTP (CSV format for ClickHouse):
- *   GET /metrics                     — accumulated events as CSV (read-only)
- *   GET /metrics?format=csv         — same as above (explicit format)
- *   GET /metrics?format=csv&clear=1 — returns CSV and clears buffer after delivery
+ * Отдаёт метрики по HTTP (формат CSV для ClickHouse):
+ *   GET /metrics                     — накопленные события в CSV (только чтение)
+ *   GET /metrics?format=csv         — то же самое (явное указание формата)
+ *   GET /metrics?format=csv&clear=1 — возвращает CSV и очищает буфер после доставки
  */
 
 #ifndef HTTP_SERVER_H
@@ -13,34 +13,34 @@
 #include <linux/types.h>
 
 struct http_config {
-	int  port;           /* listen port (default: 9091) */
-	char bind[64];       /* bind address (default: "0.0.0.0") */
-	int  enabled;        /* 0 = disabled */
+	int  port;           /* порт для прослушивания (по умолчанию: 9091) */
+	char bind[64];       /* адрес привязки (по умолчанию: "0.0.0.0") */
+	int  enabled;        /* 0 = отключён */
 };
 
 /*
- * Resolve cgroup path for display.
- * If docker resolve is enabled and cgroup contains docker-<hash>.scope,
- * replaces it with docker/<container_name>.
- * buf must be at least EV_CGROUP_LEN bytes.
+ * Разрешает путь cgroup для отображения.
+ * Если включено разрешение docker и cgroup содержит docker-<hash>.scope,
+ * заменяет его на docker/<container_name>.
+ * buf должен быть не менее EV_CGROUP_LEN байт.
  */
 void http_resolve_cgroup(const char *raw, char *buf, int buflen);
 
 /*
- * Resolve UID to username from /etc/passwd (cached).
- * If not found, buf is set to empty string.
+ * Разрешает UID в имя пользователя из /etc/passwd (с кэшированием).
+ * Если не найдено, buf устанавливается в пустую строку.
  */
 void http_resolve_uid(__u32 uid, char *buf, int buflen);
 
 /*
- * Start the HTTP server in a background thread.
- * Returns 0 on success, -1 on error.
+ * Запускает HTTP-сервер в фоновом потоке.
+ * Возвращает 0 при успехе, -1 при ошибке.
  */
 int http_server_start(const struct http_config *cfg);
 
 /*
- * Stop the HTTP server and join the thread.
+ * Останавливает HTTP-сервер и дожидается завершения потока.
  */
 void http_server_stop(void);
 
-#endif /* HTTP_SERVER_H */
+#endif /* HTTP_SERVER_H — конец заголовка */

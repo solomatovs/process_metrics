@@ -1,11 +1,11 @@
 /*
- * csv_format.h — fast CSV formatting without snprintf
+ * csv_format.h — быстрое CSV-форматирование без snprintf
  *
- * All functions write directly into a char buffer using memcpy/manual
- * conversion, avoiding the overhead of printf-family format string parsing.
+ * Все функции пишут напрямую в char-буфер через memcpy/ручную конвертацию,
+ * избегая накладных расходов на разбор форматной строки printf-семейства.
  *
- * csv_format_row() replaces the former snprintf-based format_csv_row()
- * and is ~5–8× faster for the same output.
+ * csv_format_row() заменяет прежний format_csv_row() на основе snprintf
+ * и работает в ~5–8× быстрее при том же выводе.
  */
 
 #ifndef CSV_FORMAT_H
@@ -14,14 +14,14 @@
 #include "event_file.h"
 
 /*
- * Returns pointer to CSV_HEADER string (static, null-terminated).
- * Length is written to *len if len is not NULL.
+ * Возвращает указатель на строку CSV-заголовка (статическая, с нуль-терминатором).
+ * Длина записывается в *len, если len не NULL.
  */
 const char *csv_header(int *len);
 
 /*
- * Resolver callbacks used during CSV formatting.
- * Any field may be NULL — raw values are used as-is.
+ * Callback-функции для разрешения значений при CSV-форматировании.
+ * Любое поле может быть NULL — используются исходные значения.
  */
 struct csv_resolvers {
 	void (*resolve_cgroup)(const char *raw, char *out, int outlen);
@@ -29,12 +29,12 @@ struct csv_resolvers {
 };
 
 /*
- * Format one ef_record as a CSV row into buf[0..buflen-1].
+ * Форматирует одну запись ef_record как CSV-строку в buf[0..buflen-1].
  *
- * resolvers: optional callbacks for lazy resolution (cgroup, uid).
- *            May be NULL — raw values are used as-is.
+ * resolvers: необязательные callback-функции для отложенного разрешения (cgroup, uid).
+ *            Может быть NULL — используются исходные значения.
  *
- * Returns number of bytes written (excluding NUL), or -1 if buf is too small.
+ * Возвращает количество записанных байт (без NUL) или -1, если буфер слишком мал.
  */
 int csv_format_row(char *buf, int buflen,
 		   const struct ef_record *rec,
