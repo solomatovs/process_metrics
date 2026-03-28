@@ -91,6 +91,7 @@ enum event_type {
 	EVENT_TCP_RETRANSMIT = 8,
 	EVENT_SYN_RECV       = 9,
 	EVENT_RST            = 10,
+	EVENT_CHDIR          = 11,
 	/* события жизненного цикла cgroup */
 	EVENT_CGROUP_MKDIR           = 20,
 	EVENT_CGROUP_RMDIR           = 21,

@@ -40,7 +40,9 @@ declare -A FETCH_SOURCES
 
 FETCH_SOURCES["5.14"]="rpm|https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/debug/tree/Packages/kernel-debuginfo-5.14.0-687.el9.x86_64.rpm"
 FETCH_SOURCES["6.8"]="rpm|https://kojipkgs.fedoraproject.org/packages/kernel/6.8.11/300.fc40/x86_64/kernel-debuginfo-6.8.11-300.fc40.x86_64.rpm"
-FETCH_SOURCES["local"]="local|/sys/kernel/btf/vmlinux"
+# Текущее ядро хоста: версия определяется автоматически из uname -r (major.minor)
+_LOCAL_KERN_VER="$(uname -r | grep -oE '^[0-9]+\.[0-9]+')"
+FETCH_SOURCES["$_LOCAL_KERN_VER"]="local|/sys/kernel/btf/vmlinux"
 
 # ──────────────────────────────────────────────────────────────────────
 # Цвета

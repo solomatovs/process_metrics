@@ -413,6 +413,160 @@ static void tags_clear_ts(void)
 
 #endif /* NO_TAGS */
 
+/* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
+ *
+ * Кэширует текущий рабочий каталог (pwd) каждого отслеживаемого процесса.
+ * Заполняется при initial_scan (readlink /proc/PID/cwd), обновляется
+ * при chdir/fchdir (EVENT_CHDIR), наследуется при fork, удаляется при exit.
+ *
+ * Структура аналогична tags: split-layout + murmurhash3 + linear probing.
+ */
+
+#define PWD_HT_SIZE 16384  /* степень 2, как tags */
+
+static __u32 pwd_tgid[PWD_HT_SIZE];
+static char  pwd_data[PWD_HT_SIZE][EV_PWD_LEN];  /* 512 * 16384 = 8 MB */
+static pthread_rwlock_t g_pwd_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static inline __u32 pwd_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (PWD_HT_SIZE - 1);
+}
+
+static void pwd_store(__u32 tgid, const char *path)
+{
+	__u32 idx = pwd_hash(tgid);
+	for (int i = 0; i < PWD_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PWD_HT_SIZE - 1);
+		if (pwd_tgid[slot] == 0 || pwd_tgid[slot] == tgid) {
+			pwd_tgid[slot] = tgid;
+			snprintf(pwd_data[slot], EV_PWD_LEN, "%s", path);
+			return;
+		}
+	}
+}
+
+static const char *pwd_lookup(__u32 tgid)
+{
+	__u32 idx = pwd_hash(tgid);
+	for (int i = 0; i < PWD_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PWD_HT_SIZE - 1);
+		if (pwd_tgid[slot] == tgid)
+			return pwd_data[slot];
+		if (pwd_tgid[slot] == 0)
+			return "";
+	}
+	return "";
+}
+
+static void pwd_remove(__u32 tgid)
+{
+	__u32 idx = pwd_hash(tgid);
+	__u32 slot;
+	int i;
+
+	for (i = 0; i < PWD_HT_SIZE; i++) {
+		slot = (idx + i) & (PWD_HT_SIZE - 1);
+		if (pwd_tgid[slot] == tgid)
+			goto found;
+		if (pwd_tgid[slot] == 0)
+			return;
+	}
+	return;
+
+found:
+	for (;;) {
+		__u32 next = (slot + 1) & (PWD_HT_SIZE - 1);
+		if (pwd_tgid[next] == 0)
+			break;
+
+		__u32 natural = pwd_hash(pwd_tgid[next]);
+		__u32 d_natural_to_next = (next - natural) & (PWD_HT_SIZE - 1);
+		__u32 d_natural_to_slot = (slot - natural) & (PWD_HT_SIZE - 1);
+
+		if (d_natural_to_slot < d_natural_to_next) {
+			pwd_tgid[slot] = pwd_tgid[next];
+			memcpy(pwd_data[slot], pwd_data[next], EV_PWD_LEN);
+			slot = next;
+		} else {
+			break;
+		}
+	}
+
+	pwd_tgid[slot] = 0;
+	pwd_data[slot][0] = '\0';
+}
+
+static void pwd_inherit(__u32 child_tgid, __u32 parent_tgid)
+{
+	const char *pp = pwd_lookup(parent_tgid);
+	if (pp[0])
+		pwd_store(child_tgid, pp);
+}
+
+static void pwd_clear(void)
+{
+	memset(pwd_tgid, 0, sizeof(pwd_tgid));
+	memset(pwd_data, 0, sizeof(pwd_data));
+}
+
+/* Thread-safe обёртки */
+static void pwd_store_ts(__u32 tgid, const char *path)
+{
+	pthread_rwlock_wrlock(&g_pwd_lock);
+	pwd_store(tgid, path);
+	pthread_rwlock_unlock(&g_pwd_lock);
+}
+
+static void pwd_lookup_ts(__u32 tgid, char *buf, int buflen)
+{
+	pthread_rwlock_rdlock(&g_pwd_lock);
+	const char *p = pwd_lookup(tgid);
+	snprintf(buf, buflen, "%s", p);
+	pthread_rwlock_unlock(&g_pwd_lock);
+}
+
+static void pwd_remove_ts(__u32 tgid)
+{
+	pthread_rwlock_wrlock(&g_pwd_lock);
+	pwd_remove(tgid);
+	pthread_rwlock_unlock(&g_pwd_lock);
+}
+
+static void pwd_inherit_ts(__u32 child, __u32 parent)
+{
+	pthread_rwlock_wrlock(&g_pwd_lock);
+	pwd_inherit(child, parent);
+	pthread_rwlock_unlock(&g_pwd_lock);
+}
+
+static void pwd_clear_ts(void)
+{
+	pthread_rwlock_wrlock(&g_pwd_lock);
+	pwd_clear();
+	pthread_rwlock_unlock(&g_pwd_lock);
+}
+
+/*
+ * Читает pwd процесса через readlink(/proc/PID/cwd) и сохраняет в pwd-кэш.
+ * Thread-safe.
+ */
+static void pwd_read_and_store(__u32 tgid)
+{
+	char cwd_path[64], pwd_buf[EV_PWD_LEN];
+	snprintf(cwd_path, sizeof(cwd_path), "/proc/%u/cwd", tgid);
+	ssize_t len = readlink(cwd_path, pwd_buf, sizeof(pwd_buf) - 1);
+	if (len > 0) {
+		pwd_buf[len] = '\0';
+		pwd_store_ts(tgid, pwd_buf);
+	}
+}
+
 /*
  * Сопоставляет cmdline со ВСЕМИ правилами, формирует строку тегов
  * через разделитель '|'. Возвращает индекс первого совпавшего правила
@@ -1694,6 +1848,9 @@ static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
 	pi.cgroup_id = read_proc_cgroup_id(pid);
 	pi.oom_score_adj = read_proc_oom(pid);
 	bpf_map_update_elem(proc_map_fd, &pid, &pi, BPF_ANY);
+
+	/* Заполняем pwd-кэш через readlink /proc/PID/cwd */
+	pwd_read_and_store(pid);
 }
 
 static void add_descendants(struct scan_entry *entries, int count,
@@ -1888,6 +2045,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.file_write_bytes = fe->write_bytes;
 			cev.file_open_count = fe->open_count;
 
+			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
+
 			/* Запись в буферный файл (1× write syscall) */
 			ef_append(&cev, cfg_hostname);
 		}
@@ -1973,6 +2132,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.net_conn_rx_bytes = ne->rx_bytes;
 			cev.net_duration_ms = ne->duration_ns / 1000000;
 
+			pwd_lookup_ts(ne->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2074,6 +2234,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				fclose(tcf);
 			}
 
+			pwd_lookup_ts(se->sender_tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2147,6 +2308,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			pwd_lookup_ts(re->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2217,6 +2379,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			pwd_lookup_ts(se_syn->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2289,6 +2452,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			pwd_lookup_ts(rste->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2334,6 +2498,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			bpf_map_update_elem(tracked_map_fd, &e->tgid,
 					    &new_ti, BPF_ANY);
 			tags_store_ts(e->tgid, tags_buf);
+			pwd_read_and_store(e->tgid);
 
 			/* Сохраняем метаданные процесса в proc_map */
 			struct proc_info pi = {0};
@@ -2360,6 +2525,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       rules[first].name,
 					       tags_buf, cg_buf);
 				cev.is_root = 1;
+				pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 				ef_append(&cev, cfg_hostname);
 			}
 		}
@@ -2374,6 +2540,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->ppid, &parent_ti) != 0)
 			return 0;
 		tags_inherit_ts(e->tgid, e->ppid);
+		pwd_inherit_ts(e->tgid, e->ppid);
 
 		/* tty_nr уже заполнен BPF (read_tty_nr в handle_fork) */
 		__u32 child_tty = 0;
@@ -2397,6 +2564,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				       fork_tags, cg_buf);
 			cev.root_pid = parent_ti.root_pid;
 			cev.tty_nr = child_tty;
+			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2460,9 +2628,23 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       sizeof(cg_buf));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg_buf);
+			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		/* BPF уже удалил запись из tracked_map и proc_map */
+		pwd_remove_ts(e->tgid);
+		return 0;
+	}
+
+	/* ── CHDIR — смена рабочего каталога ─────────────────────────── */
+	case EVENT_CHDIR: {
+		char cwd_path[64], pwd_buf[EV_PWD_LEN];
+		snprintf(cwd_path, sizeof(cwd_path), "/proc/%u/cwd", e->tgid);
+		ssize_t len = readlink(cwd_path, pwd_buf, sizeof(pwd_buf) - 1);
+		if (len > 0) {
+			pwd_buf[len] = '\0';
+			pwd_store_ts(e->tgid, pwd_buf);
+		}
 		return 0;
 	}
 
@@ -2496,6 +2678,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname,
 				       oom_tags, cg_buf);
+			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -3031,16 +3214,8 @@ static void write_snapshot(void)
 			memcpy(cev.preempted_by_comm,
 			       pi.preempted_by_comm, COMM_LEN);
 
-			/* pwd через readlink /proc/PID/cwd (только в userspace) */
-			{
-				char cwd_path[64];
-				snprintf(cwd_path, sizeof(cwd_path),
-					 "/proc/%u/cwd", pi.tgid);
-				ssize_t cwd_len = readlink(cwd_path, cev.pwd,
-							   sizeof(cev.pwd) - 1);
-				if (cwd_len > 0)
-					cev.pwd[cwd_len] = '\0';
-			}
+			/* pwd из userspace-кэша (заполняется при scan/fork/exec/chdir) */
+			pwd_lookup_ts(pi.tgid, cev.pwd, sizeof(cev.pwd));
 
 			/* Заполнение cgroup-метрик из кэша */
 			if (cg_idx >= 0 && seen_cg[cg_idx].read) {
@@ -3136,6 +3311,7 @@ static void write_snapshot(void)
 						 "%s", tags_lookup_copy(snap_tgid, snap_data, ukey.tgid));
 #endif
 				}
+				pwd_lookup_ts(ukey.tgid, cev.pwd, sizeof(cev.pwd));
 				ef_append(&cev, cfg_hostname);
 				udp_count++;
 			}
@@ -3622,6 +3798,7 @@ int main(int argc, char *argv[])
 			}
 
 			tags_clear_ts();
+			pwd_clear_ts();
 			parse_rules_from_config(cfg_config_file);
 			build_cgroup_cache_ts();
 

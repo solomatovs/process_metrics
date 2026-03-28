@@ -1131,6 +1131,58 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
+/* ── CHDIR/FCHDIR — трекинг смены рабочего каталога ─────────────────── */
+
+/*
+ * sys_exit_chdir: при успешном chdir() отправляем уведомление в userspace,
+ * который прочитает актуальный pwd через readlink(/proc/PID/cwd).
+ */
+SEC("tracepoint/syscalls/sys_exit_chdir")
+int handle_sys_exit_chdir(struct trace_event_raw_sys_exit *ctx)
+{
+	if (ctx->ret != 0)
+		return 0;
+
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	RB_STAT_TOTAL_PROC();
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
+	if (!e) {
+		RB_STAT_DROP_PROC();
+		return 0;
+	}
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type = EVENT_CHDIR;
+	e->tgid = tgid;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_fchdir")
+int handle_sys_exit_fchdir(struct trace_event_raw_sys_exit *ctx)
+{
+	if (ctx->ret != 0)
+		return 0;
+
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	RB_STAT_TOTAL_PROC();
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
+	if (!e) {
+		RB_STAT_DROP_PROC();
+		return 0;
+	}
+	__builtin_memset(e, 0, sizeof(*e));
+	e->type = EVENT_CHDIR;
+	e->tgid = tgid;
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
 /* ── Отслеживание файлов: openat/close/read/write ─────────────────── */
 
 /*
