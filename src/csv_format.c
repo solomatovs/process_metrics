@@ -284,7 +284,7 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->uid);
 	/* user_name (разрешается из uid) */
 	if (resolvers && resolvers->resolve_uid) {
-		char uname[64];
+		char uname[USERNAME_LEN];
 		resolvers->resolve_uid(ev->uid, uname, sizeof(uname));
 		STR(uname, 64);
 	} else {
@@ -295,7 +295,7 @@ int csv_format_row(char *buf, int buflen,
 	if (ev->loginuid == 4294967295U) {
 		STR("AUDIT_UID_UNSET", 64);
 	} else if (resolvers && resolvers->resolve_uid) {
-		char lname[64];
+		char lname[USERNAME_LEN];
 		resolvers->resolve_uid(ev->loginuid, lname, sizeof(lname));
 		STR(lname, 64);
 	} else {
@@ -305,7 +305,7 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->euid);
 	/* euser_name (разрешается из euid) */
 	if (resolvers && resolvers->resolve_uid) {
-		char ename[64];
+		char ename[USERNAME_LEN];
 		resolvers->resolve_uid(ev->euid, ename, sizeof(ename));
 		STR(ename, 64);
 	} else {

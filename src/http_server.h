@@ -11,10 +11,11 @@
 #define HTTP_SERVER_H
 
 #include <linux/types.h>
+#include "process_metrics_common.h"
 
 struct http_config {
 	int  port;           /* порт для прослушивания (по умолчанию: 9091) */
-	char bind[64];       /* адрес привязки (по умолчанию: "0.0.0.0") */
+	char bind[BIND_ADDR_LEN]; /* адрес привязки (по умолчанию: "0.0.0.0") */
 	int  enabled;        /* 0 = отключён */
 };
 

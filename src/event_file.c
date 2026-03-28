@@ -51,8 +51,8 @@ int ef_init(__u64 max_size_bytes)
 	__u64 cap = max_size_bytes / sizeof(struct ef_record);
 	if (cap < 64)
 		cap = 64;
-	if (cap > 1000000)
-		cap = 1000000; /* предельное ограничение: ~2.7 ГБ */
+	if (cap > EF_MAX_CAPACITY)
+		cap = EF_MAX_CAPACITY; /* предельное ограничение: ~2.7 ГБ */
 
 	g_ring = calloc((size_t)cap, sizeof(struct ef_record));
 	if (!g_ring) {
