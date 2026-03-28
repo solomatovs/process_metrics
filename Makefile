@@ -7,7 +7,7 @@
 #
 # Использование:
 #   make               — показать эту справку
-#   make deps          — установить зависимости сборки (автоопределение apt/yum)
+#   make deps          — установить зависимости сборки (автоопределение pacman/apt/yum)
 #   make all           — полная сборка: vmlinux.h + bpftool + BPF + бинарник
 #   make bpftool       — собрать только bpftool из src/bpftool/
 #   make vmlinux       — пересоздать vmlinux.h из BTF текущего ядра
@@ -65,11 +65,12 @@ CFLAGS     := -O2 -Wall -I$(BUILDDIR) -I$(SRCDIR)
 ifdef NO_TAGS
 CFLAGS += -DNO_TAGS
 endif
-LDFLAGS    := -Wl,-Bstatic -lbpf -lelf -lz -lconfig -Wl,-Bdynamic -lpthread -lc
+LDFLAGS    := -Wl,-Bstatic -lbpf -lelf -lzstd -lz -lconfig -Wl,-Bdynamic -lpthread -lc
 
 # Пакеты зависимостей
 APT_PKGS := gcc make build-essential libbpf-dev libelf-dev zlib1g-dev libbfd-dev libcap-dev llvm libconfig-dev
 YUM_PKGS := gcc make gcc-c++ libbpf-devel elfutils-libelf-devel zlib-devel binutils-devel libcap-devel llvm libconfig-devel
+PAC_PKGS := gcc make libbpf libelf zlib binutils libcap llvm clang libconfig
 
 # Минимальная версия clang для BPF CO-RE
 MIN_CLANG_VER := 10
@@ -78,12 +79,12 @@ MIN_CLANG_VER := 10
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
-.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum bpftool check-clang test test-unit test-http test-clickhouse compat
+.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum deps-pacman bpftool check-clang test test-unit test-http test-clickhouse compat
 
 help:
 	@echo "process_metrics — событийный BPF-коллектор метрик процессов"
 	@echo ""
-	@echo "  make deps       установить зависимости сборки (автоопределение apt/yum)"
+	@echo "  make deps       установить зависимости сборки (автоопределение pacman/apt/yum)"
 	@echo "  make all        полная сборка: vmlinux + bpftool + bpf + бинарник"
 	@echo "  make vmlinux    пересоздать vmlinux.h из BTF текущего ядра"
 	@echo "  make bpftool    собрать bpftool из вендорных исходников"
@@ -112,7 +113,7 @@ all: check-clang vmlinux bpftool bpf binary
 check-clang:
 	@if [ -z "$(CLANG)" ]; then \
 		echo "Ошибка: не найден clang >= $(MIN_CLANG_VER)."; \
-		echo "Установите: apt install clang-11  ИЛИ  yum install clang"; \
+		echo "Установите: pacman -S clang  ИЛИ  apt install clang-11  ИЛИ  yum install clang"; \
 		echo "Или укажите: make all CLANG=/path/to/clang-11"; \
 		exit 1; \
 	fi; \
@@ -127,12 +128,14 @@ check-clang:
 # --- установка зависимостей ---
 
 deps:
-	@if command -v apt-get >/dev/null 2>&1; then \
+	@if command -v pacman >/dev/null 2>&1; then \
+		$(MAKE) deps-pacman; \
+	elif command -v apt-get >/dev/null 2>&1; then \
 		$(MAKE) deps-apt; \
 	elif command -v yum >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1; then \
 		$(MAKE) deps-yum; \
 	else \
-		echo "Ошибка: не найден ни apt-get, ни yum/dnf"; exit 1; \
+		echo "Ошибка: не найден ни pacman, ни apt-get, ни yum/dnf"; exit 1; \
 	fi
 
 deps-apt:
@@ -161,6 +164,12 @@ deps-yum:
 	@# заголовки ядра — опционально, могут отсутствовать в контейнерах
 	yum install -y kernel-devel-$(shell uname -r) 2>/dev/null || \
 		echo "Примечание: kernel-devel не найден (ОК для контейнеров, нужен только для пересоздания vmlinux.h)"
+
+deps-pacman:
+	sudo pacman -Sy --needed --noconfirm $(PAC_PKGS)
+	@# заголовки ядра — опционально
+	sudo pacman -S --needed --noconfirm linux-headers 2>/dev/null || \
+		echo "Примечание: linux-headers не найдены (ОК для контейнеров, нужны только для пересоздания vmlinux.h)"
 
 # --- vmlinux.h из BTF текущего ядра ---
 

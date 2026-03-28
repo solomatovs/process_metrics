@@ -762,8 +762,9 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 							  sizeof(ti.comm),
 							  &leader->comm);
 			else
-				__builtin_memcpy(ti.comm, ctx->prev_comm,
-						 COMM_LEN);
+				bpf_probe_read_kernel(ti.comm,
+						      COMM_LEN,
+						      ctx->prev_comm);
 			ti.comm[COMM_LEN - 1] = '\0';
 			bpf_map_update_elem(&tid_tgid_map, &tid,
 					    &ti, BPF_NOEXIST);
@@ -888,8 +889,9 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 					 ti->comm, COMM_LEN);
 		} else {
 			info->preempted_by_pid = next_tid;
-			__builtin_memcpy(info->preempted_by_comm,
-					 ctx->next_comm, COMM_LEN);
+			bpf_probe_read_kernel(info->preempted_by_comm,
+					      COMM_LEN,
+					      ctx->next_comm);
 		}
 		info->preempted_by_comm[COMM_LEN - 1] = '\0';
 		info->preempted_by_cgroup_id = 0;
