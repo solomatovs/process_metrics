@@ -118,7 +118,8 @@ CREATE TABLE _pm_reference (
     open_tcp_conns         UInt64                      CODEC(T64, ZSTD(1)),
     disk_total_bytes       UInt64                      CODEC(T64, ZSTD(1)),
     disk_used_bytes        UInt64                      CODEC(T64, ZSTD(1)),
-    disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1))
+    disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
+    parent_pids            Array(UInt32)               CODEC(ZSTD(1))
 ) ENGINE = Null;
 
 -- ── Шаг 2: Сгенерировать ALTER TABLE для недостающих колонок ─────────

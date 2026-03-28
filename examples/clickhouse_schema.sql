@@ -183,11 +183,15 @@ CREATE TABLE IF NOT EXISTS process_metrics (
     disk_used_bytes        UInt64                      CODEC(T64, ZSTD(1)),
     disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
 
+    -- ── process ancestry chain ────────────────────────────────────
+    parent_pids            Array(UInt32)               CODEC(ZSTD(1)),
+
     -- ── skip-индексы ──────────────────────────────────────────────
-    INDEX idx_pid       pid            TYPE bloom_filter(0.01) GRANULARITY 4,
-    INDEX idx_cgroup    cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
-    INDEX idx_login     login_name     TYPE bloom_filter(0.01) GRANULARITY 4,
-    INDEX idx_sec_addr  sec_remote_addr TYPE bloom_filter(0.01) GRANULARITY 4
+    INDEX idx_pid         pid            TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_cgroup      cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_login       login_name     TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_sec_addr    sec_remote_addr TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_parent_pids parent_pids    TYPE bloom_filter(0.01) GRANULARITY 4
 )
 ENGINE = MergeTree()
 PARTITION BY toYYYYMM(timestamp)
@@ -260,7 +264,10 @@ CREATE MATERIALIZED VIEW process_metrics_pull_server1
 REFRESH EVERY 3 SECOND RANDOMIZE FOR 1 SECOND APPEND
 TO process_metrics
 AS
-SELECT * REPLACE (if(tags = '', [], splitByChar('|', tags)) AS tags)
+SELECT * REPLACE (
+    if(tags = '', [], splitByChar('|', tags)) AS tags,
+    if(parent_pids = '', [], arrayMap(x -> toUInt32(x), splitByChar('|', parent_pids))) AS parent_pids
+)
 FROM url(
     'http://server1:9091/metrics?format=csv&clear=1',
     'CSVWithNames',
@@ -294,5 +301,6 @@ FROM url(
      sec_local_port UInt16, sec_remote_port UInt16,
      sec_af UInt8, sec_tcp_state UInt8, sec_direction UInt8,
      open_tcp_conns UInt64,
-     disk_total_bytes UInt64, disk_used_bytes UInt64, disk_avail_bytes UInt64'
+     disk_total_bytes UInt64, disk_used_bytes UInt64, disk_avail_bytes UInt64,
+     parent_pids String'
 );

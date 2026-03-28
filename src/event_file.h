@@ -23,6 +23,7 @@
 #define EV_CGROUP_LEN      512  /* cgroup path */
 #define EV_ADDR_LEN        46   /* formatted IP string (INET6_ADDRSTRLEN) */
 #define EV_PWD_LEN         512  /* current working directory */
+#define EV_PARENT_PIDS_MAX 32   /* max depth of process ancestry chain */
 
 /*
  * CSV escape worst case: every char doubled + 2 quotes + NUL.
@@ -153,6 +154,10 @@ struct metric_event {
 	__u64 disk_total_bytes;
 	__u64 disk_used_bytes;
 	__u64 disk_avail_bytes;
+
+	/* ── process ancestry chain ──────────────────────────────────── */
+	__u32 parent_pids[EV_PARENT_PIDS_MAX]; /* [ppid, ppid's parent, ..., 1] */
+	__u8  parent_pids_len;                  /* valid entries in parent_pids[] */
 };
 
 /* ── event file record (hostname + event) ────────────────────────── */

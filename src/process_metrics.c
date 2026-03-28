@@ -141,6 +141,7 @@ static int tracked_map_fd, proc_map_fd;
 static pthread_rwlock_t g_tags_lock    = PTHREAD_RWLOCK_INITIALIZER;
 #endif
 static pthread_rwlock_t g_cgroup_lock  = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_rwlock_t g_pidtree_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 /* Аргумент для потока poll */
 struct poll_thread_arg {
@@ -412,6 +413,229 @@ static void tags_clear_ts(void)
 }
 
 #endif /* NO_TAGS */
+
+/* ── pid tree: global pid→ppid hash map for ancestry chains ──────
+ *
+ * Covers ALL system processes (not just tracked ones), so that
+ * ancestry chains for tracked processes can walk through untracked
+ * intermediate parents.
+ *
+ * Layout: open-addressing hash table with linear probing and
+ * backward-shift deletion (same pattern as tags hash table).
+ *
+ * Memory: pt_pid[65536] + pt_ppid[65536] = 512 KB total.
+ */
+
+#define PIDTREE_HT_SIZE  65536  /* power of 2, covers pid_max with ~50% load */
+
+static __u32 pt_pid[PIDTREE_HT_SIZE];    /* keys: pid   (0 = empty slot) */
+static __u32 pt_ppid[PIDTREE_HT_SIZE];   /* values: ppid                 */
+
+static inline __u32 pidtree_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (PIDTREE_HT_SIZE - 1);
+}
+
+static void pidtree_store(__u32 pid, __u32 ppid)
+{
+	__u32 idx = pidtree_hash(pid);
+	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[slot] == 0 || pt_pid[slot] == pid) {
+			pt_pid[slot] = pid;
+			pt_ppid[slot] = ppid;
+			return;
+		}
+	}
+}
+
+/* Lookup in pid tree arrays (works for both live table and snapshot copy) */
+static __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid,
+			       __u32 pid)
+{
+	__u32 idx = pidtree_hash(pid);
+	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+		__u32 slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (p_pid[slot] == pid)
+			return p_ppid[slot];
+		if (p_pid[slot] == 0)
+			return 0;
+	}
+	return 0;
+}
+
+static void pidtree_remove(__u32 pid)
+{
+	__u32 idx = pidtree_hash(pid);
+	__u32 slot;
+	int i;
+
+	for (i = 0; i < PIDTREE_HT_SIZE; i++) {
+		slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[slot] == pid)
+			goto found;
+		if (pt_pid[slot] == 0)
+			return;
+	}
+	return;
+
+found:
+	for (;;) {
+		__u32 next = (slot + 1) & (PIDTREE_HT_SIZE - 1);
+		if (pt_pid[next] == 0)
+			break;
+
+		__u32 natural = pidtree_hash(pt_pid[next]);
+		__u32 d_natural_to_next = (next - natural) & (PIDTREE_HT_SIZE - 1);
+		__u32 d_natural_to_slot = (slot - natural) & (PIDTREE_HT_SIZE - 1);
+
+		if (d_natural_to_slot < d_natural_to_next) {
+			pt_pid[slot] = pt_pid[next];
+			pt_ppid[slot] = pt_ppid[next];
+			slot = next;
+		} else {
+			break;
+		}
+	}
+
+	pt_pid[slot] = 0;
+	pt_ppid[slot] = 0;
+}
+
+/* Generation counter: bumped on every tree mutation (fork/exit).
+ * Used to invalidate the chain cache without per-entry tracking. */
+static __u64 pt_generation;
+
+static void pidtree_store_ts(__u32 pid, __u32 ppid)
+{
+	pthread_rwlock_wrlock(&g_pidtree_lock);
+	pidtree_store(pid, ppid);
+	pt_generation++;
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+static void pidtree_remove_ts(__u32 pid)
+{
+	pthread_rwlock_wrlock(&g_pidtree_lock);
+	pidtree_remove(pid);
+	pt_generation++;
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+/* ── ancestor chain cache ────────────────────────────────────────
+ *
+ * Caches computed ancestry chains to avoid repeated tree walks.
+ * Invalidated via generation counter — any fork/exit bumps
+ * pt_generation, making all cached entries stale.
+ */
+
+#define CHAIN_CACHE_SIZE 16384  /* power of 2 */
+
+static __u32 cc_pid[CHAIN_CACHE_SIZE];
+static __u32 cc_chain[CHAIN_CACHE_SIZE][EV_PARENT_PIDS_MAX];
+static __u8  cc_len[CHAIN_CACHE_SIZE];
+static __u64 cc_gen[CHAIN_CACHE_SIZE];  /* generation stamp per entry */
+
+static inline __u32 chain_cache_hash(__u32 h)
+{
+	h ^= h >> 16;
+	h *= 0x85ebca6b;
+	h ^= h >> 13;
+	h *= 0xc2b2ae35;
+	h ^= h >> 16;
+	return h & (CHAIN_CACHE_SIZE - 1);
+}
+
+/*
+ * Walk the pid tree upward from pid, building the ancestor chain.
+ * Operates on provided arrays (can be live table or snapshot copy).
+ * Returns chain length.
+ */
+static int pidtree_walk_chain(const __u32 *p_pid, const __u32 *p_ppid,
+			      __u32 pid, __u32 *out, int max_depth)
+{
+	int len = 0;
+	__u32 cur = pidtree_lookup_in(p_pid, p_ppid, pid);
+
+	while (cur > 0 && len < max_depth) {
+		/* cycle detection */
+		for (int j = 0; j < len; j++) {
+			if (out[j] == cur)
+				return len;
+		}
+		out[len++] = cur;
+		if (cur == 1)
+			break; /* reached init, no need to go further */
+		cur = pidtree_lookup_in(p_pid, p_ppid, cur);
+	}
+	return len;
+}
+
+/*
+ * Get ancestry chain for pid (thread-safe, uses cache).
+ * Acquires rdlock on g_pidtree_lock.
+ */
+static void pidtree_get_chain_ts(__u32 pid, __u32 *out, __u8 *out_len)
+{
+	pthread_rwlock_rdlock(&g_pidtree_lock);
+
+	__u64 gen = pt_generation;
+	__u32 slot = chain_cache_hash(pid);
+
+	/* Check cache */
+	if (cc_pid[slot] == pid && cc_gen[slot] == gen) {
+		int n = cc_len[slot];
+		memcpy(out, cc_chain[slot], n * sizeof(__u32));
+		*out_len = (__u8)n;
+		pthread_rwlock_unlock(&g_pidtree_lock);
+		return;
+	}
+
+	/* Cache miss — walk the tree */
+	__u32 chain[EV_PARENT_PIDS_MAX];
+	int n = pidtree_walk_chain(pt_pid, pt_ppid, pid, chain,
+				   EV_PARENT_PIDS_MAX);
+
+	/* Store in cache (direct-mapped, overwrites previous occupant) */
+	cc_pid[slot] = pid;
+	cc_gen[slot] = gen;
+	cc_len[slot] = (__u8)n;
+	memcpy(cc_chain[slot], chain, n * sizeof(__u32));
+
+	/* Copy to caller */
+	memcpy(out, chain, n * sizeof(__u32));
+	*out_len = (__u8)n;
+
+	pthread_rwlock_unlock(&g_pidtree_lock);
+}
+
+/*
+ * Get ancestry chain from a snapshot copy of the pid tree (no lock).
+ * Used by write_snapshot() to avoid holding g_pidtree_lock during
+ * the entire snapshot iteration.
+ */
+static void pidtree_get_chain_copy(const __u32 *snap_pid,
+				   const __u32 *snap_ppid,
+				   __u32 pid, __u32 *out, __u8 *out_len)
+{
+	int n = pidtree_walk_chain(snap_pid, snap_ppid, pid, out,
+				   EV_PARENT_PIDS_MAX);
+	*out_len = (__u8)n;
+}
+
+/*
+ * Fill parent_pids in a metric_event (thread-safe, for event handler).
+ */
+static void fill_parent_pids(struct metric_event *cev)
+{
+	pidtree_get_chain_ts(cev->pid, cev->parent_pids,
+			     &cev->parent_pids_len);
+}
 
 /*
  * Match cmdline against ALL rules, build pipe-separated tags string.
@@ -1754,6 +1978,10 @@ static void initial_scan(void)
 	}
 	closedir(pd);
 
+	/* Pass 1.5: populate global pid tree with ALL processes */
+	for (int i = 0; i < count; i++)
+		pidtree_store(entries[i].pid, entries[i].ppid);
+
 	/* Pass 2: match cmdlines against rules, find roots */
 	int tracked = 0;
 	for (int i = 0; i < count; i++) {
@@ -1888,6 +2116,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.file_open_count = fe->open_count;
 
 			/* Запись в буферный файл (1× write syscall) */
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -1972,6 +2201,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.net_conn_rx_bytes = ne->rx_bytes;
 			cev.net_duration_ms = ne->duration_ns / 1000000;
 
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2073,6 +2303,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				fclose(tcf);
 			}
 
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2146,6 +2377,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2216,6 +2448,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2288,6 +2521,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  cev.sec_remote_addr,
 					  sizeof(cev.sec_remote_addr));
 			}
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2306,6 +2540,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	/* ── EXEC — вызов exec (запуск нового процесса) ──────────────── */
 	case EVENT_EXEC: {
+		/* Update global pid tree (exec may be first time we see this pid) */
+		pidtree_store_ts(e->tgid, e->ppid);
+
 		/* Уже отслеживается? BPF обновил proc_info, нам делать нечего */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) == 0)
@@ -2359,6 +2596,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       rules[first].name,
 					       tags_buf, cg_buf);
 				cev.is_root = 1;
+				fill_parent_pids(&cev);
 				ef_append(&cev, cfg_hostname);
 			}
 		}
@@ -2367,6 +2605,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	/* ── FORK — создание дочернего процесса ──────────────────────── */
 	case EVENT_FORK: {
+		/* Update global pid tree (covers ALL processes, not just tracked) */
+		pidtree_store_ts(e->tgid, e->ppid);
+
 		/* BPF handle_fork уже создал tracked_map и proc_info записи.
 		 * Здесь только наследуем tags (они живут в userspace hash table). */
 		struct track_info parent_ti;
@@ -2396,6 +2637,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				       fork_tags, cg_buf);
 			cev.root_pid = parent_ti.root_pid;
 			cev.tty_nr = child_tty;
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2459,9 +2701,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       sizeof(cg_buf));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg_buf);
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		/* BPF уже удалил запись из tracked_map и proc_map */
+		pidtree_remove_ts(e->tgid);
 		return 0;
 	}
 
@@ -2495,6 +2739,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname,
 				       oom_tags, cg_buf);
+			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -2761,6 +3006,14 @@ static void write_snapshot(void)
 	memcpy(snap_data, tags_data, sizeof(tags_data));
 	pthread_rwlock_unlock(&g_tags_lock);
 #endif
+
+	/* Snapshot pid tree for ancestry chains (512 KB, ~0.1ms) */
+	static __u32 snap_pt_pid[PIDTREE_HT_SIZE];
+	static __u32 snap_pt_ppid[PIDTREE_HT_SIZE];
+	pthread_rwlock_rdlock(&g_pidtree_lock);
+	memcpy(snap_pt_pid, pt_pid, sizeof(pt_pid));
+	memcpy(snap_pt_ppid, pt_ppid, sizeof(pt_ppid));
+	pthread_rwlock_unlock(&g_pidtree_lock);
 
 	long page_size = sysconf(_SC_PAGESIZE);
 	if (page_size <= 0) page_size = 4096;
@@ -3065,6 +3318,9 @@ static void write_snapshot(void)
 					cev.open_tcp_conns = conn_cnt;
 			}
 
+			pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid,
+					       cev.pid, cev.parent_pids,
+					       &cev.parent_pids_len);
 			ef_append(&cev, cfg_hostname);
 			snap_count++;
 		}
@@ -3135,6 +3391,9 @@ static void write_snapshot(void)
 						 "%s", tags_lookup_copy(snap_tgid, snap_data, ukey.tgid));
 #endif
 				}
+				pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid,
+						       cev.pid, cev.parent_pids,
+						       &cev.parent_pids_len);
 				ef_append(&cev, cfg_hostname);
 				udp_count++;
 			}
@@ -3186,6 +3445,9 @@ static void write_snapshot(void)
 				cev.sec_tcp_state = ikey.icmp_type;
 				cev.sec_direction = ikey.icmp_code;
 				cev.open_tcp_conns = ival.count;
+				pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid,
+						       cev.pid, cev.parent_pids,
+						       &cev.parent_pids_len);
 				ef_append(&cev, cfg_hostname);
 				icmp_count++;
 			}
