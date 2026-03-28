@@ -43,17 +43,22 @@
 #define RINGBUF_FILE_EVENTS  4096
 #endif
 #ifndef RINGBUF_NET_EVENTS
-#define RINGBUF_NET_EVENTS   4096
+#define RINGBUF_NET_EVENTS   16384
+#endif
+#ifndef RINGBUF_SEC_EVENTS
+#define RINGBUF_SEC_EVENTS   4096
 #endif
 
 /* Размер слота: sizeof(struct) + заголовок, округлено вверх до степени двойки */
 #define _RINGBUF_PROC_SLOT   512   /* struct event ~450 + 8 */
 #define _RINGBUF_FILE_SLOT   512   /* struct file_event ~300 + 8 */
 #define _RINGBUF_NET_SLOT    256   /* struct net_event ~120 + 8 (макс. из сетевых) */
+#define _RINGBUF_SEC_SLOT    256   /* struct retransmit_event/syn_event/rst_event ~90 + 8 */
 
 #define RINGBUF_PROC_SIZE  _RINGBUF_POW2(RINGBUF_PROC_EVENTS * _RINGBUF_PROC_SLOT)
 #define RINGBUF_FILE_SIZE  _RINGBUF_POW2(RINGBUF_FILE_EVENTS * _RINGBUF_FILE_SLOT)
 #define RINGBUF_NET_SIZE   _RINGBUF_POW2(RINGBUF_NET_EVENTS  * _RINGBUF_NET_SLOT)
+#define RINGBUF_SEC_SIZE   _RINGBUF_POW2(RINGBUF_SEC_EVENTS  * _RINGBUF_SEC_SLOT)
 
 /*
  * Счётчики потерь событий в ring buffer'ах.
@@ -64,10 +69,12 @@ struct ringbuf_stats {
 	__u64 drop_proc;       /* потери в events_proc */
 	__u64 drop_file;       /* потери в events_file */
 	__u64 drop_net;        /* потери в events_net */
+	__u64 drop_sec;        /* потери в events_sec (security: retransmit, syn, rst) */
 	__u64 drop_cgroup;     /* потери в events_cgroup */
 	__u64 total_proc;      /* всего событий proc */
 	__u64 total_file;      /* всего событий file */
 	__u64 total_net;       /* всего событий net */
+	__u64 total_sec;       /* всего событий sec */
 	__u64 total_cgroup;    /* всего событий cgroup */
 	__u64 drop_missed_exec; /* missed_exec_map overflow (ENOSPC) */
 };

@@ -67,11 +67,18 @@ struct {
 	__uint(max_entries, RINGBUF_FILE_SIZE);
 } events_file SEC(".maps");
 
-/* Ring buffer для сетевых и signal событий (net_event, signal_event, retransmit, syn, rst) */
+/* Ring buffer для сетевых и signal событий (net_event, signal_event) */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_NET_SIZE);
 } events_net SEC(".maps");
+
+/* Ring buffer для security событий (retransmit, syn, rst) — отдельный от net,
+ * чтобы security flood не вытеснял net_close/signal события */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_SEC_SIZE);
+} events_sec SEC(".maps");
 
 /* Ring buffer для cgroup событий (struct cgroup_event) */
 struct {
@@ -132,6 +139,8 @@ static __always_inline void rb_stat_inc(__u64 offset)
 #define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
 #define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
 #define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
+#define RB_STAT_TOTAL_SEC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_sec))
+#define RB_STAT_DROP_SEC()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_sec))
 #define RB_STAT_TOTAL_CGROUP() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_cgroup))
 #define RB_STAT_DROP_CGROUP()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_cgroup))
 
@@ -2010,11 +2019,11 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = const struct sock *sk, args[1] = const struct sk_buff *skb */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
-	RB_STAT_TOTAL_NET();
+	RB_STAT_TOTAL_SEC();
 	struct retransmit_event *re =
-		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
-		RB_STAT_DROP_NET();
+		RB_STAT_DROP_SEC();
 		return 0;
 	}
 
@@ -2051,11 +2060,11 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	if (!sec_enabled(SEC_SYN_TRACKING))
 		return 0;
 
-	RB_STAT_TOTAL_NET();
+	RB_STAT_TOTAL_SEC();
 	struct syn_event *se =
-		bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
+		bpf_ringbuf_reserve(&events_sec, sizeof(*se), 0);
 	if (!se) {
-		RB_STAT_DROP_NET();
+		RB_STAT_DROP_SEC();
 		return 0;
 	}
 
@@ -2121,11 +2130,11 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 	if (!sk)
 		return 0;
 
-	RB_STAT_TOTAL_NET();
+	RB_STAT_TOTAL_SEC();
 	struct rst_event *re =
-		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
-		RB_STAT_DROP_NET();
+		RB_STAT_DROP_SEC();
 		return 0;
 	}
 
@@ -2160,11 +2169,11 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	/* args[0] = struct sock *sk */
 	struct sock *sk = (struct sock *)ctx->args[0];
 
-	RB_STAT_TOTAL_NET();
+	RB_STAT_TOTAL_SEC();
 	struct rst_event *re =
-		bpf_ringbuf_reserve(&events_net, sizeof(*re), 0);
+		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
-		RB_STAT_DROP_NET();
+		RB_STAT_DROP_SEC();
 		return 0;
 	}
 

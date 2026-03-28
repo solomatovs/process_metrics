@@ -3856,24 +3856,28 @@ static void write_snapshot(void)
 		if (stats_fd >= 0 &&
 		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
 			if (rs.drop_proc || rs.drop_file || rs.drop_net ||
-			    rs.drop_cgroup || rs.drop_missed_exec) {
+			    rs.drop_sec || rs.drop_cgroup ||
+			    rs.drop_missed_exec) {
 				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
 				       (unsigned long long)rs.total_file,
 				       (unsigned long long)rs.drop_net,
 				       (unsigned long long)rs.total_net,
+				       (unsigned long long)rs.drop_sec,
+				       (unsigned long long)rs.total_sec,
 				       (unsigned long long)rs.drop_cgroup,
 				       (unsigned long long)rs.total_cgroup,
 				       (unsigned long long)rs.drop_missed_exec);
 			} else if (cfg_log_level >= 2) {
 				log_ts("DEBUG",
-				       "ringbuf totals: proc=%llu file=%llu net=%llu cgroup=%llu",
+				       "ringbuf totals: proc=%llu file=%llu net=%llu sec=%llu cgroup=%llu",
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.total_file,
 				       (unsigned long long)rs.total_net,
+				       (unsigned long long)rs.total_sec,
 				       (unsigned long long)rs.total_cgroup);
 			}
 		}
@@ -4178,14 +4182,17 @@ int main(int argc, char *argv[])
 		bpf_map__fd(skel->maps.events_file), handle_event, NULL, NULL);
 	struct ring_buffer *rb_net = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_net), handle_event, NULL, NULL);
+	struct ring_buffer *rb_sec = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_sec), handle_event, NULL, NULL);
 	struct ring_buffer *rb_cgroup = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_cgroup), handle_cgroup_event,
 		NULL, NULL);
-	if (!rb_proc || !rb_file || !rb_net || !rb_cgroup) {
+	if (!rb_proc || !rb_file || !rb_net || !rb_sec || !rb_cgroup) {
 		fprintf(stderr, "FATAL: failed to create ring buffers\n");
 		if (rb_proc)   ring_buffer__free(rb_proc);
 		if (rb_file)   ring_buffer__free(rb_file);
 		if (rb_net)    ring_buffer__free(rb_net);
+		if (rb_sec)    ring_buffer__free(rb_sec);
 		if (rb_cgroup) ring_buffer__free(rb_cgroup);
 		process_metrics_bpf__destroy(skel);
 		return 1;
@@ -4207,6 +4214,7 @@ int main(int argc, char *argv[])
 			ring_buffer__free(rb_proc);
 			ring_buffer__free(rb_file);
 			ring_buffer__free(rb_net);
+			ring_buffer__free(rb_sec);
 			ring_buffer__free(rb_cgroup);
 			process_metrics_bpf__destroy(skel);
 			return 1;
@@ -4247,15 +4255,16 @@ int main(int argc, char *argv[])
 	 *   при mkdir/rmdir/rename.
 	 * Основной поток занимается snapshot и config reload.
 	 */
-	struct poll_thread_arg args[4] = {
+	struct poll_thread_arg args[5] = {
 		{ .rb = rb_proc,   .name = "proc"   },
 		{ .rb = rb_file,   .name = "file"   },
 		{ .rb = rb_net,    .name = "net"    },
+		{ .rb = rb_sec,    .name = "sec"    },
 		{ .rb = rb_cgroup, .name = "cgroup" },
 	};
-	pthread_t poll_threads[4];
+	pthread_t poll_threads[5];
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
 			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
 				args[i].name);
@@ -4314,7 +4323,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Ждём завершения потоков poll */
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 5; i++)
 		pthread_join(poll_threads[i], NULL);
 
 	/* Остановка HTTP-сервера */
@@ -4326,6 +4335,7 @@ int main(int argc, char *argv[])
 	ring_buffer__free(rb_proc);
 	ring_buffer__free(rb_file);
 	ring_buffer__free(rb_net);
+	ring_buffer__free(rb_sec);
 	ring_buffer__free(rb_cgroup);
 	process_metrics_bpf__destroy(skel);
 	free_rules();
