@@ -36,6 +36,8 @@
 static int           g_listen_fd = -1;
 static pthread_t     g_thread;
 static volatile int  g_running;
+static int           g_max_connections;
+static volatile int  g_active_connections;
 
 /* ── форматирование CSV (делегировано csv_format.c) ──────────────── */
 
@@ -322,6 +324,15 @@ static void *server_thread(void *arg)
 			continue;
 		}
 
+		/* Проверяем лимит одновременных подключений */
+		if (__atomic_load_n(&g_active_connections, __ATOMIC_RELAXED) >=
+		    g_max_connections) {
+			close(client_fd);
+			continue;
+		}
+
+		__atomic_add_fetch(&g_active_connections, 1, __ATOMIC_RELAXED);
+
 		struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
 		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
 			   &tv, sizeof(tv));
@@ -330,6 +341,8 @@ static void *server_thread(void *arg)
 
 		handle_request(client_fd, &client_addr);
 		close(client_fd);
+
+		__atomic_sub_fetch(&g_active_connections, 1, __ATOMIC_RELAXED);
 	}
 
 	return NULL;
@@ -341,6 +354,13 @@ int http_server_start(const struct http_config *cfg)
 {
 	if (!cfg->enabled)
 		return 0;
+
+	if (cfg->max_connections <= 0) {
+		fprintf(stderr,
+			"ERROR: http_server: max_connections must be > 0 (got %d)\n",
+			cfg->max_connections);
+		return -1;
+	}
 
 	g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (g_listen_fd < 0) {
@@ -383,6 +403,7 @@ int http_server_start(const struct http_config *cfg)
 	setsockopt(g_listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
 	g_running = 1;
+	g_max_connections = cfg->max_connections;
 
 	if (pthread_create(&g_thread, NULL, server_thread, NULL) != 0) {
 		fprintf(stderr, "ERROR: http_server: pthread_create: %s\n",

@@ -123,9 +123,19 @@ SETTINGS
     merge_with_ttl_timeout = 86400;
 
 
--- ── Шаг 2: INSERT для копирования данных ────────────────────────────
+-- ── Шаг 2: остановка MV и копирование данных ────────────────────────
+-- ВАЖНО: сначала остановите все MV чтобы они не очищали буфер
+-- и не писали в таблицу во время миграции.
+-- Выполните для каждого MV:  SYSTEM STOP VIEW <имя_mv>;
+--
 -- Генерирует INSERT с пересечением колонок. Выполните результат.
 -- При первой установке — пропустите.
+
+SELECT format('SYSTEM STOP VIEW {0};', name)
+FROM system.tables
+WHERE database = currentDatabase()
+  AND engine = 'MaterializedView'
+  AND create_table_query LIKE concat('%TO ', currentDatabase(), '.process_metrics%');
 
 SELECT format(
     'INSERT INTO _pm_target ({0}) SELECT {0} FROM process_metrics SETTINGS max_insert_threads=4, max_execution_time=0;',
@@ -167,7 +177,7 @@ SELECT 'ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;';
 -- Генерирует DROP+CREATE с прежним URL и актуальной структурой.
 -- Выполните если менялся набор колонок в CSV.
 
-SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND RANDOMIZE FOR 1 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (if(tags = '''', [], splitByChar(''|'', tags)) AS tags)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
+SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 1 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (if(tags = '''', [], splitByChar(''|'', tags)) AS tags)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
     mv.name,
     currentDatabase(),
     extractAll(mv.create_table_query, 'url\\(''([^'']+)''')[1],
