@@ -2597,6 +2597,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.uid = ne->uid;
 			memcpy(cev.comm, ne->comm, COMM_LEN);
 
+			/* Identity из proc_map (loginuid, sessionid, euid, tty_nr) */
+			{
+				struct proc_info pi_net;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&ne->tgid, &pi_net) == 0) {
+					cev.loginuid  = pi_net.loginuid;
+					cev.sessionid = pi_net.sessionid;
+					cev.euid      = pi_net.euid;
+					cev.tty_nr    = pi_net.tty_nr;
+				}
+			}
+
 			/* Cgroup из кэша */
 			resolve_cgroup_fast_ts(ne->cgroup_id,
 					       cev.cgroup, sizeof(cev.cgroup));
@@ -4131,7 +4143,7 @@ static void write_snapshot(void)
 					cev.uid = si.uid;
 					cev.is_root = ti.is_root;
 
-					/* comm, ppid из proc_map */
+					/* comm, ppid, identity из proc_map */
 					struct proc_info cpi;
 					if (bpf_map_lookup_elem(
 						proc_map_fd,
@@ -4139,6 +4151,10 @@ static void write_snapshot(void)
 						cev.ppid = cpi.ppid;
 						memcpy(cev.comm, cpi.comm,
 						       COMM_LEN);
+						cev.loginuid  = cpi.loginuid;
+						cev.sessionid = cpi.sessionid;
+						cev.euid      = cpi.euid;
+						cev.tty_nr    = cpi.tty_nr;
 					}
 
 					/* IP-адреса */
