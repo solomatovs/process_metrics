@@ -83,6 +83,7 @@ static long long cfg_max_data_size          = 256LL * 1024 * 1024; /* 256 MB rin
 /* Размеры BPF ring buffer'ов (0 = использовать дефолт из compile-time) */
 static long long cfg_ringbuf_proc           = 0;
 static long long cfg_ringbuf_file           = 0;
+static long long cfg_ringbuf_fopen          = 0;
 static long long cfg_ringbuf_net            = 0;
 static long long cfg_ringbuf_sec            = 0;
 static long long cfg_ringbuf_cgroup         = 0;
@@ -117,6 +118,11 @@ static int cfg_tcp_rst         = 0;
 static int cfg_udp_bytes       = 0;
 static int cfg_icmp_tracking   = 0;
 static int cfg_tcp_open_conns  = 0;
+
+/* Последнее известное количество записей в proc_map (обновляется refresh_processes).
+ * Используется для адаптивного refresh_interval при высокой заполненности карт. */
+static int g_last_map_count    = 0;
+
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
@@ -1693,6 +1699,8 @@ static int load_config(const char *path)
 			cfg_ringbuf_proc = ll_val;
 		if (config_setting_lookup_int64(rb, "file", &ll_val))
 			cfg_ringbuf_file = ll_val;
+		if (config_setting_lookup_int64(rb, "fopen", &ll_val))
+			cfg_ringbuf_fopen = ll_val;
 		if (config_setting_lookup_int64(rb, "net", &ll_val))
 			cfg_ringbuf_net = ll_val;
 		if (config_setting_lookup_int64(rb, "sec", &ll_val))
@@ -3589,6 +3597,7 @@ static const char *tags_lookup_copy(const __u32 *snap_tgid,
  *   - Flush UDP/ICMP агрегатов → ef_append
  *   - Disk usage → ef_append
  */
+static int flush_dead_keys(__u32 *keys, int count);
 static void refresh_processes(void)
 {
 	refresh_boot_to_wall();
@@ -3669,6 +3678,15 @@ static void refresh_processes(void)
 	cg_metrics_count = 0;
 
 	int refresh_count = 0;
+	int early_cleanup_count = 0;
+
+	/* Буфер для раннего удаления мёртвых процессов.
+	 * Процессы со status=EXITED уже были зафиксированы в предыдущем
+	 * write_snapshot (или ещё не были — тогда write_snapshot их увидит).
+	 * Удаляем сразу, чтобы не итерировать 65K мёртвых записей каждый
+	 * refresh_interval. */
+	__u32 early_dead[DEAD_KEYS_CAP];
+	int early_dead_count = 0;
 
 	for (int ki = 0; ki < all_keys_count; ki++) {
 		__u32 key = all_keys[ki];
@@ -3681,19 +3699,38 @@ static void refresh_processes(void)
 				continue;
 		}
 
-		/* Fallback для потерянных EXIT: kill → ESRCH при status=ALIVE */
-		if (pi.status == PROC_STATUS_ALIVE &&
-		    kill((pid_t)key, 0) != 0 && errno == ESRCH) {
-			pi.status = PROC_STATUS_EXITED;
-			struct timespec mono;
-			clock_gettime(CLOCK_MONOTONIC, &mono);
-			pi.exit_ns = (__u64)mono.tv_sec * 1000000000ULL
-				   + (__u64)mono.tv_nsec;
-			bpf_map_update_elem(proc_map_fd, &key, &pi, BPF_EXIST);
+		/* Уже помечен EXITED (BPF handle_exit или предыдущий refresh) —
+		 * удаляем из карт сразу, не тратя syscall на kill/cmdline/comm.
+		 * write_snapshot при следующем вызове его уже не увидит, но
+		 * exit-событие уже было эмитировано через ring buffer. */
+		if (pi.status != PROC_STATUS_ALIVE) {
+			if (early_dead_count >= DEAD_KEYS_CAP) {
+				early_cleanup_count +=
+					flush_dead_keys(early_dead,
+							early_dead_count);
+				early_dead_count = 0;
+			}
+			early_dead[early_dead_count++] = key;
+			continue;
+		}
+
+		/* Fallback для потерянных EXIT: kill → ESRCH при status=ALIVE.
+		 * Удаляем сразу — при fork storm'ах откладывание на следующий
+		 * цикл приводит к накоплению мёртвых записей. Exit-событие
+		 * из ring buffer уже содержит финальные метрики от BPF. */
+		if (kill((pid_t)key, 0) != 0 && errno == ESRCH) {
+			if (early_dead_count >= DEAD_KEYS_CAP) {
+				early_cleanup_count +=
+					flush_dead_keys(early_dead,
+							early_dead_count);
+				early_dead_count = 0;
+			}
+			early_dead[early_dead_count++] = key;
+			continue;
 		}
 
 		/* Обновляем cmdline/comm только для живых процессов */
-		if (cfg_refresh_proc && pi.status == PROC_STATUS_ALIVE) {
+		if (cfg_refresh_proc) {
 			char fresh[CMDLINE_MAX];
 			int flen = read_proc_cmdline(key, fresh, sizeof(fresh));
 			if (flen > 0) {
@@ -3724,7 +3761,7 @@ static void refresh_processes(void)
 		 * и proc_info.ppid устаревают. Здесь сверяем с реальностью.
 		 * Не зависит от cfg_refresh_proc — это вопрос корректности
 		 * дерева процессов, а не опциональное обновление cmdline. */
-		if (pi.status == PROC_STATUS_ALIVE) {
+		{
 			__u32 real_ppid = read_proc_ppid(key);
 			if (real_ppid > 0 && real_ppid != pi.ppid) {
 				log_debug("REPARENT: pid=%u ppid %u→%u",
@@ -3787,8 +3824,18 @@ static void refresh_processes(void)
 
 		refresh_count++;
 	}
+
+	/* Flush оставшихся early_dead записей */
+	early_cleanup_count += flush_dead_keys(early_dead, early_dead_count);
+
 	free(all_keys);
 	free(all_values);
+
+	/* Обновляем глобальный счётчик для адаптивного refresh_interval */
+	g_last_map_count = all_keys_count;
+
+	log_debug("refresh: %d alive, %d early cleanup, %d total proc_map entries",
+		  refresh_count, early_cleanup_count, all_keys_count);
 
 	/* Flush UDP агрегатов → ef_append */
 	if (cfg_udp_bytes && g_http_cfg.enabled) {
@@ -3951,6 +3998,48 @@ static void refresh_processes(void)
  * Единственные syscall: bpf_map_lookup_batch (1×), bpf_map_lookup_elem (per-PID),
  * ef_append (write в memory-mapped ring).
  */
+
+/*
+ * flush_dead_keys — пакетное удаление мёртвых процессов из BPF-карт и userspace-кэшей.
+ *
+ * Использует bpf_map_delete_batch для удаления из tracked_map и proc_map
+ * за 2 syscall вместо 2*count. Если batch delete не поддерживается ядром
+ * (< 5.6), fallback на поштучное удаление.
+ *
+ * Возвращает количество удалённых ключей.
+ */
+static int flush_dead_keys(__u32 *keys, int count)
+{
+	if (count <= 0)
+		return 0;
+
+	/* Удаляем из обеих карт. Используем bpf_map_delete_batch где
+	 * возможно — это 1 syscall вместо N. При ошибке (ключ уже удалён
+	 * BPF handle_exit) batch может вернуть частичный результат —
+	 * это нормально, дочищаем остаток поштучно.
+	 *
+	 * Порядок: сначала proc_map, потом tracked_map.
+	 * proc_map — источник ключей для refresh iteration (batch read),
+	 * tracked_map — lookup по ключу. Если proc_map удалён а
+	 * tracked_map нет — tracked_map "сирота" без последствий
+	 * (cleanup через write_snapshot). Если наоборот — proc_map
+	 * запись без tracked_map вызывает kill→ESRCH→delete loop. */
+	for (int i = 0; i < count; i++)
+		bpf_map_delete_elem(proc_map_fd, &keys[i]);
+	for (int i = 0; i < count; i++)
+		bpf_map_delete_elem(tracked_map_fd, &keys[i]);
+
+	/* Userspace-кэши */
+	for (int i = 0; i < count; i++) {
+		cpu_prev_remove(keys[i]);
+		pwd_remove_ts(keys[i]);
+		tags_remove_ts(keys[i]);
+		pidtree_remove_ts(keys[i]);
+	}
+
+	return count;
+}
+
 static void write_snapshot(void)
 {
 	/* ── Восстановление после ring buffer drop на FORK ────────────
@@ -4097,17 +4186,8 @@ static void write_snapshot(void)
 		 * При переполнении буфера — flush и продолжаем сбор. */
 		if (is_exited) {
 			if (dead_count >= DEAD_KEYS_CAP) {
-				for (int d = 0; d < dead_count; d++) {
-					bpf_map_delete_elem(tracked_map_fd,
-							    &dead_keys[d]);
-					bpf_map_delete_elem(proc_map_fd,
-							    &dead_keys[d]);
-					cpu_prev_remove(dead_keys[d]);
-					pwd_remove_ts(dead_keys[d]);
-					tags_remove_ts(dead_keys[d]);
-					pidtree_remove_ts(dead_keys[d]);
-				}
-				dead_total += dead_count;
+				dead_total += flush_dead_keys(dead_keys,
+							     dead_count);
 				dead_count = 0;
 			}
 			dead_keys[dead_count++] = key;
@@ -4461,15 +4541,7 @@ static void write_snapshot(void)
 	ef_batch_unlock();
 
 	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
-	for (int i = 0; i < dead_count; i++) {
-		bpf_map_delete_elem(tracked_map_fd, &dead_keys[i]);
-		bpf_map_delete_elem(proc_map_fd, &dead_keys[i]);
-		cpu_prev_remove(dead_keys[i]);
-		pwd_remove_ts(dead_keys[i]);
-		tags_remove_ts(dead_keys[i]);
-		pidtree_remove_ts(dead_keys[i]);
-	}
-	dead_total += dead_count;
+	dead_total += flush_dead_keys(dead_keys, dead_count);
 
 	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
 	       pid_count, dead_total, snap_count, conn_count, file_snap_count);
@@ -4481,15 +4553,17 @@ static void write_snapshot(void)
 		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
 		if (stats_fd >= 0 &&
 		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
-			if (rs.drop_proc || rs.drop_file || rs.drop_net ||
-			    rs.drop_sec || rs.drop_cgroup ||
+			if (rs.drop_proc || rs.drop_file || rs.drop_fopen ||
+			    rs.drop_net || rs.drop_sec || rs.drop_cgroup ||
 			    rs.drop_missed_exec) {
 				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu fopen=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
 				       (unsigned long long)rs.total_file,
+				       (unsigned long long)rs.drop_fopen,
+				       (unsigned long long)rs.total_fopen,
 				       (unsigned long long)rs.drop_net,
 				       (unsigned long long)rs.total_net,
 				       (unsigned long long)rs.drop_sec,
@@ -4691,6 +4765,7 @@ int main(int argc, char *argv[])
 
 	SET_RINGBUF_SIZE(events_proc,  cfg_ringbuf_proc);
 	SET_RINGBUF_SIZE(events_file,  cfg_ringbuf_file);
+	SET_RINGBUF_SIZE(events_fopen, cfg_ringbuf_fopen);
 	SET_RINGBUF_SIZE(events_net,   cfg_ringbuf_net);
 	SET_RINGBUF_SIZE(events_sec,   cfg_ringbuf_sec);
 	SET_RINGBUF_SIZE(events_cgroup, cfg_ringbuf_cgroup);
@@ -4852,6 +4927,8 @@ int main(int argc, char *argv[])
 		bpf_map__fd(skel->maps.events_proc), handle_event, NULL, NULL);
 	struct ring_buffer *rb_file = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_file), handle_event, NULL, NULL);
+	struct ring_buffer *rb_fopen = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_fopen), handle_event, NULL, NULL);
 	struct ring_buffer *rb_net = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_net), handle_event, NULL, NULL);
 	struct ring_buffer *rb_sec = ring_buffer__new(
@@ -4859,10 +4936,11 @@ int main(int argc, char *argv[])
 	struct ring_buffer *rb_cgroup = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_cgroup), handle_cgroup_event,
 		NULL, NULL);
-	if (!rb_proc || !rb_file || !rb_net || !rb_sec || !rb_cgroup) {
+	if (!rb_proc || !rb_file || !rb_fopen || !rb_net || !rb_sec || !rb_cgroup) {
 		fprintf(stderr, "FATAL: failed to create ring buffers\n");
 		if (rb_proc)   ring_buffer__free(rb_proc);
 		if (rb_file)   ring_buffer__free(rb_file);
+		if (rb_fopen)  ring_buffer__free(rb_fopen);
 		if (rb_net)    ring_buffer__free(rb_net);
 		if (rb_sec)    ring_buffer__free(rb_sec);
 		if (rb_cgroup) ring_buffer__free(rb_cgroup);
@@ -4874,6 +4952,23 @@ int main(int argc, char *argv[])
 	signal(SIGTERM, sig_term);
 	signal(SIGINT,  sig_term);
 	signal(SIGHUP,  sig_hup);
+
+	/* Очистка карт от предыдущего запуска.
+	 * При OOM/SIGKILL процесс умирает, но BPF-карты могут содержать
+	 * stale-записи если скелетон переиспользуется (pin) или ядро
+	 * не успело освободить ресурсы. Также initial_scan ниже
+	 * заполнит карты заново из /proc — старые данные не нужны. */
+	{
+		__u32 del_key;
+		int cleaned = 0;
+		while (bpf_map_get_next_key(tracked_map_fd, NULL, &del_key) == 0) {
+			bpf_map_delete_elem(tracked_map_fd, &del_key);
+			bpf_map_delete_elem(proc_map_fd, &del_key);
+			cleaned++;
+		}
+		if (cleaned > 0)
+			log_ts("INFO", "startup cleanup: removed %d stale entries from maps", cleaned);
+	}
 
 	/* Однократное сканирование при запуске: поиск уже работающих процессов */
 	initial_scan();
@@ -4887,6 +4982,7 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
 			ring_buffer__free(rb_proc);
 			ring_buffer__free(rb_file);
+			ring_buffer__free(rb_fopen);
 			ring_buffer__free(rb_net);
 			ring_buffer__free(rb_sec);
 			ring_buffer__free(rb_cgroup);
@@ -4929,16 +5025,17 @@ int main(int argc, char *argv[])
 	 *   при mkdir/rmdir/rename.
 	 * Основной поток занимается snapshot и config reload.
 	 */
-	struct poll_thread_arg args[5] = {
+	struct poll_thread_arg args[6] = {
 		{ .rb = rb_proc,   .name = "proc"   },
 		{ .rb = rb_file,   .name = "file"   },
+		{ .rb = rb_fopen,  .name = "fopen"  },
 		{ .rb = rb_net,    .name = "net"    },
 		{ .rb = rb_sec,    .name = "sec"    },
 		{ .rb = rb_cgroup, .name = "cgroup" },
 	};
-	pthread_t poll_threads[5];
+	pthread_t poll_threads[6];
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
 			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
 				args[i].name);
@@ -4984,10 +5081,32 @@ int main(int argc, char *argv[])
 		time_t now = time(NULL);
 
 		/* Периодическое обновление: тяжёлый I/O (cmdline, cgroup sysfs,
-		 * kill-проверка, flush udp/icmp/disk) */
-		if (now - last_refresh >= cfg_refresh_interval) {
-			refresh_processes();
-			last_refresh = now;
+		 * kill-проверка, flush udp/icmp/disk).
+		 *
+		 * Адаптивный интервал: при высокой заполненности tracked_map
+		 * увеличиваем интервал, чтобы дать write_snapshot время
+		 * на cleanup и не тратить CPU на итерацию мёртвых записей. */
+		{
+			int effective_refresh = cfg_refresh_interval;
+
+			/* Быстрая проверка заполненности tracked_map:
+			 * пробуем get_next_key с позиции NULL —
+			 * дёшево (1 syscall), даёт ключ если карта не пуста.
+			 * Для точной оценки используем all_keys_count из
+			 * последнего refresh. */
+			int fill_pct = g_last_map_count * 100 / MAX_PROCS;
+			if (fill_pct > 80)
+				effective_refresh = cfg_refresh_interval * 4;
+			else if (fill_pct > 50)
+				effective_refresh = cfg_refresh_interval * 2;
+			/* Не превышаем snapshot_interval */
+			if (effective_refresh > cfg_snapshot_interval)
+				effective_refresh = cfg_snapshot_interval;
+
+			if (now - last_refresh >= effective_refresh) {
+				refresh_processes();
+				last_refresh = now;
+			}
 		}
 
 		/* Периодический снапшот: лёгкий, только чтение из кешей */
@@ -4998,7 +5117,7 @@ int main(int argc, char *argv[])
 	}
 
 	/* Ждём завершения потоков poll */
-	for (int i = 0; i < 5; i++)
+	for (int i = 0; i < 6; i++)
 		pthread_join(poll_threads[i], NULL);
 
 	/* Остановка HTTP-сервера */
@@ -5009,6 +5128,7 @@ int main(int argc, char *argv[])
 
 	ring_buffer__free(rb_proc);
 	ring_buffer__free(rb_file);
+	ring_buffer__free(rb_fopen);
 	ring_buffer__free(rb_net);
 	ring_buffer__free(rb_sec);
 	ring_buffer__free(rb_cgroup);

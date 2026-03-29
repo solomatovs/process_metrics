@@ -42,7 +42,7 @@
 #define DOCKER_NAME_CACHE_SIZE 256  /* кеш имён Docker-контейнеров */
 #define UID_NAME_CACHE_SIZE  512    /* кеш uid→username */
 #define MAX_SCAN             8192   /* макс. итераций сканирования /proc */
-#define DEAD_KEYS_CAP        256    /* буфер мёртвых ключей для удаления */
+#define DEAD_KEYS_CAP        4096   /* буфер мёртвых ключей для удаления */
 
 /* ── ёмкости дисковых и файловых массивов ──────────────────────────── */
 #define DISK_MAX_PREFIXES    32     /* макс. префиксов disk_include */
@@ -94,10 +94,13 @@
 	 1U << (32 - __builtin_clz((unsigned)((x) - 1))))
 
 #ifndef RINGBUF_PROC_EVENTS
-#define RINGBUF_PROC_EVENTS  8192
+#define RINGBUF_PROC_EVENTS  2048   /* struct event=4320B → 2048 × 4352 = 16 MB */
 #endif
 #ifndef RINGBUF_FILE_EVENTS
-#define RINGBUF_FILE_EVENTS  12288
+#define RINGBUF_FILE_EVENTS  4096   /* struct file_event=2152B → 4096 × 2176 = 16 MB */
+#endif
+#ifndef RINGBUF_FOPEN_EVENTS
+#define RINGBUF_FOPEN_EVENTS 2048   /* struct file_event=2152B → 2048 × 2176 = 4 MB (шумный, допустимы потери) */
 #endif
 #ifndef RINGBUF_NET_EVENTS
 #define RINGBUF_NET_EVENTS   32768
@@ -106,16 +109,21 @@
 #define RINGBUF_SEC_EVENTS   8192
 #endif
 
-/* Размер слота: sizeof(struct) + заголовок, округлено вверх до степени двойки */
-#define _RINGBUF_PROC_SLOT   512   /* struct event ~450 + 8 */
-#define _RINGBUF_FILE_SLOT   2560  /* struct file_event ~2150 (path+path2 по BPF_FILE_PATH_MAX) */
-#define _RINGBUF_NET_SLOT    256   /* struct net_event ~120 + 8 (макс. из сетевых) */
-#define _RINGBUF_SEC_SLOT    256   /* struct retransmit_event/syn_event/rst_event ~90 + 8 */
+/* Размер слота: sizeof(struct) + 8 (BPF_RINGBUF_HDR_SZ), для расчёта ёмкости.
+ * BPF ring buffer аллоцирует реальный sizeof при reserve, слот — только для
+ * вычисления RINGBUF_*_SIZE = POW2(events × slot).
+ * ВАЖНО: слот должен быть >= sizeof(struct) + 8, иначе реальная ёмкость
+ * будет меньше заявленной. */
+#define _RINGBUF_PROC_SLOT   4352  /* struct event (4320) + 8 + padding */
+#define _RINGBUF_FILE_SLOT   2176  /* struct file_event (2152) + 8 + padding */
+#define _RINGBUF_NET_SLOT    256   /* struct net_event (136) + 8 */
+#define _RINGBUF_SEC_SLOT    128   /* struct retransmit_event/syn_event/rst_event (88) + 8 */
 
-#define RINGBUF_PROC_SIZE  _RINGBUF_POW2(RINGBUF_PROC_EVENTS * _RINGBUF_PROC_SLOT)
-#define RINGBUF_FILE_SIZE  _RINGBUF_POW2(RINGBUF_FILE_EVENTS * _RINGBUF_FILE_SLOT)
-#define RINGBUF_NET_SIZE   _RINGBUF_POW2(RINGBUF_NET_EVENTS  * _RINGBUF_NET_SLOT)
-#define RINGBUF_SEC_SIZE   _RINGBUF_POW2(RINGBUF_SEC_EVENTS  * _RINGBUF_SEC_SLOT)
+#define RINGBUF_PROC_SIZE   _RINGBUF_POW2(RINGBUF_PROC_EVENTS  * _RINGBUF_PROC_SLOT)
+#define RINGBUF_FILE_SIZE   _RINGBUF_POW2(RINGBUF_FILE_EVENTS  * _RINGBUF_FILE_SLOT)
+#define RINGBUF_FOPEN_SIZE  _RINGBUF_POW2(RINGBUF_FOPEN_EVENTS * _RINGBUF_FILE_SLOT)
+#define RINGBUF_NET_SIZE    _RINGBUF_POW2(RINGBUF_NET_EVENTS   * _RINGBUF_NET_SLOT)
+#define RINGBUF_SEC_SIZE    _RINGBUF_POW2(RINGBUF_SEC_EVENTS   * _RINGBUF_SEC_SLOT)
 
 /*
  * Счётчики потерь событий в ring buffer'ах.
@@ -124,12 +132,14 @@
  */
 struct ringbuf_stats {
 	__u64 drop_proc;       /* потери в events_proc */
-	__u64 drop_file;       /* потери в events_file */
+	__u64 drop_file;       /* потери в events_file (close/rename/chmod/...) */
+	__u64 drop_fopen;      /* потери в events_fopen (file_open) */
 	__u64 drop_net;        /* потери в events_net */
 	__u64 drop_sec;        /* потери в events_sec (security: retransmit, syn, rst) */
 	__u64 drop_cgroup;     /* потери в events_cgroup */
 	__u64 total_proc;      /* всего событий proc */
-	__u64 total_file;      /* всего событий file */
+	__u64 total_file;      /* всего событий file (close/rename/chmod/...) */
+	__u64 total_fopen;     /* всего событий fopen */
 	__u64 total_net;       /* всего событий net */
 	__u64 total_sec;       /* всего событий sec */
 	__u64 total_cgroup;    /* всего событий cgroup */

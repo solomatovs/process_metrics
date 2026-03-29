@@ -105,13 +105,21 @@ struct {
 	__uint(max_entries, RINGBUF_PROC_SIZE);
 } events_proc SEC(".maps");
 
-/* Ring buffer для файловых событий (struct file_event) */
+/* Ring buffer для файловых мутаций: close/rename/unlink/truncate/chmod/chown
+ * (аудитно-важные, потеря недопустима) */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_FILE_SIZE);
 } events_file SEC(".maps");
 
-/* Ring buffer для сетевых и signal событий (net_event, signal_event) */
+/* Ring buffer для file_open — шумный, допустимы потери при storm.
+ * Отделён от events_file чтобы не вытеснять close/rename/chmod. */
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, RINGBUF_FOPEN_SIZE);
+} events_fopen SEC(".maps");
+
+/* Ring buffer для сетевых событий (net_event) */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_NET_SIZE);
@@ -179,9 +187,11 @@ static __always_inline void rb_stat_inc(__u64 offset)
 
 #define RB_STAT_TOTAL_PROC()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
 #define RB_STAT_TOTAL_FILE()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
+#define RB_STAT_TOTAL_FOPEN() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_fopen))
 #define RB_STAT_TOTAL_NET()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_net))
 #define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
 #define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
+#define RB_STAT_DROP_FOPEN()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_fopen))
 #define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
 #define RB_STAT_TOTAL_SEC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_sec))
 #define RB_STAT_DROP_SEC()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_sec))
@@ -728,7 +738,13 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	child_ti.root_pid = parent_ti->root_pid;
 	child_ti.rule_id  = parent_ti->rule_id;
 	child_ti.is_root  = 0;
-	bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti, BPF_NOEXIST);
+	/* BPF_NOEXIST: если карта полна (-E2BIG) — не отслеживаем ребёнка.
+	 * Это защита от fork storm'ов: при переполнении tracked_map
+	 * новые короткоживущие процессы не добавляются, что позволяет
+	 * userspace cleanup дренировать карту. */
+	if (bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti,
+				BPF_NOEXIST) != 0)
+		return 0;
 
 	/* Создаём proc_info для потомка через per-CPU scratch buffer
 	 * (proc_info превышает 512-байтовый лимит стека BPF) */
@@ -1024,8 +1040,8 @@ int handle_exit(void *ctx)
 	__u32 final_exit_code = BPF_CORE_READ(task, exit_code);
 	__u64 exit_ts        = bpf_ktime_get_boot_ns();
 
-	/* Помечаем proc_info как завершённый + обновляем финальные метрики.
-	 * Карты НЕ удаляем — snapshot прочитает и зачистит */
+	/* Финальные метрики из proc_info. Карты удаляются ПОСЛЕ отправки
+	 * exit-события, чтобы не инвалидировать указатель info. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
 		info->status        = PROC_STATUS_EXITED;
@@ -1093,6 +1109,15 @@ int handle_exit(void *ctx)
 	}
 
 	bpf_ringbuf_submit(e, 0);
+
+	/* Удаляем карты ПОСЛЕ отправки exit-события.
+	 * При fork storm'ах отложенный cleanup в userspace не успевает:
+	 * карты забиваются до 65K мёртвыми записями, refresh_processes
+	 * тратит 100% CPU на итерацию kill(pid,0)→ESRCH.
+	 * Удаление в BPF — O(1), мгновенно освобождает слот. */
+	bpf_map_delete_elem(&tracked_map, &tgid);
+	bpf_map_delete_elem(&proc_map, &tgid);
+
 	return 0;
 }
 
@@ -1200,10 +1225,10 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
 		return 0;
 
-	RB_STAT_TOTAL_NET();
-	struct signal_event *se = bpf_ringbuf_reserve(&events_net, sizeof(*se), 0);
+	RB_STAT_TOTAL_PROC();
+	struct signal_event *se = bpf_ringbuf_reserve(&events_proc, sizeof(*se), 0);
 	if (!se) {
-		RB_STAT_DROP_NET();
+		RB_STAT_DROP_PROC();
 		return 0;
 	}
 
@@ -1514,9 +1539,11 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 	bpf_map_update_elem(&fd_map, &fk, fi, BPF_ANY);
 	bpf_map_delete_elem(&openat_args_map, &pid_tgid);
 
-	/* Отправляем событие file_open через кольцевой буфер */
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	/* Отправляем событие file_open через отдельный ring buffer (events_fopen).
+	 * Отделён от events_file чтобы шумный file_open не вытеснял
+	 * аудитно-важные close/rename/chmod. */
+	RB_STAT_TOTAL_FOPEN();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_fopen, sizeof(*fe), 0);
 	if (fe) {
 		BPF_ZERO_PTR(fe, sizeof(*fe));
 		fe->type = EVENT_FILE_OPEN;
@@ -1535,7 +1562,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 
 		bpf_ringbuf_submit(fe, 0);
 	} else {
-		RB_STAT_DROP_FILE();
+		RB_STAT_DROP_FOPEN();
 	}
 
 	return 0;
