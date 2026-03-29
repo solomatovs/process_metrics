@@ -2447,8 +2447,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Время: BPF boot_ns → wall clock через предвычисленное смещение */
 			cev.timestamp_ns = fe->timestamp_ns
 					 + (__u64)g_boot_to_wall_ns;
-			snprintf(cev.event_type, sizeof(cev.event_type),
-				 "file_close");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    "file_close");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги из userspace hash table (O(1)) */
@@ -2465,8 +2465,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       cev.cgroup, sizeof(cev.cgroup));
 
 			/* Файловые метрики: путь, флаги, прочитано/записано, кол-во открытий */
-			snprintf(cev.file_path, sizeof(cev.file_path),
-				 "%s", fe->path);
+			fast_strcpy(cev.file_path, sizeof(cev.file_path),
+				    fe->path);
 			cev.file_flags = (__u32)fe->flags;
 			cev.file_read_bytes = fe->read_bytes;
 			cev.file_write_bytes = fe->write_bytes;
@@ -2626,8 +2626,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
 					 + (__u64)ts_now.tv_nsec;
-			snprintf(cev.event_type, sizeof(cev.event_type),
-				 "signal");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    "signal");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги: сначала отправителя, потом получателя */
@@ -2635,7 +2635,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			tags_lookup_ts(se->sender_tgid, sig_tags, sizeof(sig_tags));
 			if (!sig_tags[0])
 				tags_lookup_ts(se->target_pid, sig_tags, sizeof(sig_tags));
-			snprintf(cev.tags, sizeof(cev.tags), "%s", sig_tags);
+			fast_strcpy(cev.tags, sizeof(cev.tags), sig_tags);
 
 			/* Данные отправителя из tracked_map */
 			if (bpf_map_lookup_elem(tracked_map_fd,
@@ -2647,8 +2647,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.uid = se->sender_uid;
 			memcpy(cev.comm, se->sender_comm, COMM_LEN);
 			if (cg_buf[0])
-				snprintf(cev.cgroup, sizeof(cev.cgroup),
-					 "%s", cg_buf);
+				fast_strcpy(cev.cgroup, sizeof(cev.cgroup),
+					    cg_buf);
 
 			/* Идентификация отправителя из proc_info (loginuid, tty, ...) */
 			struct proc_info sender_pi;
@@ -2675,9 +2675,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			if (tcf) {
 				if (fgets(tcomm_buf, sizeof(tcomm_buf), tcf)) {
 					tcomm_buf[strcspn(tcomm_buf, "\n")] = 0;
-					snprintf(cev.sig_target_comm,
-						 sizeof(cev.sig_target_comm),
-						 "%s", tcomm_buf);
+					fast_strcpy(cev.sig_target_comm,
+						    sizeof(cev.sig_target_comm),
+						    tcomm_buf);
 				}
 				fclose(tcf);
 			}
