@@ -1670,11 +1670,59 @@ static __always_inline void read_sock_addrs(struct sock *sk,
 }
 
 /*
+ * Отправка события NET_LISTEN/NET_CONNECT/NET_ACCEPT из sock_info.
+ */
+static __always_inline void emit_net_event(struct sock_info *si,
+					   __u64 now_ns,
+					   __u32 evt_type)
+{
+	__u32 zero = 0;
+	struct net_config *nc = bpf_map_lookup_elem(&net_cfg, &zero);
+	if (!nc || !nc->enabled)
+		return;
+
+	RB_STAT_TOTAL_NET();
+	struct net_event *ne = bpf_ringbuf_reserve(&events_net, sizeof(*ne), 0);
+	if (!ne) {
+		RB_STAT_DROP_NET();
+		return;
+	}
+
+	__builtin_memset(ne, 0, sizeof(*ne));
+	ne->type         = evt_type;
+	ne->tgid         = si->tgid;
+	ne->uid          = si->uid;
+	ne->timestamp_ns = now_ns;
+	ne->cgroup_id    = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(ne->comm, sizeof(ne->comm));
+
+	struct task_struct *task =
+		(struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	ne->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+	ne->af = si->af;
+	__builtin_memcpy(ne->local_addr, si->local_addr, 16);
+	__builtin_memcpy(ne->remote_addr, si->remote_addr, 16);
+	ne->local_port  = si->local_port;
+	ne->remote_port = si->remote_port;
+
+	bpf_ringbuf_submit(ne, 0);
+}
+
+/*
  * Отправка события NET_CLOSE из sock_info.
  */
 static __always_inline void emit_net_close(struct sock_info *si,
-					   __u64 now_ns)
+					   __u64 now_ns,
+					   __u8 tcp_state)
 {
+	/* net_close только если net_tracking.enabled = true */
+	__u32 zero = 0;
+	struct net_config *nc = bpf_map_lookup_elem(&net_cfg, &zero);
+	if (!nc || !nc->enabled)
+		return;
+
 	RB_STAT_TOTAL_NET();
 	struct net_event *ne = bpf_ringbuf_reserve(&events_net, sizeof(*ne), 0);
 	if (!ne) {
@@ -1703,7 +1751,10 @@ static __always_inline void emit_net_close(struct sock_info *si,
 	ne->remote_port = si->remote_port;
 	ne->tx_bytes    = si->tx_bytes;
 	ne->rx_bytes    = si->rx_bytes;
+	ne->tx_calls    = si->tx_calls;
+	ne->rx_calls    = si->rx_calls;
 	ne->duration_ns = (now_ns > si->start_ns) ? now_ns - si->start_ns : 0;
+	ne->tcp_state   = tcp_state;
 
 	bpf_ringbuf_submit(ne, 0);
 }
@@ -1747,6 +1798,7 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	emit_net_event(&si, si.start_ns, EVENT_NET_CONNECT);
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
@@ -1795,6 +1847,7 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	emit_net_event(&si, si.start_ns, EVENT_NET_CONNECT);
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
@@ -1827,6 +1880,7 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	emit_net_event(&si, si.start_ns, EVENT_NET_ACCEPT);
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
@@ -1857,6 +1911,7 @@ int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
 	read_sock_addrs(sk, &si);
 
 	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	emit_net_event(&si, si.start_ns, EVENT_NET_LISTEN);
 	return 0;
 }
 
@@ -1895,7 +1950,11 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
 
-	emit_net_close(si, bpf_ktime_get_boot_ns());
+	/* TCP state на момент close:
+	 * ESTABLISHED(1) = инициатор закрытия (шлёт FIN первым)
+	 * CLOSE_WAIT(8)  = реагирует на чужой FIN */
+	__u8 tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
+	emit_net_close(si, bpf_ktime_get_boot_ns(), tcp_state);
 
 	/* Сохраняем sk_ptr для kretprobe (отложенное удаление из sock_map) */
 	__u32 zero = 0;
@@ -1949,8 +2008,10 @@ int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
 	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
 		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
-		if (si)
+		if (si) {
 			__sync_fetch_and_add(&si->tx_bytes, (__u64)ret);
+			__sync_fetch_and_add(&si->tx_calls, 1);
+		}
 	}
 	return 0;
 }
@@ -1985,8 +2046,10 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
 		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
-		if (si)
+		if (si) {
 			__sync_fetch_and_add(&si->rx_bytes, (__u64)ret);
+			__sync_fetch_and_add(&si->rx_calls, 1);
+		}
 	}
 	return 0;
 }
@@ -2056,9 +2119,9 @@ static __always_inline int sec_enabled(int offset)
 }
 
 #define SEC_TCP_RETRANSMIT  0
-#define SEC_SYN_TRACKING    1
-#define SEC_RST_TRACKING    2
-#define SEC_UDP_TRACKING    3
+#define SEC_TCP_SYN         1
+#define SEC_TCP_RST         2
+#define SEC_UDP_BYTES       3
 #define SEC_ICMP_TRACKING   4
 #define SEC_OPEN_CONN_COUNT 5
 
@@ -2147,7 +2210,7 @@ SEC("kprobe/tcp_conn_request")
 int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 	       const void *af_ops, struct sock *sk, struct sk_buff *skb)
 {
-	if (!sec_enabled(SEC_SYN_TRACKING))
+	if (!sec_enabled(SEC_TCP_SYN))
 		return 0;
 
 	/* Только для слушающих сокетов отслеживаемых процессов */
@@ -2221,7 +2284,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 SEC("raw_tracepoint/tcp_send_reset")
 int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 {
-	if (!sec_enabled(SEC_RST_TRACKING))
+	if (!sec_enabled(SEC_TCP_RST))
 		return 0;
 
 	/* args[0] = const struct sock *sk (может быть NULL), args[1] = struct sk_buff *skb */
@@ -2271,7 +2334,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 SEC("kprobe/tcp_send_active_reset")
 int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 {
-	if (!sec_enabled(SEC_RST_TRACKING))
+	if (!sec_enabled(SEC_TCP_RST))
 		return 0;
 
 	__u64 sk_ptr = (__u64)sk;
@@ -2313,7 +2376,7 @@ int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 SEC("raw_tracepoint/tcp_receive_reset")
 int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 {
-	if (!sec_enabled(SEC_RST_TRACKING))
+	if (!sec_enabled(SEC_TCP_RST))
 		return 0;
 
 	/* args[0] = struct sock *sk */
@@ -2369,7 +2432,7 @@ struct {
 SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(kp_udp_sendmsg_sec, struct sock *sk)
 {
-	if (!sec_enabled(SEC_UDP_TRACKING))
+	if (!sec_enabled(SEC_UDP_BYTES))
 		return 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
@@ -2425,7 +2488,7 @@ int BPF_KRETPROBE(ret_udp_sendmsg_sec, int ret)
 SEC("kprobe/udp_recvmsg")
 int BPF_KPROBE(kp_udp_recvmsg_sec, struct sock *sk)
 {
-	if (!sec_enabled(SEC_UDP_TRACKING))
+	if (!sec_enabled(SEC_UDP_BYTES))
 		return 0;
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);

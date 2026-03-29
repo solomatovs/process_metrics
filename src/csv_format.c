@@ -38,7 +38,7 @@ static const char CSV_HEADER_STR[] =
 	"cgroup_pids_current,"
 	"file_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
 	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
-	"net_conn_tx_bytes,net_conn_rx_bytes,net_duration_ms,"
+	"net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,"
 	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
 	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
 	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
@@ -413,6 +413,8 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->net_remote_port);
 	U64(ev->net_conn_tx_bytes);
 	U64(ev->net_conn_rx_bytes);
+	U64(ev->net_conn_tx_calls);
+	U64(ev->net_conn_rx_calls);
 	U64(ev->net_duration_ms);
 
 	/* ── сигналы ────────────────────────────────────────────────── */

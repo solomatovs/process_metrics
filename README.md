@@ -1,19 +1,19 @@
 # process_metrics
 
-Мониторинг процессов Linux через eBPF. Отслеживает жизненный цикл процессов (exec/fork/exit/OOM), сетевые соединения (TCP connect/accept/close), файловые операции (open/close/read/write), сигналы, заполненность дисков и сетевые аномалии (retransmit, SYN flood, RST, UDP/ICMP flood).
+Мониторинг процессов Linux через eBPF. Отслеживает жизненный цикл процессов (exec/fork/exit/OOM), сетевые соединения (TCP connect/accept/close) с детализацией до каждого соединения, файловые операции (open/close/read/write), сигналы, заполненность дисков и сетевые аномалии (retransmit, SYN flood, RST, UDP/ICMP flood).
 
 Работает по pull-модели: накапливает события в кольцевой буфер в памяти и отдаёт по HTTP в формате CSV. Внешний коллектор (ClickHouse Refreshable MV) периодически забирает данные. Disk I/O на горячем пути отсутствует.
 
 ## Возможности
 
-- **15 типов событий**: snapshot, fork, exec, exit, oom_kill, file_close, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv, udp_agg, icmp_agg, disk_usage
-- **65+ метрик** на процесс: CPU, RSS, swap, I/O, page faults, context switches, threads, namespaces, cgroup v2, сеть, файлы, сигналы, диски
+- **16 типов событий**: snapshot, conn_snapshot, fork, exec, exit, oom_kill, file_close, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv, udp_agg, icmp_agg, disk_usage
+- **90+ полей** на событие: CPU, RSS, swap, I/O, page faults, context switches, threads, namespaces, cgroup v2, сеть (до каждого TCP-соединения), файлы, сигналы, диски
 - **Правила отслеживания**: regex-фильтрация по командной строке с наследованием потомков
 - **Кольцевой буфер в RAM**: все данные в памяти, без файлового I/O на горячем пути
 - **Резолвинг пользователей**: uid/euid/loginuid → текстовые имена через NSS (LDAP, SSSD, локальные)
 - **Аудит**: отслеживание loginuid (audit UID) для идентификации реального пользователя через sudo/su
 - **Docker resolve**: автоматическое определение имён контейнеров по cgroup path (без Docker socket)
-- **Security-пробы**: TCP retransmit, SYN flood, RST, UDP/ICMP — захватывают весь трафик хоста
+- **Security-пробы**: TCP retransmit, SYN flood, RST (включая SO_LINGER=0), UDP/ICMP — per-process через sock_map
 - **cgroup v2**: memory, swap, cpu.weight, pids из /sys/fs/cgroup
 - **Совместимость**: ядра 5.15+ (CO-RE + условная компиляция через `BPF_ZERO`)
 - **Перезагрузка без рестарта**: `SIGHUP` — пересканирование /proc и перезагрузка правил
@@ -59,6 +59,7 @@ make all CLANG=clang-15
 | `make test` | Запуск unit-тестов |
 | `make test-http` | Тесты HTTP-сервера |
 | `make test-clickhouse` | Интеграционные тесты ClickHouse |
+| `make test-security` | Интеграционные тесты security_tracking |
 
 ### Цепочка сборки
 
@@ -136,32 +137,57 @@ sudo systemctl reload process_metrics   # или kill -HUP <pid>
 
 ### Коллекторы
 
-| Коллектор | Описание | По умолчанию |
-|-----------|----------|-------------|
-| `cgroup_metrics` | memory.max, memory.current, memory.swap.current, cpu.weight, pids.current из cgroup v2 | вкл |
-| `net_tracking` | TCP connect/accept/close через kprobes. События `net_close` | выкл |
-| `file_tracking` | open/close/read/write через tracepoints. События `file_close` | выкл |
-| `disk_tracking` | Заполненность дисков через statvfs(). События `disk_usage` | вкл |
-| `security_tracking` | TCP retransmit, SYN, RST, UDP/ICMP через kprobes/tracepoints | выкл |
+| Коллектор | Описание | События | По умолчанию |
+|-----------|----------|---------|-------------|
+| `cgroup_metrics` | memory.max/current, swap, cpu.weight, pids из cgroup v2 | поля в `snapshot` | вкл |
+| `net_tracking` | TCP/UDP жизненный цикл + security-пробы + per-connection снимки | `net_close`, `conn_snapshot`, `tcp_retrans`, `syn_recv`, `rst_sent`, `rst_recv`, `udp_agg` | выкл |
+| `file_tracking` | open/close/read/write через tracepoints | `file_close` | выкл |
+| `disk_tracking` | Заполненность дисков через statvfs() | `disk_usage` | вкл |
+| `icmp_tracking` | Глобальная агрегация ICMP (не привязана к процессам) | `icmp_agg` | выкл |
 
-`net_tracking` и `file_tracking` — объекты с полями `enabled` и `track_bytes`. `track_bytes = true` добавляет учёт байтов на соединение/fd (повышает нагрузку).
+### net_tracking
 
-`file_tracking` поддерживает `include` и `exclude` — списки префиксов путей. Без `include` отслеживаются все пути (кроме `exclude`).
+Единая точка конфигурации для всего сетевого отслеживания. Все опции внутри используют общую инфраструктуру — BPF-карту `sock_map`, которая маппит `sk_ptr → (tgid, addr, port, bytes)`.
+
+```conf
+net_tracking = {
+    enabled = true;       # net_close + conn_snapshot события
+    track_bytes = true;   # per-connection подсчёт байтов
+
+    # Security-пробы (per-process через sock_map)
+    tcp_retransmit = true;   # tcp_retrans: TCP-ретрансмиссии
+    syn_tracking = true;     # syn_recv: входящие SYN
+    rst_tracking = true;     # rst_sent/rst_recv: TCP RST
+    udp_tracking = true;     # udp_agg: агрегация UDP
+    open_conn_count = true;  # поле open_tcp_conns в snapshot
+};
+```
+
+| Опция | Событие | Хук | Описание |
+|-------|---------|-----|----------|
+| `enabled` | `net_close`, `conn_snapshot` | kprobe/tcp_close, итерация sock_map | Жизненный цикл TCP-соединений + per-connection снимки |
+| `track_bytes` | — | kprobe/tcp_sendmsg, tcp_recvmsg | Per-connection подсчёт tx/rx байтов |
+| `tcp_retransmit` | `tcp_retrans` | raw_tracepoint/tcp_retransmit_skb | Потеря пакетов, перегрузка, DDoS |
+| `syn_tracking` | `syn_recv` | kprobe/tcp_conn_request | SYN flood detection |
+| `rst_tracking` | `rst_sent`, `rst_recv` | raw_tracepoint/tcp_send_reset, tcp_receive_reset + kprobe/tcp_send_active_reset | Сканирование портов, отказы, SO_LINGER=0 |
+| `udp_tracking` | `udp_agg` | kretprobe/udp_sendmsg, udp_recvmsg | UDP flood, DNS amplification |
+| `open_conn_count` | поле в `snapshot` | — (из BPF-карты open_conn_map) | Утечка соединений |
+
+**Автоматическая активация**: если включена любая TCP-security опция (tcp_retransmit, syn_tracking, rst_tracking, open_conn_count), инфраструктура sock_map включается автоматически, даже при `enabled = false`. `enabled` управляет только генерацией `net_close` и `conn_snapshot`.
+
+При старте выполняется init-seed: сканирование `/proc/<pid>/fd/` + BPF iter/tcp для заполнения sock_map существующими сокетами.
+
+**conn_snapshot** — снимок **каждого живого TCP-соединения** с тем же timestamp что и `snapshot` процесса. Поле `state`: `L` = listener, `E` = established. Байты кумулятивные.
+
+**Обратная совместимость**: опции tcp_retransmit, syn_tracking, rst_tracking, udp_tracking, open_conn_count также читаются из устаревшей секции `security_tracking` (если не заданы в `net_tracking`).
+
+### Остальные коллекторы
+
+`file_tracking` — объект с `enabled`, `track_bytes`, `include` и `exclude` (списки префиксов путей). Без `include` отслеживаются все пути (кроме `exclude`).
 
 `disk_tracking` поддерживает `fs_types` (типы ФС), `include` и `exclude` (префиксы точек монтирования). По умолчанию мониторит: ext2/3/4, xfs, btrfs, vfat, zfs, ntfs, fuseblk, f2fs. Дедуплицирует bind-mount'ы одного устройства.
 
-### Security tracking
-
-Сетевые security-пробы для обнаружения аномалий. **Не фильтруются по rules** — захватывают весь трафик хоста.
-
-| Probe | Описание | Событие |
-|-------|----------|---------|
-| `tcp_retransmit` | Повторные передачи TCP-сегментов (потеря пакетов, DDoS) | `tcp_retrans` |
-| `syn_tracking` | Входящие SYN-запросы (SYN flood) | `syn_recv` |
-| `rst_tracking` | TCP RST отправленные/полученные (сканирование портов) | `rst_sent`, `rst_recv` |
-| `udp_tracking` | Агрегация UDP пакетов/байтов по (remote_addr, port) | `udp_agg` |
-| `icmp_tracking` | Агрегация ICMP по (src_addr, type, code) | `icmp_agg` |
-| `open_conn_count` | Счётчик активных TCP-соединений на процесс | поле `open_tcp_conns` в snapshot |
+`icmp_tracking` — глобальная агрегация ICMP-пакетов по (src_addr, type, code). Не привязана к процессам. Может быть указана в `security_tracking { icmp_tracking = true; }` или как верхнеуровневый `icmp_tracking = true`.
 
 ### Docker resolve
 
@@ -201,23 +227,65 @@ sudo systemctl reload process_metrics   # или kill -HUP <pid>
 
 ## Типы событий
 
-| event_type | Когда | Описание |
-|------------|-------|----------|
-| `snapshot` | Каждые N секунд | Снимок всех живых отслеживаемых процессов |
-| `exec` | exec() | Новый процесс подходит под правило |
-| `fork` | fork() | Потомок отслеживаемого процесса |
-| `exit` | Завершение | Финальные метрики (cpu, rss_max, exit_code) |
-| `oom_kill` | OOM | Процесс убит OOM killer |
-| `file_close` | Закрытие файла | Путь, флаги, read/write bytes |
-| `net_close` | Закрытие TCP | IP-адреса, порты, длительность, байты |
-| `signal` | Доставка сигнала | Отправитель, получатель, номер, результат |
-| `tcp_retrans` | TCP retransmit | Адреса, порты, TCP state |
-| `syn_recv` | Входящий SYN | Адреса, порты |
-| `rst_sent` | Отправлен RST | Адреса, порты |
-| `rst_recv` | Получен RST | Адреса, порты |
-| `udp_agg` | Каждый snapshot | Агрегация UDP: пакеты, байты по (addr, port) |
-| `icmp_agg` | Каждый snapshot | Агрегация ICMP: count по (addr, type, code) |
-| `disk_usage` | Каждый snapshot | Заполненность ФС: total, used, avail |
+16 типов событий, разделённых на 4 категории: жизненный цикл процесса, сетевые соединения, безопасность и инфраструктура.
+
+### Жизненный цикл процесса
+
+| event_type | Триггер | Ключевые поля | Описание |
+|------------|---------|---------------|----------|
+| `exec` | exec() системный вызов | pid, comm, exec, args, uid, cgroup, pwd | Новый процесс подходит под regex-правило. Первый exec запускает трекинг, все потомки наследуют правило |
+| `fork` | fork() потомка tracked-процесса | pid, ppid, comm, args (наследуются от родителя) | Потомок автоматически отслеживается с тем же правилом. comm/args берутся из родителя до первого exec |
+| `exit` | Завершение процесса | exit_code, cpu_ns, rss_max_bytes, io_read/write_bytes | Финальные кумулятивные метрики процесса. exit_code содержит код возврата (старшие 8 бит) и номер сигнала (младшие 7 бит) |
+| `oom_kill` | OOM killer | pid, comm, oom_killed=1 | Процесс убит OOM killer. oom_killed всегда 1. Правило определяется по PID или родителю |
+| `signal` | Доставка сигнала | sig_num, sig_target_pid, sig_target_comm, sig_code, sig_result | Любой сигнал: SIGTERM, SIGKILL и т.д. sig_code: SI_USER=0, SI_KERNEL=0x80. sig_result: 0 = успешно доставлен |
+
+### Периодические снимки
+
+| event_type | Триггер | Ключевые поля | Описание |
+|------------|---------|---------------|----------|
+| `snapshot` | Каждые `snapshot_interval` секунд | Все 90+ полей (см. детали ниже) | Полный снимок каждого отслеживаемого процесса. Одинаковый timestamp для всех процессов в одном цикле. Включает завершившиеся процессы (однократно) |
+| `conn_snapshot` | Вместе с `snapshot` | net_local/remote_addr, net_local/remote_port, net_conn_tx/rx_bytes, net_duration_ms, state | Снимок каждого живого TCP-соединения. Тот же timestamp что и `snapshot`. state: `L` = listener, `E` = established. Байты кумулятивные |
+
+### Сетевые соединения и файлы
+
+| event_type | Триггер | Ключевые поля | Описание |
+|------------|---------|---------------|----------|
+| `net_close` | Закрытие TCP-соединения | net_local/remote_addr, net_local/remote_port, net_conn_tx/rx_bytes, net_duration_ms | Финальные метрики закрытого соединения. Содержит итоговые кумулятивные байты. Listener-сокеты не генерируют net_close |
+| `file_close` | Закрытие tracked файла | file_path, file_flags, file_read/write_bytes, file_open_count | Метрики файлового ввода-вывода. Фильтруется по include/exclude префиксам из конфига |
+
+### Security и инфраструктура
+
+| event_type | Триггер | Ключевые поля | Описание |
+|------------|---------|---------------|----------|
+| `tcp_retrans` | TCP-ретрансмиссия (потеря пакета) | sec_local/remote_addr, sec_local/remote_port, sec_af, sec_tcp_state | Симптом потери пакетов, перегрузки или DDoS. sec_tcp_state содержит состояние TCP на момент ретрансмиссии |
+| `syn_recv` | Входящий SYN-пакет | sec_local/remote_addr, sec_local/remote_port, sec_af | Каждый входящий TCP SYN. Массовое появление = SYN flood |
+| `rst_sent` | Отправлен TCP RST | sec_local/remote_addr, sec_local/remote_port, sec_af, sec_direction=0 | RST отправлен. Включает: tracepoint tcp_send_reset + kprobe tcp_send_active_reset (SO_LINGER=0 close) |
+| `rst_recv` | Получен TCP RST | sec_local/remote_addr, sec_local/remote_port, sec_af, sec_direction=1 | RST получен. Индикатор: сканирование портов, отказы соединений, connection refused |
+| `udp_agg` | Каждый snapshot-цикл | sec_af, sec_remote_addr, sec_remote_port, net_tx/rx_bytes, file_write/read_bytes (пакеты) | Агрегированная статистика UDP за интервал по ключу (tgid, remote_addr, remote_port). Сбрасывается после каждого snapshot |
+| `icmp_agg` | Каждый snapshot-цикл | sec_af, sec_remote_addr, sec_tcp_state (icmp_type), sec_direction (icmp_code), open_tcp_conns (count) | Агрегированная статистика ICMP по ключу (src_addr, type, code). Сбрасывается после каждого snapshot |
+| `disk_usage` | Каждый snapshot-цикл | file_path (mount point), disk_total/used/avail_bytes, comm (device), sec_remote_addr (fstype) | Заполненность каждой файловой системы. Одно событие на точку монтирования. Дедуплицирует bind-mount'ы |
+
+### Поля snapshot-события (полный список)
+
+Событие `snapshot` содержит максимальное количество полей — полный снимок состояния процесса:
+
+| Группа | Поля | Описание |
+|--------|------|----------|
+| Идентификация | pid, ppid, root_pid, uid, euid, loginuid, sessionid, tty_nr, comm, exec, args | PID, родитель, UID'ы (реальный, эффективный, audit), терминал, командная строка |
+| Правило | rule, tags, is_root | Имя сработавшего правила, все правила через `\|`, корневой ли процесс в дереве |
+| CPU | cpu_ns, cpu_usage_ratio, sched_policy | Суммарное CPU-время (нс), доля CPU за интервал (0.0–N.0), политика планировщика |
+| Память | rss_bytes, rss_min/max_bytes, shmem_bytes, swap_bytes, vsize_bytes | RSS текущий/мин/макс, shared memory, swap, виртуальная память |
+| I/O (блочный) | io_read/write_bytes | Реальный блочный I/O (без page cache) |
+| I/O (полный) | io_rchar, io_wchar, io_syscr, io_syscw | Включая page cache: байты и количество системных вызовов |
+| Page faults | maj_flt, min_flt | Major (disk) и minor (memory) page faults |
+| Планировщик | nvcsw, nivcsw, threads, preempted_by_pid, preempted_by_comm | Добровольные/принудительные переключения контекста, потоки, последний вытеснитель |
+| OOM | oom_score_adj, oom_killed | Приоритет OOM killer, был ли убит |
+| Сеть (процесс) | net_tx/rx_bytes, open_tcp_conns | Суммарные байты всех TCP-соединений процесса, счётчик активных соединений |
+| Время | start_time_ns, uptime_seconds | Время старта (boot ns), аптайм процесса (секунды) |
+| Namespaces | mnt_ns, pid_ns, net_ns, cgroup_ns | Inode-номера пространств имён |
+| cgroup v2 | cgroup_memory_max/current, cgroup_swap_current, cgroup_cpu_weight, cgroup_cpu_max/max_period, cgroup_cpu_nr_periods/nr_throttled/throttled_usec, cgroup_pids_current | Метрики cgroup v2: лимиты памяти, CPU-квоты, throttling, кол-во процессов |
+| Файловая система | pwd, cgroup | Текущий рабочий каталог, путь cgroup |
+| Родители | parent_pids | Цепочка PID предков: [ppid, ppid's parent, ..., 1] (до 32 уровней) |
 
 ## Интеграция с ClickHouse
 
@@ -280,6 +348,19 @@ FROM process_metrics
 WHERE event_type = 'tcp_retrans'
   AND timestamp > now() - INTERVAL 1 HOUR
 ORDER BY timestamp DESC;
+
+-- Активные TCP-соединения процесса (per-connection)
+SELECT timestamp, pid, comm,
+       net_local_addr, net_local_port,
+       net_remote_addr, net_remote_port,
+       net_conn_tx_bytes, net_conn_rx_bytes,
+       net_duration_ms / 1000 AS duration_sec,
+       state  -- L=listener, E=established
+FROM process_metrics
+WHERE event_type = 'conn_snapshot'
+  AND timestamp > now() - INTERVAL 5 MINUTE
+  AND state = 'E'
+ORDER BY net_conn_tx_bytes + net_conn_rx_bytes DESC;
 ```
 
 ## Grafana
@@ -377,6 +458,10 @@ tests/
   test_event_file.c            — unit-тесты event_file
   test_http_server.sh          — тесты HTTP-сервера
   test_clickhouse_integration.sh — интеграционные тесты ClickHouse
+  test_shortlived_snapshot.sh  — тест короткоживущих процессов
+  test_conn_snapshot.sh        — e2e тест conn_snapshot (TCP lifecycle)
+  test_security.sh             — интеграционные тесты security_tracking
+  test_reparent_chain.sh       — тест цепочки parent_pids
 build/                         — артефакты сборки
 Makefile                       — сборка, тесты, установка зависимостей
 ```

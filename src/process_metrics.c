@@ -84,9 +84,17 @@ static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=d
 static struct http_config g_http_cfg;
 static long long cfg_max_data_size          = 256LL * 1024 * 1024; /* 256 MB ring buffer */
 
+/* Размеры BPF ring buffer'ов (0 = использовать дефолт из compile-time) */
+static long long cfg_ringbuf_proc           = 0;
+static long long cfg_ringbuf_file           = 0;
+static long long cfg_ringbuf_net            = 0;
+static long long cfg_ringbuf_sec            = 0;
+static long long cfg_ringbuf_cgroup         = 0;
+
 /* Конфигурация отслеживания сети */
 static int cfg_net_tracking_enabled         = 0;
 static int cfg_net_track_bytes              = 0;
+static int cfg_need_sock_map                = 0; /* net_tracking || TCP-security */
 
 /* Конфигурация отслеживания файлов */
 static int cfg_file_tracking_enabled        = 0;
@@ -108,13 +116,13 @@ static int  cfg_disk_exclude_count         = 0;
 static char cfg_disk_fs_types[DISK_MAX_PREFIXES][32];
 static int  cfg_disk_fs_types_count        = 0;
 
-/* Конфигурация отслеживания безопасности */
-static int cfg_sec_tcp_retransmit  = 0;
-static int cfg_sec_syn_tracking    = 0;
-static int cfg_sec_rst_tracking    = 0;
-static int cfg_sec_udp_tracking    = 0;
-static int cfg_sec_icmp_tracking   = 0;
-static int cfg_sec_open_conn_count = 0;
+/* Конфигурация net_tracking: security-опции */
+static int cfg_tcp_retransmit  = 0;
+static int cfg_tcp_syn         = 0;
+static int cfg_tcp_rst         = 0;
+static int cfg_udp_bytes       = 0;
+static int cfg_icmp_tracking   = 0;
+static int cfg_tcp_open_conns  = 0;
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
@@ -1618,13 +1626,40 @@ static int load_config(const char *path)
 			cfg_max_data_size = ll_val;
 	}
 
-	/* Настройки отслеживания сети */
+	/* Размеры BPF ring buffer'ов */
+	config_setting_t *rb = config_lookup(&cfg, "ring_buffers");
+	if (rb) {
+		long long ll_val;
+		if (config_setting_lookup_int64(rb, "proc", &ll_val))
+			cfg_ringbuf_proc = ll_val;
+		if (config_setting_lookup_int64(rb, "file", &ll_val))
+			cfg_ringbuf_file = ll_val;
+		if (config_setting_lookup_int64(rb, "net", &ll_val))
+			cfg_ringbuf_net = ll_val;
+		if (config_setting_lookup_int64(rb, "sec", &ll_val))
+			cfg_ringbuf_sec = ll_val;
+		if (config_setting_lookup_int64(rb, "cgroup", &ll_val))
+			cfg_ringbuf_cgroup = ll_val;
+	}
+
+	/* Настройки отслеживания сети (включая security TCP/UDP) */
 	config_setting_t *nt = config_lookup(&cfg, "net_tracking");
 	if (nt) {
 		if (config_setting_lookup_bool(nt, "enabled", &bool_val))
 			cfg_net_tracking_enabled = bool_val;
-		if (config_setting_lookup_bool(nt, "track_bytes", &bool_val))
+		if (config_setting_lookup_bool(nt, "tcp_bytes", &bool_val))
 			cfg_net_track_bytes = bool_val;
+
+		if (config_setting_lookup_bool(nt, "tcp_retransmit", &bool_val))
+			cfg_tcp_retransmit = bool_val;
+		if (config_setting_lookup_bool(nt, "tcp_syn", &bool_val))
+			cfg_tcp_syn = bool_val;
+		if (config_setting_lookup_bool(nt, "tcp_rst", &bool_val))
+			cfg_tcp_rst = bool_val;
+		if (config_setting_lookup_bool(nt, "udp_bytes", &bool_val))
+			cfg_udp_bytes = bool_val;
+		if (config_setting_lookup_bool(nt, "tcp_open_conns", &bool_val))
+			cfg_tcp_open_conns = bool_val;
 	}
 
 	/* Настройки отслеживания файлов */
@@ -1687,22 +1722,9 @@ static int load_config(const char *path)
 				 "%s", str_val);
 	}
 
-	/* Настройки отслеживания безопасности */
-	config_setting_t *st = config_lookup(&cfg, "security_tracking");
-	if (st) {
-		if (config_setting_lookup_bool(st, "tcp_retransmit", &bool_val))
-			cfg_sec_tcp_retransmit = bool_val;
-		if (config_setting_lookup_bool(st, "syn_tracking", &bool_val))
-			cfg_sec_syn_tracking = bool_val;
-		if (config_setting_lookup_bool(st, "rst_tracking", &bool_val))
-			cfg_sec_rst_tracking = bool_val;
-		if (config_setting_lookup_bool(st, "udp_tracking", &bool_val))
-			cfg_sec_udp_tracking = bool_val;
-		if (config_setting_lookup_bool(st, "icmp_tracking", &bool_val))
-			cfg_sec_icmp_tracking = bool_val;
-		if (config_setting_lookup_bool(st, "open_conn_count", &bool_val))
-			cfg_sec_open_conn_count = bool_val;
-	}
+	/* ICMP — верхнеуровневая опция (не привязана к процессам) */
+	if (config_lookup_bool(&cfg, "icmp_tracking", &bool_val))
+		cfg_icmp_tracking = bool_val;
 
 	/* Настройки отслеживания дисков */
 	config_setting_t *dt = config_lookup(&cfg, "disk_tracking");
@@ -1822,6 +1844,38 @@ static void cmdline_split(const char *raw, __u16 len,
 	while (alen > 0 && args_out[alen - 1] == ' ')
 		alen--;
 	args_out[alen] = '\0';
+}
+
+/* ── быстрые хелперы для горячего пути (замена snprintf) ──────────── */
+
+/* Быстрое u8 → десятичное (1-3 цифры). Возвращает указатель за последним. */
+static inline char *fast_u8(char *p, unsigned char v)
+{
+	if (v >= 100) { *p++ = '0' + v / 100; v %= 100; *p++ = '0' + v / 10; *p++ = '0' + v % 10; }
+	else if (v >= 10) { *p++ = '0' + v / 10; *p++ = '0' + v % 10; }
+	else { *p++ = '0' + v; }
+	return p;
+}
+
+/* IPv4 bytes[4] → "1.2.3.4" в dst, возвращает длину. */
+static inline int fmt_ipv4(char *dst, int cap, const __u8 *a)
+{
+	char *p = dst;
+	p = fast_u8(p, a[0]); *p++ = '.';
+	p = fast_u8(p, a[1]); *p++ = '.';
+	p = fast_u8(p, a[2]); *p++ = '.';
+	p = fast_u8(p, a[3]);
+	*p = '\0';
+	(void)cap;
+	return (int)(p - dst);
+}
+
+/* Копирование строки в поле фиксированного размера (замена snprintf("%s")) */
+static inline void fast_strcpy(char *dst, int cap, const char *src)
+{
+	int i = 0;
+	while (i < cap - 1 && src[i]) { dst[i] = src[i]; i++; }
+	dst[i] = '\0';
 }
 
 static void log_ts(const char *level, const char *fmt, ...)
@@ -2151,7 +2205,7 @@ static void add_descendants(struct scan_entry *entries, int count,
  */
 static void seed_sock_map(void)
 {
-	if (!cfg_net_tracking_enabled)
+	if (!cfg_need_sock_map)
 		return;
 
 	int seed_fd = bpf_map__fd(skel->maps.seed_inode_map);
@@ -2395,7 +2449,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					 + (__u64)g_boot_to_wall_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "file_close");
-			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги из userspace hash table (O(1)) */
 			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
@@ -2435,7 +2489,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * события приходят для ВСЕХ процессов на хосте. Фильтрация выполняется
 	 * здесь одним bpf_map_lookup_elem: если PID не в tracked_map — пропускаем.
 	 */
-	if (type == EVENT_NET_CLOSE) {
+	if (type == EVENT_NET_LISTEN || type == EVENT_NET_CONNECT
+	    || type == EVENT_NET_ACCEPT || type == EVENT_NET_CLOSE) {
 		if (size < sizeof(struct net_event))
 			return 0;
 		const struct net_event *ne = data;
@@ -2449,8 +2504,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const char *rname = (ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
-		log_debug("NET_CLOSE: pid=%u rule=%s port=%u→%u "
+		const char *net_evt;
+		switch (type) {
+		case EVENT_NET_LISTEN:  net_evt = "net_listen";  break;
+		case EVENT_NET_CONNECT: net_evt = "net_connect"; break;
+		case EVENT_NET_ACCEPT:  net_evt = "net_accept";  break;
+		default:                net_evt = "net_close";   break;
+		}
+		log_debug("%s: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
+			  net_evt,
 			  ne->tgid, rname, ne->local_port, ne->remote_port,
 			  (unsigned long long)ne->tx_bytes,
 			  (unsigned long long)ne->rx_bytes,
@@ -2463,9 +2526,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Время: BPF boot_ns → wall clock */
 			cev.timestamp_ns = ne->timestamp_ns
 					 + (__u64)g_boot_to_wall_ns;
-			snprintf(cev.event_type, sizeof(cev.event_type),
-				 "net_close");
-			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
+			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 			tags_lookup_ts(ne->tgid, cev.tags, sizeof(cev.tags));
 			cev.root_pid = ti.root_pid;
 			cev.is_root = ti.is_root;
@@ -2480,16 +2542,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			/* Форматирование IP-адресов */
 			if (ne->af == 2) { /* AF_INET — IPv4 */
-				snprintf(cev.net_local_addr,
+				fmt_ipv4(cev.net_local_addr,
 					 sizeof(cev.net_local_addr),
-					 "%u.%u.%u.%u",
-					 ne->local_addr[0], ne->local_addr[1],
-					 ne->local_addr[2], ne->local_addr[3]);
-				snprintf(cev.net_remote_addr,
+					 ne->local_addr);
+				fmt_ipv4(cev.net_remote_addr,
 					 sizeof(cev.net_remote_addr),
-					 "%u.%u.%u.%u",
-					 ne->remote_addr[0], ne->remote_addr[1],
-					 ne->remote_addr[2], ne->remote_addr[3]);
+					 ne->remote_addr);
 			} else if (ne->af == 10) { /* AF_INET6 — IPv6 */
 				inet_ntop(AF_INET6, ne->local_addr,
 					  cev.net_local_addr,
@@ -2504,7 +2562,22 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.net_remote_port = ne->remote_port;
 			cev.net_conn_tx_bytes = ne->tx_bytes;
 			cev.net_conn_rx_bytes = ne->rx_bytes;
+			cev.net_conn_tx_calls = ne->tx_calls;
+			cev.net_conn_rx_calls = ne->rx_calls;
 			cev.net_duration_ms = ne->duration_ns / 1000000;
+
+			/* TCP state на момент close для net_close.
+			 * Кодируем как символ для CSV:
+			 * ESTABLISHED(1)→'I' (initiator), CLOSE_WAIT(8)→'R' (responder),
+			 * остальные→числовой код */
+			if (type == EVENT_NET_CLOSE && ne->tcp_state) {
+				if (ne->tcp_state == 1) /* ESTABLISHED */
+					cev.state = 'I'; /* initiator */
+				else if (ne->tcp_state == 8) /* CLOSE_WAIT */
+					cev.state = 'R'; /* responder */
+				else
+					cev.state = '0' + (ne->tcp_state % 10);
+			}
 
 			pwd_lookup_ts(ne->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
@@ -2555,7 +2628,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					 + (__u64)ts_now.tv_nsec;
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "signal");
-			snprintf(cev.rule, sizeof(cev.rule), "%s", rname);
+			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги: сначала отправителя, потом получателя */
 			char sig_tags[TAGS_MAX_LEN];
@@ -2633,14 +2706,14 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
+			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 
 			/* Время: clock_gettime (ретрансмиты редкие) */
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
 					 + (__u64)ts_now.tv_nsec;
-			snprintf(cev.event_type, sizeof(cev.event_type),
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				 "tcp_retrans");
 			cev.pid = re->tgid;
 			cev.uid = re->uid;
@@ -2653,8 +2726,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&re->tgid, &ti) == 0) {
 				if (ti.rule_id < num_rules)
-					snprintf(cev.rule, sizeof(cev.rule),
-						 "%s", rules[ti.rule_id].name);
+					fast_strcpy(cev.rule, sizeof(cev.rule),
+						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
 				tags_lookup_ts(re->tgid, cev.tags,
 					       sizeof(cev.tags));
@@ -2666,16 +2739,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.sec_remote_port = re->remote_port;
 			cev.sec_tcp_state = re->state;
 			if (re->af == 2) {
-				snprintf(cev.sec_local_addr,
+				fmt_ipv4(cev.sec_local_addr,
 					 sizeof(cev.sec_local_addr),
-					 "%u.%u.%u.%u",
-					 re->local_addr[0], re->local_addr[1],
-					 re->local_addr[2], re->local_addr[3]);
-				snprintf(cev.sec_remote_addr,
+					 re->local_addr);
+				fmt_ipv4(cev.sec_remote_addr,
 					 sizeof(cev.sec_remote_addr),
-					 "%u.%u.%u.%u",
-					 re->remote_addr[0], re->remote_addr[1],
-					 re->remote_addr[2], re->remote_addr[3]);
+					 re->remote_addr);
 			} else if (re->af == 10) {
 				inet_ntop(AF_INET6, re->local_addr,
 					  cev.sec_local_addr,
@@ -2708,12 +2777,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
+			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
 					 + (__u64)ts_now.tv_nsec;
-			snprintf(cev.event_type, sizeof(cev.event_type),
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				 "syn_recv");
 			cev.pid = se_syn->tgid;
 			cev.uid = se_syn->uid;
@@ -2724,8 +2793,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&se_syn->tgid, &ti) == 0) {
 				if (ti.rule_id < num_rules)
-					snprintf(cev.rule, sizeof(cev.rule),
-						 "%s", rules[ti.rule_id].name);
+					fast_strcpy(cev.rule, sizeof(cev.rule),
+						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
 				tags_lookup_ts(se_syn->tgid, cev.tags,
 					       sizeof(cev.tags));
@@ -2734,20 +2803,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.sec_local_port = se_syn->local_port;
 			cev.sec_remote_port = se_syn->remote_port;
 			if (se_syn->af == 2) {
-				snprintf(cev.sec_local_addr,
+				fmt_ipv4(cev.sec_local_addr,
 					 sizeof(cev.sec_local_addr),
-					 "%u.%u.%u.%u",
-					 se_syn->local_addr[0],
-					 se_syn->local_addr[1],
-					 se_syn->local_addr[2],
-					 se_syn->local_addr[3]);
-				snprintf(cev.sec_remote_addr,
+					 se_syn->local_addr);
+				fmt_ipv4(cev.sec_remote_addr,
 					 sizeof(cev.sec_remote_addr),
-					 "%u.%u.%u.%u",
-					 se_syn->remote_addr[0],
-					 se_syn->remote_addr[1],
-					 se_syn->remote_addr[2],
-					 se_syn->remote_addr[3]);
+					 se_syn->remote_addr);
 			} else if (se_syn->af == 10) {
 				inet_ntop(AF_INET6, se_syn->local_addr,
 					  cev.sec_local_addr,
@@ -2781,13 +2842,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
+			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
 					 + (__u64)ts_now.tv_nsec;
-			snprintf(cev.event_type, sizeof(cev.event_type),
-				 rste->direction ? "rst_recv" : "rst_sent");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    rste->direction ? "rst_recv" : "rst_sent");
 			cev.pid = rste->tgid;
 			cev.uid = rste->uid;
 			memcpy(cev.comm, rste->comm, COMM_LEN);
@@ -2797,8 +2858,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&rste->tgid, &ti) == 0) {
 				if (ti.rule_id < num_rules)
-					snprintf(cev.rule, sizeof(cev.rule),
-						 "%s", rules[ti.rule_id].name);
+					fast_strcpy(cev.rule, sizeof(cev.rule),
+						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
 				tags_lookup_ts(rste->tgid, cev.tags,
 					       sizeof(cev.tags));
@@ -2808,20 +2869,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.sec_remote_port = rste->remote_port;
 			cev.sec_direction = rste->direction;
 			if (rste->af == 2) {
-				snprintf(cev.sec_local_addr,
+				fmt_ipv4(cev.sec_local_addr,
 					 sizeof(cev.sec_local_addr),
-					 "%u.%u.%u.%u",
-					 rste->local_addr[0],
-					 rste->local_addr[1],
-					 rste->local_addr[2],
-					 rste->local_addr[3]);
-				snprintf(cev.sec_remote_addr,
+					 rste->local_addr);
+				fmt_ipv4(cev.sec_remote_addr,
 					 sizeof(cev.sec_remote_addr),
-					 "%u.%u.%u.%u",
-					 rste->remote_addr[0],
-					 rste->remote_addr[1],
-					 rste->remote_addr[2],
-					 rste->remote_addr[3]);
+					 rste->remote_addr);
 			} else if (rste->af == 10) {
 				inet_ntop(AF_INET6, rste->local_addr,
 					  cev.sec_local_addr,
@@ -3251,7 +3304,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 
 		struct metric_event cev;
 		memset(&cev, 0, sizeof(cev));
-		snprintf(cev.rule, sizeof(cev.rule), "%s", RULE_NOT_MATCH);
+		fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 		cev.timestamp_ns = timestamp_ns;
 		snprintf(cev.event_type, sizeof(cev.event_type), "disk_usage");
 
@@ -3518,7 +3571,7 @@ static void refresh_processes(void)
 	free(all_values);
 
 	/* Flush UDP агрегатов → ef_append */
-	if (cfg_sec_udp_tracking && g_http_cfg.enabled) {
+	if (cfg_udp_bytes && g_http_cfg.enabled) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
 		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
@@ -3594,7 +3647,7 @@ static void refresh_processes(void)
 	}
 
 	/* Flush ICMP агрегатов → ef_append */
-	if (cfg_sec_icmp_tracking && g_http_cfg.enabled) {
+	if (cfg_icmp_tracking && g_http_cfg.enabled) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
 		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
@@ -3947,7 +4000,7 @@ static void write_snapshot(void)
 			}
 
 			/* open_conn_map — BPF map lookup, не файловый I/O */
-			if (cfg_sec_open_conn_count) {
+			if (cfg_tcp_open_conns) {
 				__u64 conn_cnt = 0;
 				int occ_fd = bpf_map__fd(
 					skel->maps.open_conn_map);
@@ -4059,6 +4112,8 @@ static void write_snapshot(void)
 					cev.net_remote_port = si.remote_port;
 					cev.net_conn_tx_bytes = si.tx_bytes;
 					cev.net_conn_rx_bytes = si.rx_bytes;
+					cev.net_conn_tx_calls = si.tx_calls;
+					cev.net_conn_rx_calls = si.rx_calls;
 
 					/* Длительность соединения */
 					if (si.start_ns > 0 &&
@@ -4293,11 +4348,49 @@ int main(int argc, char *argv[])
 	/* Установка rodata перед загрузкой */
 	skel->rodata->max_exec_events_per_sec = (__u32)cfg_exec_rate_limit;
 
+	/* Переопределение размеров BPF ring buffer'ов из конфига.
+	 * Размер должен быть степенью 2 и >= PAGE_SIZE (4096).
+	 * bpf_map__set_max_entries работает между open() и load(). */
+#define SET_RINGBUF_SIZE(map, cfg_val)                                  \
+	do {                                                            \
+		if ((cfg_val) > 0) {                                    \
+			__u32 sz = (__u32)(cfg_val);                    \
+			/* Округляем вверх до степени 2 */              \
+			sz--;                                           \
+			sz |= sz >> 1; sz |= sz >> 2;                  \
+			sz |= sz >> 4; sz |= sz >> 8; sz |= sz >> 16; \
+			sz++;                                           \
+			if (sz < 4096) sz = 4096;                       \
+			bpf_map__set_max_entries(skel->maps.map, sz);   \
+			log_ts("INFO", "ring_buffers.%s = %u bytes",    \
+			       #map, sz);                               \
+		}                                                       \
+	} while (0)
+
+	SET_RINGBUF_SIZE(events_proc,  cfg_ringbuf_proc);
+	SET_RINGBUF_SIZE(events_file,  cfg_ringbuf_file);
+	SET_RINGBUF_SIZE(events_net,   cfg_ringbuf_net);
+	SET_RINGBUF_SIZE(events_sec,   cfg_ringbuf_sec);
+	SET_RINGBUF_SIZE(events_cgroup, cfg_ringbuf_cgroup);
+#undef SET_RINGBUF_SIZE
+
 	/* iter/tcp запускается вручную (seed_sock_map), не через autoattach */
 	BPF_PROG_DISABLE(skel->progs.seed_sock_map_iter);
 
+	/*
+	 * sock_map необходим для: net_tracking (net_close, conn_snapshot,
+	 * track_bytes) и TCP security (retransmit, syn, rst, open_conn_count).
+	 * Если любая из этих опций включена — инфраструктура сокетов нужна.
+	 */
+	cfg_need_sock_map = cfg_net_tracking_enabled
+			  || cfg_tcp_retransmit
+			  || cfg_tcp_syn
+			  || cfg_tcp_rst
+			  || cfg_tcp_open_conns;
+	int need_sock_map = cfg_need_sock_map;
+
 	/* Условное отключение программ отслеживания сети */
-	if (!cfg_net_tracking_enabled) {
+	if (!need_sock_map) {
 		/* Жизненный цикл соединения: connect/accept/close/listen */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
 		BPF_PROG_DISABLE(skel->progs.krp_tcp_v4_connect);
@@ -4307,12 +4400,12 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.kp_inet_csk_listen_start);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
 	}
-	if (!cfg_net_tracking_enabled || !cfg_net_track_bytes) {
+	if (!need_sock_map || !cfg_net_track_bytes) {
 		/* Подсчёт байтов на соединение (kprobe enter + kretprobe) */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_recvmsg);
 	}
-	if (!cfg_net_tracking_enabled) {
+	if (!need_sock_map) {
 		/* Агрегированный подсчёт байтов на процесс (TCP + UDP kretprobes) */
 		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
@@ -4332,22 +4425,22 @@ int main(int argc, char *argv[])
 	}
 
 	/* Условное отключение программ отслеживания безопасности */
-	if (!cfg_sec_tcp_retransmit)
+	if (!cfg_tcp_retransmit)
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_retransmit);
-	if (!cfg_sec_syn_tracking)
+	if (!cfg_tcp_syn)
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_conn_request);
-	if (!cfg_sec_rst_tracking) {
+	if (!cfg_tcp_rst) {
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_send_reset);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_send_active_reset);
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_receive_reset);
 	}
-	if (!cfg_sec_udp_tracking) {
+	if (!cfg_udp_bytes) {
 		BPF_PROG_DISABLE(skel->progs.kp_udp_sendmsg_sec);
 		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg_sec);
 		BPF_PROG_DISABLE(skel->progs.kp_udp_recvmsg_sec);
 		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg_sec);
 	}
-	if (!cfg_sec_icmp_tracking)
+	if (!cfg_icmp_tracking)
 		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
 
 	/* Tracepoints cgroup_freeze/cgroup_unfreeze используют другой
@@ -4391,12 +4484,15 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Передача конфигурации отслеживания сети в BPF-карты */
-	if (cfg_net_tracking_enabled) {
+	/* Передача конфигурации отслеживания сети в BPF-карты.
+	 * net_cfg заполняется если нужна sock_map инфраструктура.
+	 * enabled отражает именно cfg_net_tracking_enabled
+	 * (управляет net_close/conn_snapshot, не security-пробами). */
+	if (cfg_need_sock_map) {
 		int net_cfg_fd = bpf_map__fd(skel->maps.net_cfg);
 		__u32 key0 = 0;
 		struct net_config nc = {
-			.enabled = 1,
+			.enabled = (__u8)cfg_net_tracking_enabled,
 			.track_bytes = (__u8)cfg_net_track_bytes,
 		};
 		bpf_map_update_elem(net_cfg_fd, &key0, &nc, BPF_ANY);
@@ -4407,12 +4503,12 @@ int main(int argc, char *argv[])
 		int sec_cfg_fd = bpf_map__fd(skel->maps.sec_cfg);
 		__u32 key0 = 0;
 		struct sec_config sc = {
-			.tcp_retransmit  = (__u8)cfg_sec_tcp_retransmit,
-			.syn_tracking    = (__u8)cfg_sec_syn_tracking,
-			.rst_tracking    = (__u8)cfg_sec_rst_tracking,
-			.udp_tracking    = (__u8)cfg_sec_udp_tracking,
-			.icmp_tracking   = (__u8)cfg_sec_icmp_tracking,
-			.open_conn_count = (__u8)cfg_sec_open_conn_count,
+			.tcp_retransmit  = (__u8)cfg_tcp_retransmit,
+			.tcp_syn         = (__u8)cfg_tcp_syn,
+			.tcp_rst         = (__u8)cfg_tcp_rst,
+			.udp_bytes       = (__u8)cfg_udp_bytes,
+			.icmp_tracking   = (__u8)cfg_icmp_tracking,
+			.tcp_open_conns  = (__u8)cfg_tcp_open_conns,
 		};
 		bpf_map_update_elem(sec_cfg_fd, &key0, &sc, BPF_ANY);
 	}
@@ -4480,24 +4576,24 @@ int main(int argc, char *argv[])
 	log_ts("INFO", "started: %d rules, snapshot every %ds, refresh every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
-	       "net_tracking=%s%s, file_tracking=%s%s, "
-	       "security=[retransmit=%s syn=%s rst=%s udp=%s icmp=%s open_conn=%s], "
-	       "disk_tracking=%s, ring_buffer_size=%lld",
+	       "net=[enabled=%s tcp_bytes=%s tcp_retransmit=%s tcp_syn=%s tcp_rst=%s "
+	       "udp_bytes=%s tcp_open_conns=%s], "
+	       "file=%s%s, icmp=%s, disk=%s, ring_buffer=%lld",
 	       num_rules, cfg_snapshot_interval, cfg_refresh_interval,
 	       cfg_exec_rate_limit,
 	       g_http_cfg.enabled ? "on" : "off",
 	       cfg_cgroup_metrics ? "on" : "off",
 	       cfg_refresh_proc ? "on" : "off",
 	       cfg_net_tracking_enabled ? "on" : "off",
-	       cfg_net_track_bytes ? "+bytes" : "",
+	       cfg_net_track_bytes ? "on" : "off",
+	       cfg_tcp_retransmit ? "on" : "off",
+	       cfg_tcp_syn ? "on" : "off",
+	       cfg_tcp_rst ? "on" : "off",
+	       cfg_udp_bytes ? "on" : "off",
+	       cfg_tcp_open_conns ? "on" : "off",
 	       cfg_file_tracking_enabled ? "on" : "off",
 	       cfg_file_track_bytes ? "+bytes" : "",
-	       cfg_sec_tcp_retransmit ? "on" : "off",
-	       cfg_sec_syn_tracking ? "on" : "off",
-	       cfg_sec_rst_tracking ? "on" : "off",
-	       cfg_sec_udp_tracking ? "on" : "off",
-	       cfg_sec_icmp_tracking ? "on" : "off",
-	       cfg_sec_open_conn_count ? "on" : "off",
+	       cfg_icmp_tracking ? "on" : "off",
 	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_size);
 

@@ -95,6 +95,9 @@ enum event_type {
 	EVENT_OOM_KILL       = 4,
 	EVENT_FILE_CLOSE     = 5,
 	EVENT_NET_CLOSE      = 6,
+	EVENT_NET_LISTEN     = 12,
+	EVENT_NET_CONNECT    = 13,
+	EVENT_NET_ACCEPT     = 14,
 	EVENT_SIGNAL         = 7,
 	EVENT_TCP_RETRANSMIT = 8,
 	EVENT_SYN_RECV       = 9,
@@ -418,6 +421,8 @@ struct sock_info {
 	__u16 remote_port;    /* порядок байт хоста */
 	__u64 tx_bytes;
 	__u64 rx_bytes;
+	__u64 tx_calls;       /* количество вызовов sendmsg */
+	__u64 rx_calls;       /* количество вызовов recvmsg */
 	__u64 start_ns;       /* время начала соединения (boot ns) */
 	__u8  is_listener;    /* 1 = слушающий сокет (не соединение) */
 };
@@ -425,10 +430,10 @@ struct sock_info {
 /*
  * Событие закрытия сетевого соединения — отправляется из BPF в userspace
  * через кольцевой буфер.
- * Первое поле — __u32 type (= EVENT_NET_CLOSE), единая диспетчеризация.
+ * Первое поле — __u32 type (EVENT_NET_OPEN или EVENT_NET_CLOSE).
  */
 struct net_event {
-	__u32 type;           /* EVENT_NET_CLOSE */
+	__u32 type;           /* EVENT_NET_OPEN или EVENT_NET_CLOSE */
 	__u32 tgid;
 	__u32 ppid;
 	__u32 uid;
@@ -442,7 +447,10 @@ struct net_event {
 	__u16 remote_port;
 	__u64 tx_bytes;
 	__u64 rx_bytes;
+	__u64 tx_calls;       /* количество вызовов sendmsg */
+	__u64 rx_calls;       /* количество вызовов recvmsg */
 	__u64 duration_ns;    /* сколько времени соединение было открыто */
+	__u8  tcp_state;      /* TCP state на момент close (ESTABLISHED=1, CLOSE_WAIT=8, ...) */
 };
 
 /*
@@ -469,11 +477,11 @@ struct signal_event {
  */
 struct sec_config {
 	__u8 tcp_retransmit;     /* 1 = отслеживать TCP-ретрансмиты */
-	__u8 syn_tracking;       /* 1 = отслеживать SYN-recv события */
-	__u8 rst_tracking;       /* 1 = отслеживать RST-события */
-	__u8 udp_tracking;       /* 1 = агрегировать UDP-пакеты */
+	__u8 tcp_syn;            /* 1 = отслеживать SYN-recv события */
+	__u8 tcp_rst;            /* 1 = отслеживать RST-события */
+	__u8 udp_bytes;          /* 1 = учёт UDP байтов/пакетов по (addr, port) */
 	__u8 icmp_tracking;      /* 1 = агрегировать ICMP-пакеты */
-	__u8 open_conn_count;    /* 1 = считать открытые TCP-соединения */
+	__u8 tcp_open_conns;     /* 1 = считать открытые TCP-соединения */
 };
 
 /*
