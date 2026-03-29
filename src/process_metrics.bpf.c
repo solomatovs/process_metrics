@@ -41,15 +41,15 @@
  */
 static __always_inline void _bpf_zero(void *p, unsigned int sz)
 {
-	unsigned long *lp = (unsigned long *)p;
-	unsigned int longs = sz / sizeof(unsigned long);
-	unsigned int i;
+	/* 4-байтовые записи для гарантии 4-byte выравнивания на стеке.
+	 * BPF verifier требует store size ≤ alignment offset.
+	 * Без #pragma unroll — ядро 5.3+ поддерживает bounded loops. */
+	__u32 *wp = (__u32 *)p;
+	unsigned int words = sz / sizeof(__u32);
 
-	#pragma unroll
-	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
-		if (i >= longs)
-			break;
-		lp[i] = 0;
+	for (unsigned int i = 0; i < words && i < 2048; i++) {
+		wp[i] = 0;
+		asm volatile("" : "+r"(wp) :: "memory");
 	}
 }
 
@@ -63,16 +63,13 @@ static __always_inline void _bpf_zero(void *p, unsigned int sz)
 static __always_inline void _bpf_copy(void *dst, const void *src,
 				      unsigned int sz)
 {
-	unsigned long *dp = (unsigned long *)dst;
-	const unsigned long *sp = (const unsigned long *)src;
-	unsigned int longs = sz / sizeof(unsigned long);
-	unsigned int i;
+	__u32 *dp = (__u32 *)dst;
+	const __u32 *sp = (const __u32 *)src;
+	unsigned int words = sz / sizeof(__u32);
 
-	#pragma unroll
-	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
-		if (i >= longs)
-			break;
+	for (unsigned int i = 0; i < words && i < 2048; i++) {
 		dp[i] = sp[i];
+		asm volatile("" : "+r"(dp), "+r"(sp) :: "memory");
 	}
 }
 
