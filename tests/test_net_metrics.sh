@@ -741,6 +741,238 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════
+#  ТЕСТЫ UID / IDENTITY для сетевых событий
+# ══════════════════════════════════════════════════════════════════
+log ""
+log "${CYAN}════════════════════════════════════════════════════${NC}"
+log "  ТЕСТЫ UID / IDENTITY"
+log "${CYAN}════════════════════════════════════════════════════${NC}"
+
+# Определяем ожидаемый UID процесса (тест запускается от текущего пользователя через sudo)
+# BPF bpf_get_current_uid_gid() вернёт UID вызвавшего python3 (через exec -a)
+# Процесс создаётся из sudo bash → python3, uid будет 0 (root)
+EXPECTED_UID=$(csv_field "${TMPD}/snap1.csv" "snapshot" "uid" "NETTEST_tcp")
+log "Ожидаемый uid=${EXPECTED_UID}"
+
+# ── ТЕСТ 28: snapshot uid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 28: snapshot uid ═══${NC}"
+if [ -n "$EXPECTED_UID" ]; then
+    pass "snapshot uid=${EXPECTED_UID}"
+else
+    fail "snapshot uid пустой"
+fi
+
+# ── ТЕСТ 29: snapshot loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 29: snapshot loginuid ═══${NC}"
+SNAP_LOGINUID=$(csv_field "${TMPD}/snap1.csv" "snapshot" "loginuid" "NETTEST_tcp")
+if [ -n "$SNAP_LOGINUID" ]; then
+    pass "snapshot loginuid=${SNAP_LOGINUID}"
+else
+    fail "snapshot loginuid пустой"
+fi
+
+# ── ТЕСТ 30: snapshot euid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 30: snapshot euid ═══${NC}"
+SNAP_EUID=$(csv_field "${TMPD}/snap1.csv" "snapshot" "euid" "NETTEST_tcp")
+if [ -n "$SNAP_EUID" ]; then
+    pass "snapshot euid=${SNAP_EUID}"
+else
+    fail "snapshot euid пустой"
+fi
+
+# ── ТЕСТ 31: snapshot sessionid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 31: snapshot sessionid ═══${NC}"
+SNAP_SESSIONID=$(csv_field "${TMPD}/snap1.csv" "snapshot" "sessionid" "NETTEST_tcp")
+if [ -n "$SNAP_SESSIONID" ]; then
+    pass "snapshot sessionid=${SNAP_SESSIONID}"
+else
+    fail "snapshot sessionid пустой"
+fi
+
+# ── ТЕСТ 32: conn_snapshot uid совпадает с snapshot ──
+log ""
+log "${CYAN}═══ ТЕСТ 32: conn_snapshot uid ═══${NC}"
+CS_UID=$(csv_field "${TMPD}/snap1.csv" "conn_snapshot" "uid" "${PORT_TCP}")
+if [ -n "$CS_UID" ] && [ "$CS_UID" = "$EXPECTED_UID" ]; then
+    pass "conn_snapshot uid=${CS_UID} == snapshot uid"
+elif [ -n "$CS_UID" ]; then
+    fail "conn_snapshot uid=${CS_UID} != snapshot uid=${EXPECTED_UID}"
+else
+    fail "conn_snapshot uid пустой"
+fi
+
+# ── ТЕСТ 33: conn_snapshot loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 33: conn_snapshot loginuid ═══${NC}"
+CS_LOGINUID=$(csv_field "${TMPD}/snap1.csv" "conn_snapshot" "loginuid" "${PORT_TCP}")
+if [ -n "$CS_LOGINUID" ] && [ "$CS_LOGINUID" = "$SNAP_LOGINUID" ]; then
+    pass "conn_snapshot loginuid=${CS_LOGINUID} == snapshot loginuid"
+elif [ -n "$CS_LOGINUID" ]; then
+    warn "conn_snapshot loginuid=${CS_LOGINUID} != snapshot loginuid=${SNAP_LOGINUID}"
+else
+    fail "conn_snapshot loginuid пустой"
+fi
+
+# ── ТЕСТ 34: conn_snapshot euid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 34: conn_snapshot euid ═══${NC}"
+CS_EUID=$(csv_field "${TMPD}/snap1.csv" "conn_snapshot" "euid" "${PORT_TCP}")
+if [ -n "$CS_EUID" ] && [ "$CS_EUID" = "$SNAP_EUID" ]; then
+    pass "conn_snapshot euid=${CS_EUID} == snapshot euid"
+elif [ -n "$CS_EUID" ]; then
+    warn "conn_snapshot euid=${CS_EUID} != snapshot euid=${SNAP_EUID}"
+else
+    fail "conn_snapshot euid пустой"
+fi
+
+# ── ТЕСТ 35: conn_snapshot sessionid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 35: conn_snapshot sessionid ═══${NC}"
+CS_SESSIONID=$(csv_field "${TMPD}/snap1.csv" "conn_snapshot" "sessionid" "${PORT_TCP}")
+if [ -n "$CS_SESSIONID" ] && [ "$CS_SESSIONID" = "$SNAP_SESSIONID" ]; then
+    pass "conn_snapshot sessionid=${CS_SESSIONID} == snapshot sessionid"
+elif [ -n "$CS_SESSIONID" ]; then
+    warn "conn_snapshot sessionid=${CS_SESSIONID} != snapshot sessionid=${SNAP_SESSIONID}"
+else
+    fail "conn_snapshot sessionid пустой"
+fi
+
+# ── ТЕСТ 36: net_close uid совпадает с snapshot ──
+log ""
+log "${CYAN}═══ ТЕСТ 36: net_close uid ═══${NC}"
+if [ -n "$NC_FILE" ]; then
+    NC_UID=$(csv_field "$NC_FILE" "net_close" "uid" "${PORT_TCP}")
+    if [ -n "$NC_UID" ] && [ "$NC_UID" = "$EXPECTED_UID" ]; then
+        pass "net_close uid=${NC_UID} == snapshot uid"
+    elif [ -n "$NC_UID" ]; then
+        fail "net_close uid=${NC_UID} != snapshot uid=${EXPECTED_UID}"
+    else
+        fail "net_close uid пустой"
+    fi
+else
+    fail "net_close uid (net_close отсутствует)"
+fi
+
+# ── ТЕСТ 37: net_close loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 37: net_close loginuid ═══${NC}"
+if [ -n "$NC_FILE" ]; then
+    NC_LOGINUID=$(csv_field "$NC_FILE" "net_close" "loginuid" "${PORT_TCP}")
+    if [ -n "$NC_LOGINUID" ] && [ "$NC_LOGINUID" = "$SNAP_LOGINUID" ]; then
+        pass "net_close loginuid=${NC_LOGINUID} == snapshot loginuid"
+    elif [ -n "$NC_LOGINUID" ]; then
+        warn "net_close loginuid=${NC_LOGINUID} != snapshot loginuid=${SNAP_LOGINUID}"
+    else
+        fail "net_close loginuid пустой"
+    fi
+else
+    fail "net_close loginuid (net_close отсутствует)"
+fi
+
+# ── ТЕСТ 38: net_close euid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 38: net_close euid ═══${NC}"
+if [ -n "$NC_FILE" ]; then
+    NC_EUID=$(csv_field "$NC_FILE" "net_close" "euid" "${PORT_TCP}")
+    if [ -n "$NC_EUID" ] && [ "$NC_EUID" = "$SNAP_EUID" ]; then
+        pass "net_close euid=${NC_EUID} == snapshot euid"
+    elif [ -n "$NC_EUID" ]; then
+        warn "net_close euid=${NC_EUID} != snapshot euid=${SNAP_EUID}"
+    else
+        fail "net_close euid пустой"
+    fi
+else
+    fail "net_close euid (net_close отсутствует)"
+fi
+
+# ── ТЕСТ 39: net_close sessionid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 39: net_close sessionid ═══${NC}"
+if [ -n "$NC_FILE" ]; then
+    NC_SESSIONID=$(csv_field "$NC_FILE" "net_close" "sessionid" "${PORT_TCP}")
+    if [ -n "$NC_SESSIONID" ] && [ "$NC_SESSIONID" = "$SNAP_SESSIONID" ]; then
+        pass "net_close sessionid=${NC_SESSIONID} == snapshot sessionid"
+    elif [ -n "$NC_SESSIONID" ]; then
+        warn "net_close sessionid=${NC_SESSIONID} != snapshot sessionid=${SNAP_SESSIONID}"
+    else
+        fail "net_close sessionid пустой"
+    fi
+else
+    fail "net_close sessionid (net_close отсутствует)"
+fi
+
+# ── ТЕСТ 40: net_connect uid == snapshot uid ──
+log ""
+log "${CYAN}═══ ТЕСТ 40: net_connect uid ═══${NC}"
+NCONN_UID=$(csv_field "${TMPD}/all.csv" "net_connect" "uid" "${PORT_TCP}")
+if [ -n "$NCONN_UID" ] && [ "$NCONN_UID" = "$EXPECTED_UID" ]; then
+    pass "net_connect uid=${NCONN_UID} == snapshot uid"
+elif [ -n "$NCONN_UID" ]; then
+    fail "net_connect uid=${NCONN_UID} != snapshot uid=${EXPECTED_UID}"
+else
+    warn "net_connect uid недоступен"
+fi
+
+# ── ТЕСТ 41: net_connect loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 41: net_connect loginuid ═══${NC}"
+NCONN_LOGINUID=$(csv_field "${TMPD}/all.csv" "net_connect" "loginuid" "${PORT_TCP}")
+if [ -n "$NCONN_LOGINUID" ] && [ "$NCONN_LOGINUID" = "$SNAP_LOGINUID" ]; then
+    pass "net_connect loginuid=${NCONN_LOGINUID} == snapshot loginuid"
+elif [ -n "$NCONN_LOGINUID" ]; then
+    warn "net_connect loginuid=${NCONN_LOGINUID} != snapshot loginuid=${SNAP_LOGINUID}"
+else
+    warn "net_connect loginuid недоступен"
+fi
+
+# ── ТЕСТ 42: net_accept loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 42: net_accept loginuid ═══${NC}"
+NACC_LOGINUID=$(csv_field "${TMPD}/all.csv" "net_accept" "loginuid" "${PORT_TCP}")
+if [ -n "$NACC_LOGINUID" ] && [ "$NACC_LOGINUID" = "$SNAP_LOGINUID" ]; then
+    pass "net_accept loginuid=${NACC_LOGINUID} == snapshot loginuid"
+elif [ -n "$NACC_LOGINUID" ]; then
+    warn "net_accept loginuid=${NACC_LOGINUID} != snapshot loginuid=${SNAP_LOGINUID}"
+else
+    warn "net_accept loginuid недоступен"
+fi
+
+# ── ТЕСТ 43: net_listen loginuid заполнен ──
+log ""
+log "${CYAN}═══ ТЕСТ 43: net_listen loginuid ═══${NC}"
+NLISTEN_LOGINUID=$(csv_field "${TMPD}/all.csv" "net_listen" "loginuid" "${PORT_TCP}")
+if [ -n "$NLISTEN_LOGINUID" ] && [ "$NLISTEN_LOGINUID" = "$SNAP_LOGINUID" ]; then
+    pass "net_listen loginuid=${NLISTEN_LOGINUID} == snapshot loginuid"
+elif [ -n "$NLISTEN_LOGINUID" ]; then
+    warn "net_listen loginuid=${NLISTEN_LOGINUID} != snapshot loginuid=${SNAP_LOGINUID}"
+else
+    warn "net_listen loginuid недоступен"
+fi
+
+# ── ТЕСТ 44: согласованность uid по всем сетевым событиям ──
+log ""
+log "${CYAN}═══ ТЕСТ 44: согласованность uid по всем сетевым событиям ═══${NC}"
+ALL_UIDS_CONSISTENT=1
+for evt in snapshot conn_snapshot net_close net_connect net_accept net_listen; do
+    EVT_UID=$(csv_field "${TMPD}/all.csv" "$evt" "uid" "${PORT_TCP}")
+    # Для snapshot ищем по exec
+    [ -z "$EVT_UID" ] && EVT_UID=$(csv_field "${TMPD}/all.csv" "$evt" "uid" "NETTEST_tcp")
+    if [ -n "$EVT_UID" ] && [ "$EVT_UID" != "$EXPECTED_UID" ]; then
+        ALL_UIDS_CONSISTENT=0
+        log "  ${evt}: uid=${EVT_UID} != expected=${EXPECTED_UID}"
+    fi
+done
+if [ "$ALL_UIDS_CONSISTENT" -eq 1 ]; then
+    pass "uid согласован по всем сетевым событиям (uid=${EXPECTED_UID})"
+else
+    fail "uid НЕ согласован по сетевым событиям"
+fi
+
+# ══════════════════════════════════════════════════════════════════
 #  ДЕТАЛИЗАЦИЯ
 # ══════════════════════════════════════════════════════════════════
 log ""
