@@ -2521,6 +2521,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.uid = fe->uid;
 			memcpy(cev.comm, fe->comm, COMM_LEN);
 
+			/* Identity из proc_map */
+			{
+				struct proc_info pi_file;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&fe->tgid, &pi_file) == 0) {
+					cev.loginuid  = pi_file.loginuid;
+					cev.sessionid = pi_file.sessionid;
+					cev.euid      = pi_file.euid;
+					cev.tty_nr    = pi_file.tty_nr;
+				}
+			}
+
 			/* Cgroup из кэша — линейный поиск по ~50 записям, без syscall */
 			resolve_cgroup_fast_ts(fe->cgroup_id,
 					       cev.cgroup, sizeof(cev.cgroup));
@@ -2806,6 +2818,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       sizeof(cev.tags));
 			}
 
+			/* Identity из proc_map */
+			{
+				struct proc_info pi_ret;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&re->tgid, &pi_ret) == 0) {
+					cev.loginuid  = pi_ret.loginuid;
+					cev.sessionid = pi_ret.sessionid;
+					cev.euid      = pi_ret.euid;
+					cev.tty_nr    = pi_ret.tty_nr;
+				}
+			}
+
 			/* Адреса и порты TCP-соединения */
 			cev.sec_af = re->af;
 			cev.sec_local_port = re->local_port;
@@ -2872,6 +2896,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 				tags_lookup_ts(se_syn->tgid, cev.tags,
 					       sizeof(cev.tags));
 			}
+			/* Identity из proc_map */
+			{
+				struct proc_info pi_syn;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&se_syn->tgid,
+							&pi_syn) == 0) {
+					cev.loginuid  = pi_syn.loginuid;
+					cev.sessionid = pi_syn.sessionid;
+					cev.euid      = pi_syn.euid;
+					cev.tty_nr    = pi_syn.tty_nr;
+				}
+			}
 			cev.sec_af = se_syn->af;
 			cev.sec_local_port = se_syn->local_port;
 			cev.sec_remote_port = se_syn->remote_port;
@@ -2936,6 +2972,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cev.root_pid = ti.root_pid;
 				tags_lookup_ts(rste->tgid, cev.tags,
 					       sizeof(cev.tags));
+			}
+			/* Identity из proc_map */
+			{
+				struct proc_info pi_rst;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&rste->tgid,
+							&pi_rst) == 0) {
+					cev.loginuid  = pi_rst.loginuid;
+					cev.sessionid = pi_rst.sessionid;
+					cev.euid      = pi_rst.euid;
+					cev.tty_nr    = pi_rst.tty_nr;
+				}
 			}
 			cev.sec_af = rste->af;
 			cev.sec_local_port = rste->local_port;
@@ -3692,6 +3740,11 @@ static void refresh_processes(void)
 							&ukey.tgid,
 							&upi) == 0) {
 					memcpy(cev.comm, upi.comm, COMM_LEN);
+					cev.uid       = upi.uid;
+					cev.loginuid  = upi.loginuid;
+					cev.sessionid = upi.sessionid;
+					cev.euid      = upi.euid;
+					cev.tty_nr    = upi.tty_nr;
 					resolve_cgroup_ts(upi.cgroup_id,
 							  cev.cgroup,
 							  sizeof(cev.cgroup));

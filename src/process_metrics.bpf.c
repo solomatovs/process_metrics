@@ -1142,6 +1142,10 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 		e->cpu_ns        = info->cpu_ns;
 		e->start_ns      = info->start_ns;
 		e->cmdline_len   = info->cmdline_len;
+		e->loginuid      = info->loginuid;
+		e->sessionid     = info->sessionid;
+		e->euid          = info->euid;
+		e->tty_nr        = info->tty_nr;
 		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 	}
 
