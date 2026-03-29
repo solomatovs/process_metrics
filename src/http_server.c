@@ -55,7 +55,7 @@ static int send_response(int fd, int status, const char *content_type,
 			 const char *body, int body_len)
 {
 	const char *status_text = (status == 200) ? "OK" : "Not Found";
-	char header[512];
+	char header[HTTP_HEADER_LEN];
 	int hlen = snprintf(header, sizeof(header),
 		"HTTP/1.1 %d %s\r\n"
 		"Content-Type: %s\r\n"
@@ -88,7 +88,7 @@ static int send_response(int fd, int status, const char *content_type,
  */
 static int send_stream_header(int fd, const char *content_type)
 {
-	char header[512];
+	char header[HTTP_HEADER_LEN];
 	int hlen = snprintf(header, sizeof(header),
 		"HTTP/1.1 200 OK\r\n"
 		"Content-Type: %s\r\n"
@@ -148,7 +148,7 @@ static int buf_append(int fd, char *buf, int bufsize, int *used,
 	return 0;
 }
 
-#define SEND_BUF_SIZE (128 * 1024)
+#define SEND_BUF_SIZE HTTP_SEND_BUF_SIZE
 
 /*
  * Потоково передаёт записи из кольцевого буфера в CSV на client_fd.
@@ -188,7 +188,7 @@ static void handle_csv_stream(int client_fd, int clear)
 	}
 
 	int ok = 1;
-	char row_buf[8192];
+	char row_buf[HTTP_ROW_BUF_SIZE];
 	for (int i = 0; i < n; i++) {
 		const struct ef_record *rec = ef_read_next(&iter);
 		if (!rec)
@@ -238,7 +238,7 @@ static int parse_clear(const char *request)
 static void handle_request(int client_fd,
 			   const struct sockaddr_in *peer)
 {
-	char buf[4096];
+	char buf[HTTP_BUF_LEN];
 	int n = (int)recv(client_fd, buf, sizeof(buf) - 1, 0);
 	if (n <= 0)
 		return;

@@ -13,18 +13,72 @@
 #define COMM_LEN        16
 #define CMDLINE_MAX     256   /* должно быть степенью двойки */
 #define MAX_PROCS       65536
+
+/* ── размеры буферов для /proc и текстового ввода-вывода ──────────── */
+#define PROC_PATH_LEN   64    /* "/proc/<pid>/stat", "/proc/<pid>/cmdline" и т.д. */
+#define PROC_STAT_LEN   1024  /* строка из /proc/<pid>/stat (~350 символов) */
+#define PROC_IO_LINE    128   /* строка из /proc/<pid>/io ("read_bytes: 12345\n") */
+#define PROC_STATUS_LINE 256  /* строка из /proc/<pid>/status */
+#define PROC_BUF_SMALL  512   /* /proc/<pid>/cgroup, небольшие буферы */
+#define PATH_MAX_LEN    512   /* общие пути: cgroup fs, mount info и т.д. */
+#define LINE_BUF_LEN    128   /* буфер для однострочного чтения (comm, mountinfo) */
+#define CONFIG_BUF_LEN  4096  /* буфер для чтения конфигурационных файлов */
+#define HTTP_HEADER_LEN 512   /* буфер для HTTP-заголовков */
+#define HTTP_BUF_LEN    4096  /* буфер для HTTP-запросов/ответов */
+#define USERNAME_LEN    64    /* имя пользователя (getpwuid_r) */
+#define PWD_BUF_LEN     1024  /* буфер для getpwuid_r */
+#define PROC_VAL_LEN    64    /* однострочное значение: oom_score_adj, cgroup cpu.max */
+#define BIND_ADDR_LEN   64    /* адрес привязки HTTP-сервера */
+
+/* ── ёмкости хеш-таблиц и кешей (userspace) ───────────────────────── */
+#define MAX_RULES            64     /* максимум правил трекинга */
+#define MAX_CGROUPS          256    /* максимум cgroup в кеше */
+#define TAGS_HT_SIZE         16384  /* хеш-таблица тегов (степень 2) */
+#define PIDTREE_HT_SIZE      65536  /* дерево pid→ppid (степень 2, покрывает pid_max) */
+#define CHAIN_CACHE_SIZE     16384  /* кеш цепочек parent_pids (степень 2) */
+#define PWD_HT_SIZE          16384  /* хеш-таблица рабочих каталогов (степень 2) */
+#define MAX_CPU_PREV         8192   /* кеш предыдущих значений CPU */
+#define DOCKER_NAME_CACHE_SIZE 256  /* кеш имён Docker-контейнеров */
+#define UID_NAME_CACHE_SIZE  512    /* кеш uid→username */
+#define MAX_SCAN             8192   /* макс. итераций сканирования /proc */
+#define DEAD_KEYS_CAP        256    /* буфер мёртвых ключей для удаления */
+
+/* ── ёмкости дисковых и файловых массивов ──────────────────────────── */
+#define DISK_MAX_PREFIXES    32     /* макс. префиксов disk_include */
+#define DISK_PREFIX_MAX      256    /* длина строки префикса диска */
+#define DISK_FS_TYPE_LEN     32     /* длина имени файловой системы */
+#define DISK_MAX_DEVS        64     /* макс. уникальных устройств в statvfs */
+#define DISK_DEV_NAME_LEN    256    /* длина имени устройства */
+
+/* ── ёмкости BPF map (не ring buffer) ─────────────────────────────── */
+#define BPF_ARGS_MAP_SIZE    8192   /* временные аргументы syscall (per-CPU inflight) */
+#define BPF_FD_MAP_SIZE      65536  /* отслеживание файловых дескрипторов */
+#define BPF_MISSED_EXEC_SIZE 1024   /* пропущенные exec для восстановления */
+#define BPF_UDP_AGG_SIZE     16384  /* агрегация UDP-трафика */
+#define BPF_ICMP_AGG_SIZE    8192   /* агрегация ICMP-трафика */
+
+/* ── HTTP-сервер ───────────────────────────────────────────────────── */
+#define HTTP_SEND_BUF_SIZE   (128 * 1024) /* буфер отправки HTTP (128 КБ) */
+#define HTTP_ROW_BUF_SIZE    8192         /* буфер одной CSV-строки */
+
+/* ── event_file ────────────────────────────────────────────────────── */
+#define EF_MAX_CAPACITY      1000000      /* макс. записей в кольцевом буфере */
 /*
  * Размеры кольцевых буферов для передачи событий из BPF в userspace.
- * Три раздельных буфера — каждый под свой тип событий:
+ * Пять раздельных буферов — каждый под свой тип событий:
  *
- *   events      — fork/exec/exit/oom_kill (struct event, ~450 байт)
- *   events_file — закрытие файлов (struct file_event, ~300 байт)
- *   events_net  — сетевые и signal события (~60–120 байт)
+ *   events_proc   — fork/exec/exit/oom_kill (struct event, ~450 байт)
+ *   events_file   — закрытие файлов (struct file_event, ~300 байт)
+ *   events_net    — сетевые и signal события (~60–120 байт)
+ *   events_sec    — security: retransmit/syn/rst (~90 байт), отдельно от net
+ *   events_cgroup — cgroup: запуск/остановка контейнера, миграция (~290 байт)
  *
  * Параметризация через количество событий при компиляции:
- *   -DRINGBUF_PROC_EVENTS=4096  (по умолчанию 2048)
- *   -DRINGBUF_FILE_EVENTS=4096  (по умолчанию 2048)
- *   -DRINGBUF_NET_EVENTS=4096   (по умолчанию 2048)
+ *   -DRINGBUF_PROC_EVENTS=N   (по умолчанию 8192)
+ *   -DRINGBUF_FILE_EVENTS=N   (по умолчанию 12288)
+ *   -DRINGBUF_NET_EVENTS=N    (по умолчанию 32768)
+ *   -DRINGBUF_SEC_EVENTS=N    (по умолчанию 8192)
+ *   -DRINGBUF_CGROUP_EVENTS=N (по умолчанию 768)
  *
  * Итоговый размер = кол-во событий * размер слота, округлён вверх
  * до степени двойки (требование ядра для BPF ring buffer).
@@ -37,16 +91,16 @@
 	 1U << (32 - __builtin_clz((unsigned)((x) - 1))))
 
 #ifndef RINGBUF_PROC_EVENTS
-#define RINGBUF_PROC_EVENTS  4096
+#define RINGBUF_PROC_EVENTS  8192
 #endif
 #ifndef RINGBUF_FILE_EVENTS
-#define RINGBUF_FILE_EVENTS  4096
+#define RINGBUF_FILE_EVENTS  12288
 #endif
 #ifndef RINGBUF_NET_EVENTS
-#define RINGBUF_NET_EVENTS   16384
+#define RINGBUF_NET_EVENTS   32768
 #endif
 #ifndef RINGBUF_SEC_EVENTS
-#define RINGBUF_SEC_EVENTS   4096
+#define RINGBUF_SEC_EVENTS   8192
 #endif
 
 /* Размер слота: sizeof(struct) + заголовок, округлено вверх до степени двойки */
@@ -135,7 +189,7 @@ enum proc_status {
  * поэтому достаточно небольшого буфера.
  */
 #ifndef RINGBUF_CGROUP_EVENTS
-#define RINGBUF_CGROUP_EVENTS  256
+#define RINGBUF_CGROUP_EVENTS  768
 #endif
 #define _RINGBUF_CGROUP_SLOT  512   /* struct cgroup_event ~290 + 8 */
 #define RINGBUF_CGROUP_SIZE  _RINGBUF_POW2(RINGBUF_CGROUP_EVENTS * _RINGBUF_CGROUP_SLOT)

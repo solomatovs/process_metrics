@@ -171,7 +171,7 @@ struct {
  */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(max_entries, BPF_MISSED_EXEC_SIZE);
 	__type(key, __u32);           /* tgid */
 	__type(value, __u32);         /* ppid */
 } missed_exec_map SEC(".maps");
@@ -1260,14 +1260,14 @@ struct {
 /* Временное хранилище аргументов между входом и выходом из системного вызова */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
 	__type(key, __u64);    /* pid_tgid */
 	__type(value, struct openat_args);
 } openat_args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
 	__type(key, __u64);    /* pid_tgid */
 	__type(value, struct rw_args);
 } rw_args_map SEC(".maps");
@@ -1275,7 +1275,7 @@ struct {
 /* Отслеживание по файловым дескрипторам: накопление байт чтения/записи до закрытия */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
+	__uint(max_entries, BPF_FD_MAP_SIZE);
 	__type(key, struct fd_key);
 	__type(value, struct fd_info);
 } fd_map SEC(".maps");
@@ -1613,14 +1613,14 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
 	__type(key, __u64);           /* pid_tgid */
 	__type(value, struct connect_args);
 } connect_args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
 	__type(key, __u64);           /* pid_tgid */
 	__type(value, struct sendmsg_args);
 } sendmsg_args_map SEC(".maps");
@@ -2092,7 +2092,7 @@ struct {
 /* Карта агрегации UDP — сбрасывается из userspace при snapshot */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 16384);
+	__uint(max_entries, BPF_UDP_AGG_SIZE);
 	__type(key, struct udp_agg_key);
 	__type(value, struct udp_agg_val);
 } udp_agg_map SEC(".maps");
@@ -2100,7 +2100,7 @@ struct {
 /* Карта агрегации ICMP — сбрасывается из userspace при snapshot */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ICMP_AGG_SIZE);
 	__type(key, struct icmp_agg_key);
 	__type(value, struct icmp_agg_val);
 } icmp_agg_map SEC(".maps");
@@ -2424,7 +2424,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 /* Сохраняем указатель на sock при входе для извлечения адресов */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 8192);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
 	__type(key, __u64);           /* pid_tgid */
 	__type(value, struct sendmsg_args);
 } udp_sendmsg_args SEC(".maps");

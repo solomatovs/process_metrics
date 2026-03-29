@@ -55,10 +55,7 @@
 
 /* ── конфигурация ─────────────────────────────────────────────────── */
 
-#define MAX_RULES       64
 #define RULE_NOT_MATCH  "NOT_MATCH"
-#define MAX_CGROUPS  256
-#define PATH_MAX_LEN 512
 
 struct rule {
 	char    name[EV_RULE_LEN];
@@ -107,13 +104,11 @@ static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
 
 /* Конфигурация отслеживания дисков */
 static int cfg_disk_tracking_enabled       = 1;  /* включено по умолчанию */
-#define DISK_MAX_PREFIXES 32
-#define DISK_PREFIX_MAX   256
 static char cfg_disk_include[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
 static int  cfg_disk_include_count         = 0;
 static char cfg_disk_exclude[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
 static int  cfg_disk_exclude_count         = 0;
-static char cfg_disk_fs_types[DISK_MAX_PREFIXES][32];
+static char cfg_disk_fs_types[DISK_MAX_PREFIXES][DISK_FS_TYPE_LEN];
 static int  cfg_disk_fs_types_count        = 0;
 
 /* Конфигурация net_tracking: security-опции */
@@ -231,7 +226,6 @@ static void refresh_boot_to_wall(void)
  */
 
 #define TAGS_MAX_LEN EV_TAGS_LEN
-#define TAGS_HT_SIZE 16384  /* должно быть степенью 2 */
 
 #ifdef NO_TAGS
 /*
@@ -440,7 +434,6 @@ static void tags_clear_ts(void)
  * Память: pt_pid[65536] + pt_ppid[65536] = 512 КБ.
  */
 
-#define PIDTREE_HT_SIZE  65536  /* степень 2, покрывает pid_max с ~50% загрузкой */
 
 static __u32 pt_pid[PIDTREE_HT_SIZE];    /* ключи: pid   (0 = пустой слот) */
 static __u32 pt_ppid[PIDTREE_HT_SIZE];   /* значения: ppid                 */
@@ -549,7 +542,6 @@ static void pidtree_remove_ts(__u32 pid)
  * делает все закешированные записи устаревшими.
  */
 
-#define CHAIN_CACHE_SIZE 16384  /* степень 2 */
 
 static __u32 cc_pid[CHAIN_CACHE_SIZE];
 static __u32 cc_chain[CHAIN_CACHE_SIZE][EV_PARENT_PIDS_MAX];
@@ -658,7 +650,6 @@ static void fill_parent_pids(struct metric_event *cev)
  * Структура аналогична tags: split-layout + murmurhash3 + linear probing.
  */
 
-#define PWD_HT_SIZE 16384  /* степень 2, как tags */
 
 static __u32 pwd_tgid[PWD_HT_SIZE];
 static char  pwd_data[PWD_HT_SIZE][EV_PWD_LEN];  /* 512 * 16384 = 8 MB */
@@ -794,7 +785,7 @@ static void pwd_clear_ts(void)
  */
 static void pwd_read_and_store(__u32 tgid)
 {
-	char cwd_path[64], pwd_buf[EV_PWD_LEN];
+	char cwd_path[PROC_PATH_LEN], pwd_buf[EV_PWD_LEN];
 	snprintf(cwd_path, sizeof(cwd_path), "/proc/%u/cwd", tgid);
 	ssize_t len = readlink(cwd_path, pwd_buf, sizeof(pwd_buf) - 1);
 	if (len > 0) {
@@ -870,7 +861,6 @@ static int try_track_pid(__u32 pid)
 
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
 
-#define MAX_CPU_PREV 8192
 
 struct cpu_prev {
 	__u32 tgid;
@@ -961,7 +951,7 @@ static void detect_docker_data_root(void)
 	/* Пробуем распарсить из daemon.json */
 	FILE *f = fopen(cfg_docker_daemon_json, "r");
 	if (f) {
-		char buf[4096];
+		char buf[CONFIG_BUF_LEN];
 		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
 		fclose(f);
 		buf[n] = '\0';
@@ -1023,8 +1013,8 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 	/* config.v2.json может быть большим (>40KB если секция State велика),
 	 * поэтому читаем частями, ища паттерн "Name":" */
 	char *q1 = NULL, *q2 = NULL;
-	char buf[4096];
-	char overlap[256] = "";  /* перекрытие с предыдущим чанком */
+	char buf[CONFIG_BUF_LEN];
+	char overlap[PROC_STATUS_LINE] = "";  /* перекрытие с предыдущим чанком */
 	int found = 0;
 
 	while (!found) {
@@ -1082,7 +1072,6 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
  * Отображает ID контейнера (64 hex символа) → "docker/<имя>".
  * Избавляет от повторного fopen/fread файла config.v2.json на каждое событие.
  */
-#define DOCKER_NAME_CACHE_SIZE 256
 
 static struct {
 	char container_id[65];       /* 64 hex + NUL */
@@ -1179,12 +1168,9 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
  * Кэш в памяти для резолвинга UID → имя пользователя.
  * При промахе кэша использует getpwuid_r(), результат кэшируется.
  */
-#define UID_NAME_CACHE_SIZE 512
-#define UID_NAME_MAX 64
-
 static struct {
 	__u32 uid;
-	char  name[UID_NAME_MAX];
+	char  name[USERNAME_LEN];
 	int   valid;   /* 1 = запись используется */
 } uid_name_cache[UID_NAME_CACHE_SIZE];
 static int uid_name_cache_count;
@@ -1200,7 +1186,7 @@ static pthread_rwlock_t g_uid_cache_lock = PTHREAD_RWLOCK_INITIALIZER;
 static int resolve_uid_to_name(__u32 uid, char *name, int namelen)
 {
 	struct passwd pwd, *result = NULL;
-	char pwbuf[1024];
+	char pwbuf[PWD_BUF_LEN];
 
 	if (getpwuid_r((uid_t)uid, &pwd, pwbuf, sizeof(pwbuf),
 		       &result) == 0 && result) {
@@ -1227,7 +1213,7 @@ void http_resolve_uid(__u32 uid, char *buf, int buflen)
 	pthread_rwlock_unlock(&g_uid_cache_lock);
 
 	/* Промах кэша — резолвим через NSS или /etc/passwd */
-	char name[UID_NAME_MAX] = "";
+	char name[USERNAME_LEN] = "";
 	resolve_uid_to_name(uid, name, sizeof(name));
 
 	/* Сохраняем в кэш (wrlock) */
@@ -1244,7 +1230,7 @@ void http_resolve_uid(__u32 uid, char *buf, int buflen)
 	if (uid_name_cache_count < UID_NAME_CACHE_SIZE) {
 		uid_name_cache[uid_name_cache_count].uid = uid;
 		snprintf(uid_name_cache[uid_name_cache_count].name,
-			 UID_NAME_MAX, "%s", name);
+			 USERNAME_LEN, "%s", name);
 		uid_name_cache[uid_name_cache_count].valid = 1;
 		uid_name_cache_count++;
 	}
@@ -1961,11 +1947,11 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
  */
 static int read_proc_stat(__u32 pid, struct proc_info *pi)
 {
-	char path[64];
+	char path[PROC_PATH_LEN];
 	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return -1;
-	char buf[1024];
+	char buf[PROC_STAT_LEN];
 	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return -1; }
 	fclose(f);
 
@@ -2020,11 +2006,11 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	pi->start_ns = ((__u64)starttime * 1000000000ULL) / (__u64)clk_tck;
 
 	/* Чтение дополнительных полей из /proc/PID/status */
-	char spath[64];
+	char spath[PROC_PATH_LEN];
 	snprintf(spath, sizeof(spath), "/proc/%u/status", pid);
 	FILE *sf = fopen(spath, "r");
 	if (sf) {
-		char sline[256];
+		char sline[PROC_STATUS_LINE];
 		while (fgets(sline, sizeof(sline), sf)) {
 			unsigned long val;
 			unsigned int uid_val;
@@ -2043,11 +2029,11 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	}
 
 	/* Чтение IO из /proc/PID/io (требует root или ptrace) */
-	char iopath[64];
+	char iopath[PROC_PATH_LEN];
 	snprintf(iopath, sizeof(iopath), "/proc/%u/io", pid);
 	FILE *iof = fopen(iopath, "r");
 	if (iof) {
-		char ioline[128];
+		char ioline[PROC_IO_LINE];
 		while (fgets(ioline, sizeof(ioline), iof)) {
 			unsigned long long val;
 			if (sscanf(ioline, "read_bytes: %llu", &val) == 1)
@@ -2065,11 +2051,11 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
  * Возвращает ppid или 0 при ошибке. */
 static __u32 read_proc_ppid(__u32 pid)
 {
-	char path[64];
+	char path[PROC_PATH_LEN];
 	snprintf(path, sizeof(path), "/proc/%u/stat", pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return 0;
-	char buf[512];
+	char buf[PROC_BUF_SMALL];
 	if (!fgets(buf, sizeof(buf), f)) { fclose(f); return 0; }
 	fclose(f);
 	char *rp = strrchr(buf, ')');
@@ -2081,7 +2067,7 @@ static __u32 read_proc_ppid(__u32 pid)
 
 static int read_proc_cmdline(__u32 pid, char *dst, int dstlen)
 {
-	char path[64];
+	char path[PROC_PATH_LEN];
 	snprintf(path, sizeof(path), "/proc/%u/cmdline", pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return 0;
@@ -2094,7 +2080,7 @@ static int read_proc_cmdline(__u32 pid, char *dst, int dstlen)
 
 static __u64 read_proc_cgroup_id(__u32 pid)
 {
-	char path[64], buf[512];
+	char path[PROC_PATH_LEN], buf[PROC_BUF_SMALL];
 	snprintf(path, sizeof(path), "/proc/%u/cgroup", pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return 0;
@@ -2132,7 +2118,7 @@ static __u64 read_proc_cgroup_id(__u32 pid)
 
 static __s16 read_proc_oom(__u32 pid)
 {
-	char path[64], buf[32];
+	char path[PROC_PATH_LEN], buf[PROC_VAL_LEN];
 	snprintf(path, sizeof(path), "/proc/%u/oom_score_adj", pid);
 	FILE *f = fopen(path, "r");
 	if (!f) return 0;
@@ -2152,7 +2138,6 @@ struct scan_entry {
 	__u32 ppid;
 };
 
-#define MAX_SCAN 8192
 
 static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
 				__u8 is_root)
@@ -2317,7 +2302,7 @@ static void initial_scan(void)
 		int pid = atoi(de->d_name);
 		if (pid <= 0) continue;
 
-		char path[64], buf[512];
+		char path[PROC_PATH_LEN], buf[PROC_BUF_SMALL];
 		snprintf(path, sizeof(path), "/proc/%d/stat", pid);
 		FILE *f = fopen(path, "r");
 		if (!f) continue;
@@ -2668,7 +2653,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.sig_result = se->sig_result;
 
 			/* Чтение имени процесса-получателя из /proc/<pid>/comm */
-			char tcomm_path[64], tcomm_buf[COMM_LEN + 2];
+			char tcomm_path[PROC_PATH_LEN], tcomm_buf[COMM_LEN + 2];
 			snprintf(tcomm_path, sizeof(tcomm_path),
 				 "/proc/%u/comm", se->target_pid);
 			FILE *tcf = fopen(tcomm_path, "r");
@@ -3080,7 +3065,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 	/* ── CHDIR — смена рабочего каталога ─────────────────────────── */
 	case EVENT_CHDIR: {
-		char cwd_path[64], pwd_buf[EV_PWD_LEN];
+		char cwd_path[PROC_PATH_LEN], pwd_buf[EV_PWD_LEN];
 		snprintf(cwd_path, sizeof(cwd_path), "/proc/%u/cwd", e->tgid);
 		ssize_t len = readlink(cwd_path, pwd_buf, sizeof(pwd_buf) - 1);
 		if (len > 0) {
@@ -3144,7 +3129,7 @@ static long long read_cgroup_value(const char *cg_path, const char *file)
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return -1;
-	char buf[64];
+	char buf[PROC_VAL_LEN];
 	if (!fgets(buf, sizeof(buf), f)) {
 		fclose(f);
 		return -1;
@@ -3169,7 +3154,7 @@ static void read_cgroup_cpu_max(const char *cg_path,
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return;
-	char buf[64];
+	char buf[PROC_VAL_LEN];
 	if (fgets(buf, sizeof(buf), f)) {
 		if (strncmp(buf, "max", 3) == 0) {
 			*quota = 0;  /* без ограничений */
@@ -3201,7 +3186,7 @@ static void read_cgroup_cpu_stat(const char *cg_path,
 	FILE *f = fopen(path, "r");
 	if (!f)
 		return;
-	char line[128];
+	char line[LINE_BUF_LEN];
 	while (fgets(line, sizeof(line), f)) {
 		if (strncmp(line, "nr_periods ", 11) == 0)
 			*nr_periods = strtoll(line + 11, NULL, 10);
@@ -3230,7 +3215,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 	if (!mf)
 		return 0;
 
-	char seen_devs[64][256];
+	char seen_devs[DISK_MAX_DEVS][DISK_DEV_NAME_LEN];
 	int seen_count = 0;
 	int disk_count = 0;
 
@@ -3294,8 +3279,8 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 		}
 		if (dup)
 			continue;
-		if (seen_count < 64)
-			snprintf(seen_devs[seen_count++], 256,
+		if (seen_count < DISK_MAX_DEVS)
+			snprintf(seen_devs[seen_count++], DISK_DEV_NAME_LEN,
 				 "%s", ent->mnt_fsname);
 
 		struct statvfs svfs;
@@ -3482,7 +3467,7 @@ static void refresh_processes(void)
 				bpf_map_update_elem(proc_map_fd, &key, &pi,
 						    BPF_EXIST);
 			}
-			char cpath[128];
+			char cpath[LINE_BUF_LEN];
 			snprintf(cpath, sizeof(cpath), "/proc/%u/comm", key);
 			FILE *cf = fopen(cpath, "r");
 			if (cf) {
@@ -3808,7 +3793,6 @@ static void write_snapshot(void)
 	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
 				+ (__u64)snap_ts.tv_nsec;
 
-	#define DEAD_KEYS_CAP 256
 	__u32 dead_keys[DEAD_KEYS_CAP];
 	int dead_count = 0;
 	int dead_total = 0;
