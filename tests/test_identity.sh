@@ -64,7 +64,7 @@ fi
 # Находим PID процесса с loginuid > 0 (реальный интерактивный пользователь)
 find_reference_pid() {
     local pid best_pid="" best_tty=0
-    for pid in $(ls -d /proc/[0-9]* 2>/dev/null | sed 's|/proc/||' | head -200); do
+    for pid in $(ls -d /proc/[0-9]* 2>/dev/null | sed 's|/proc/||'); do
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         local luid
         luid=$(cat "/proc/$pid/loginuid" 2>/dev/null) || continue
