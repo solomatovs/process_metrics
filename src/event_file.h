@@ -86,8 +86,9 @@ struct metric_event {
 	__s64 cgroup_cpu_throttled_usec; /* суммарное время троттлинга (мкс) */
 	__s64 cgroup_pids_current;
 
-	/* ── метрики отслеживания файлов (только EVENT_FILE_CLOSE) ─── */
-	char  file_path[FILE_PATH_MAX];
+	/* ── метрики отслеживания файлов ─────────────────────────────── */
+	char  file_path[FILE_PATH_MAX];      /* путь к файлу (4096) */
+	char  file_new_path[FILE_PATH_MAX];  /* rename: новый путь (4096) */
 	__u32 file_flags;
 	__u64 file_read_bytes;
 	__u64 file_write_bytes;

@@ -359,7 +359,7 @@ static void *server_thread(void *arg)
 
 		__atomic_add_fetch(&g_active_connections, 1, __ATOMIC_RELAXED);
 
-		struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+		struct timeval tv = { .tv_sec = HTTP_SOCK_TIMEOUT_SEC, .tv_usec = 0 };
 		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
 			   &tv, sizeof(tv));
 		setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,

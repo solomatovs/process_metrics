@@ -122,6 +122,28 @@ static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
 static int cfg_file_exclude_count           = 0;
 
+/* ── file path include/exclude фильтр (userspace, для file_snapshot) ── */
+
+static int file_path_allowed(const char *path)
+{
+	if (cfg_file_include_count > 0) {
+		int matched = 0;
+		for (int i = 0; i < cfg_file_include_count; i++)
+			if (strncmp(path, cfg_file_include[i].prefix,
+				    cfg_file_include[i].len) == 0) {
+				matched = 1;
+				break;
+			}
+		if (!matched)
+			return 0;
+	}
+	for (int i = 0; i < cfg_file_exclude_count; i++)
+		if (strncmp(path, cfg_file_exclude[i].prefix,
+			    cfg_file_exclude[i].len) == 0)
+			return 0;
+	return 1;
+}
+
 /* ── глобальные переменные ─────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_running   = 1;
@@ -2554,6 +2576,73 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
+	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE ──────────────────── */
+	if (type == EVENT_FILE_RENAME || type == EVENT_FILE_UNLINK
+	    || type == EVENT_FILE_TRUNCATE) {
+		if (size < sizeof(struct file_event))
+			return 0;
+		const struct file_event *fe = data;
+
+		struct track_info ti;
+		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
+			return 0;
+
+		const char *rname = (ti.rule_id < num_rules)
+			? rules[ti.rule_id].name : RULE_NOT_MATCH;
+
+		if (g_http_cfg.enabled) {
+			struct metric_event cev;
+			memset(&cev, 0, sizeof(cev));
+
+			cev.timestamp_ns = fe->timestamp_ns
+					 + (__u64)g_boot_to_wall_ns;
+
+			const char *etype =
+				type == EVENT_FILE_RENAME  ? "file_rename"  :
+				type == EVENT_FILE_UNLINK  ? "file_unlink"  :
+				                             "file_truncate";
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), etype);
+			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
+			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
+
+			cev.root_pid = ti.root_pid;
+			cev.is_root  = ti.is_root;
+			cev.pid  = fe->tgid;
+			cev.ppid = fe->ppid;
+			cev.uid  = fe->uid;
+			memcpy(cev.comm, fe->comm, COMM_LEN);
+
+			struct proc_info pi_mut;
+			if (bpf_map_lookup_elem(proc_map_fd,
+						&fe->tgid, &pi_mut) == 0) {
+				cev.loginuid  = pi_mut.loginuid;
+				cev.sessionid = pi_mut.sessionid;
+				cev.euid      = pi_mut.euid;
+				cev.tty_nr    = pi_mut.tty_nr;
+			}
+
+			resolve_cgroup_fast_ts(fe->cgroup_id,
+					       cev.cgroup, sizeof(cev.cgroup));
+
+			fast_strcpy(cev.file_path, sizeof(cev.file_path),
+				    fe->path);
+			cev.file_flags = (__u32)fe->flags;
+
+			if (type == EVENT_FILE_RENAME) {
+				fast_strcpy(cev.file_new_path,
+					    sizeof(cev.file_new_path),
+					    fe->path2);
+			} else if (type == EVENT_FILE_TRUNCATE) {
+				cev.file_write_bytes = fe->truncate_size;
+			}
+
+			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
+			fill_parent_pids(&cev);
+			ef_append(&cev, cfg_hostname);
+		}
+		return 0;
+	}
+
 	/* ── NET_CLOSE — закрытие TCP-соединения ─────────────────────────
 	 *
 	 * Второе по частоте событие (~9/сек). Оптимизирован аналогично FILE_CLOSE.
@@ -4146,15 +4235,16 @@ static void write_snapshot(void)
 	free(all_keys);
 	free(all_values);
 
+	/* boot_ns — для вычисления длительности в conn_snapshot и file_snapshot */
+	struct timespec boot_ts;
+	clock_gettime(CLOCK_BOOTTIME, &boot_ts);
+	__u64 boot_ns = (__u64)boot_ts.tv_sec * 1000000000ULL
+		      + (__u64)boot_ts.tv_nsec;
+
 	/* ── conn_snapshot: метрики живых TCP-соединений ──────────────── */
 	int conn_count = 0;
 	if (cfg_net_tracking_enabled && g_http_cfg.enabled) {
 		int sm_fd = bpf_map__fd(skel->maps.sock_map);
-
-		struct timespec boot_ts;
-		clock_gettime(CLOCK_BOOTTIME, &boot_ts);
-		__u64 boot_ns = (__u64)boot_ts.tv_sec * 1000000000ULL
-			      + (__u64)boot_ts.tv_nsec;
 
 		__u64 sk_key;
 		int sk_err = bpf_map_get_next_key(sm_fd, NULL, &sk_key);
@@ -4177,16 +4267,16 @@ static void write_snapshot(void)
 					struct metric_event cev;
 					memset(&cev, 0, sizeof(cev));
 					cev.timestamp_ns = snap_timestamp_ns;
-					snprintf(cev.event_type,
-						 sizeof(cev.event_type),
-						 "conn_snapshot");
-					snprintf(cev.rule,
-						 sizeof(cev.rule),
-						 "%s", rname);
+					fast_strcpy(cev.event_type,
+						    sizeof(cev.event_type),
+						    "conn_snapshot");
+					fast_strcpy(cev.rule,
+						    sizeof(cev.rule),
+						    rname);
 #ifndef NO_TAGS
-					snprintf(cev.tags,
-						 sizeof(cev.tags), "%s",
-						 tags_lookup_copy(
+					fast_strcpy(cev.tags,
+						    sizeof(cev.tags),
+						    tags_lookup_copy(
 							snap_tgid,
 							snap_data,
 							si.tgid));
@@ -4265,6 +4355,98 @@ static void write_snapshot(void)
 		}
 	}
 
+	/* ── file_snapshot: метрики открытых файлов ──────────────────── */
+	int file_snap_count = 0;
+	if (cfg_file_tracking_enabled && g_http_cfg.enabled) {
+		int fm_fd = bpf_map__fd(skel->maps.fd_map);
+
+		struct fd_key fk_key;
+		int fk_err = bpf_map_get_next_key(fm_fd, NULL, &fk_key);
+		while (fk_err == 0) {
+			struct fd_key fk_next;
+			int fk_next_err = bpf_map_get_next_key(fm_fd,
+							       &fk_key,
+							       &fk_next);
+
+			struct fd_info fi;
+			if (bpf_map_lookup_elem(fm_fd, &fk_key, &fi) == 0
+			    && fi.path[0] != '\0'
+			    && file_path_allowed(fi.path)) {
+				struct track_info ti;
+				if (bpf_map_lookup_elem(tracked_map_fd,
+							&fk_key.tgid,
+							&ti) == 0)
+				{
+					const char *rname =
+						(ti.rule_id < num_rules)
+						? rules[ti.rule_id].name
+						: RULE_NOT_MATCH;
+
+					struct metric_event cev;
+					memset(&cev, 0, sizeof(cev));
+					cev.timestamp_ns = snap_timestamp_ns;
+					fast_strcpy(cev.event_type,
+						    sizeof(cev.event_type),
+						    "file_snapshot");
+					fast_strcpy(cev.rule,
+						    sizeof(cev.rule),
+						    rname);
+#ifndef NO_TAGS
+					fast_strcpy(cev.tags,
+						    sizeof(cev.tags),
+						    tags_lookup_copy(
+							snap_tgid,
+							snap_data,
+							fk_key.tgid));
+#endif
+					cev.root_pid = ti.root_pid;
+					cev.pid = fk_key.tgid;
+					cev.is_root = ti.is_root;
+
+					struct proc_info fpi;
+					if (bpf_map_lookup_elem(
+						proc_map_fd,
+						&fk_key.tgid, &fpi) == 0) {
+						cev.ppid = fpi.ppid;
+						cev.uid  = fpi.uid;
+						memcpy(cev.comm, fpi.comm,
+						       COMM_LEN);
+						cev.loginuid  = fpi.loginuid;
+						cev.sessionid = fpi.sessionid;
+						cev.euid      = fpi.euid;
+						cev.tty_nr    = fpi.tty_nr;
+					}
+
+					fast_strcpy(cev.file_path,
+						    sizeof(cev.file_path),
+						    fi.path);
+					cev.file_flags = (__u32)fi.flags;
+					cev.file_read_bytes = fi.read_bytes;
+					cev.file_write_bytes = fi.write_bytes;
+					cev.file_open_count = fi.open_count;
+
+					if (fi.start_ns > 0 &&
+					    boot_ns > fi.start_ns)
+						cev.net_duration_ms =
+							(boot_ns - fi.start_ns)
+							/ 1000000;
+
+					pidtree_get_chain_copy(
+						snap_pt_pid, snap_pt_ppid,
+						fk_key.tgid,
+						cev.parent_pids,
+						&cev.parent_pids_len);
+					ef_append(&cev, cfg_hostname);
+					file_snap_count++;
+				}
+			}
+
+			if (fk_next_err != 0)
+				break;
+			fk_key = fk_next;
+		}
+	}
+
 	ef_batch_unlock();
 
 	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
@@ -4278,8 +4460,8 @@ static void write_snapshot(void)
 	}
 	dead_total += dead_count;
 
-	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns",
-	       pid_count, dead_total, snap_count, conn_count);
+	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
+	       pid_count, dead_total, snap_count, conn_count, file_snap_count);
 
 	/* Статистика ring buffer'ов */
 	{

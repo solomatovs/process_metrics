@@ -36,7 +36,7 @@ static const char CSV_HEADER_STR[] =
 	"cgroup_cpu_max,cgroup_cpu_max_period,"
 	"cgroup_cpu_nr_periods,cgroup_cpu_nr_throttled,cgroup_cpu_throttled_usec,"
 	"cgroup_pids_current,"
-	"file_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
+	"file_path,file_new_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,"
 	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
 	"net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,"
 	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
@@ -401,6 +401,7 @@ int csv_format_row(char *buf, int buflen,
 
 	/* ── отслеживание файлов ────────────────────────────────────── */
 	STR(ev->file_path, FILE_PATH_MAX);
+	STR(ev->file_new_path, FILE_PATH_MAX);
 	U32(ev->file_flags);
 	U64(ev->file_read_bytes);
 	U64(ev->file_write_bytes);

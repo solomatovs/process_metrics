@@ -59,8 +59,10 @@
 #define BPF_ICMP_AGG_SIZE    8192   /* агрегация ICMP-трафика */
 
 /* ── HTTP-сервер ───────────────────────────────────────────────────── */
-#define HTTP_SEND_BUF_SIZE   (128 * 1024) /* буфер отправки HTTP (128 КБ) */
-#define HTTP_ROW_BUF_SIZE    8192         /* буфер одной CSV-строки */
+#define HTTP_SEND_BUF_SIZE       (128 * 1024) /* буфер отправки HTTP (128 КБ) */
+#define HTTP_ROW_BUF_SIZE        8192         /* буфер одной CSV-строки */
+#define HTTP_SOCK_TIMEOUT_SEC    5            /* таймаут клиентского сокета */
+#define HTTP_LISTEN_TIMEOUT_SEC  1            /* таймаут listen-цикла */
 
 /* ── event_file ────────────────────────────────────────────────────── */
 #define EF_MAX_CAPACITY      1000000      /* макс. записей в кольцевом буфере */
@@ -106,7 +108,7 @@
 
 /* Размер слота: sizeof(struct) + заголовок, округлено вверх до степени двойки */
 #define _RINGBUF_PROC_SLOT   512   /* struct event ~450 + 8 */
-#define _RINGBUF_FILE_SLOT   512   /* struct file_event ~300 + 8 */
+#define _RINGBUF_FILE_SLOT   2560  /* struct file_event ~2150 (path+path2 по BPF_FILE_PATH_MAX) */
 #define _RINGBUF_NET_SLOT    256   /* struct net_event ~120 + 8 (макс. из сетевых) */
 #define _RINGBUF_SEC_SLOT    256   /* struct retransmit_event/syn_event/rst_event ~90 + 8 */
 
@@ -158,6 +160,9 @@ enum event_type {
 	EVENT_SYN_RECV       = 9,
 	EVENT_RST            = 10,
 	EVENT_CHDIR          = 11,
+	EVENT_FILE_RENAME    = 15,
+	EVENT_FILE_UNLINK    = 16,
+	EVENT_FILE_TRUNCATE  = 17,
 	/* события жизненного цикла cgroup */
 	EVENT_CGROUP_MKDIR           = 20,
 	EVENT_CGROUP_RMDIR           = 21,
@@ -213,9 +218,11 @@ struct cgroup_event {
 
 /* ── константы отслеживания файлов ────────────────────────────────── */
 
-#define FILE_PATH_MAX    256
-#define FILE_MAX_PREFIXES 16
-#define FILE_PREFIX_LEN  128
+#define FILE_PATH_MAX        4096  /* userspace: metric_event, CSV, ClickHouse */
+#define BPF_FILE_PATH_MAX   1024  /* BPF: fd_info, file_event, openat_args (ядерные карты) */
+#define FILE_MAX_PREFIXES    16
+#define FILE_PREFIX_LEN      128
+#define PREFIX_CMP_MAX       32    /* макс. сравниваемых байт для include/exclude фильтров */
 
 /*
  * Конфигурация, передаваемая из пространства пользователя в BPF через карты.
@@ -245,7 +252,7 @@ struct file_prefix {
  * Ключ: pid_tgid (__u64)
  */
 struct openat_args {
-	char  path[FILE_PATH_MAX];
+	char  path[BPF_FILE_PATH_MAX];
 	int   flags;
 };
 
@@ -267,11 +274,12 @@ struct fd_key {
 };
 
 struct fd_info {
-	char  path[FILE_PATH_MAX];
+	char  path[BPF_FILE_PATH_MAX];
 	int   flags;
 	__u64 read_bytes;
 	__u64 write_bytes;
 	__u32 open_count;    /* сколько раз этот fd был открыт */
+	__u64 start_ns;      /* время открытия файла (boot ns) */
 };
 
 /*
@@ -281,18 +289,20 @@ struct fd_info {
  * в struct event, что позволяет callback кольцевого буфера диспетчеризовать по type.
  */
 struct file_event {
-	__u32 type;           /* EVENT_FILE_CLOSE */
+	__u32 type;           /* EVENT_FILE_CLOSE / EVENT_FILE_RENAME / ... */
 	__u32 tgid;
 	__u32 ppid;
 	__u32 uid;            /* реальный UID процесса */
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
-	char  path[FILE_PATH_MAX];
+	char  path[BPF_FILE_PATH_MAX];
 	int   flags;
 	__u64 read_bytes;
 	__u64 write_bytes;
 	__u32 open_count;
+	char  path2[BPF_FILE_PATH_MAX]; /* rename: new_path */
+	__u64 truncate_size;            /* truncate: new_size */
 };
 
 /*

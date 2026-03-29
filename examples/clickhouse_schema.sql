@@ -75,6 +75,7 @@ CREATE TABLE _pm_target (
     cgroup_cpu_throttled_usec Int64                    CODEC(Delta, ZSTD(1)),
     cgroup_pids_current    Int64                       CODEC(T64, ZSTD(1)),
     file_path              String                      CODEC(ZSTD(1)),
+    file_new_path          String                      CODEC(ZSTD(1)),
     file_flags             UInt32                      CODEC(T64, ZSTD(1)),
     file_read_bytes        UInt64                      CODEC(Delta, ZSTD(1)),
     file_write_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
