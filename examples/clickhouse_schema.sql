@@ -104,7 +104,7 @@ CREATE TABLE _pm_target (
     disk_total_bytes       UInt64                      CODEC(T64, ZSTD(1)),
     disk_used_bytes        UInt64                      CODEC(T64, ZSTD(1)),
     disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
-    parent_pids            String                      CODEC(ZSTD(1)),
+    parent_pids            Array(UInt32)               CODEC(ZSTD(1)),
 
     INDEX idx_pid       pid            TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_cgroup    cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
@@ -177,7 +177,7 @@ SELECT 'ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;';
 -- Генерирует DROP+CREATE с прежним URL и актуальной структурой.
 -- Выполните если менялся набор колонок в CSV.
 
-SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (if(tags = '''', [], splitByChar(''|'', tags)) AS tags)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
+SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (\n    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n    if(parent_pids = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', parent_pids))) AS parent_pids\n)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
     mv.name,
     currentDatabase(),
     extractAll(mv.create_table_query, 'url\\(''([^'']+)''')[1],
@@ -188,7 +188,7 @@ CROSS JOIN (
     SELECT arrayStringConcat(groupArray(
         name || ' ' || multiIf(
             name = 'timestamp', 'DateTime64(3, ''''UTC'''')',
-            name = 'tags', 'String',
+            name IN ('tags', 'parent_pids'), 'String',
             type LIKE 'LowCardinality(%)', extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type
         )
