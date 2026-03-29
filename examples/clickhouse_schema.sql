@@ -177,7 +177,7 @@ SELECT 'ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;';
 -- Генерирует DROP+CREATE с прежним URL и актуальной структурой.
 -- Выполните если менялся набор колонок в CSV.
 
-SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 1 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (if(tags = '''', [], splitByChar(''|'', tags)) AS tags)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
+SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (if(tags = '''', [], splitByChar(''|'', tags)) AS tags)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
     mv.name,
     currentDatabase(),
     extractAll(mv.create_table_query, 'url\\(''([^'']+)''')[1],
