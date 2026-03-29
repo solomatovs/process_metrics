@@ -1595,8 +1595,8 @@ static int load_config(const char *path)
 
 	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
-	g_http_cfg.port = 9091;
-	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "0.0.0.0");
+	g_http_cfg.port = 10003;
+	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "127.0.0.1");
 
 	config_setting_t *hs = config_lookup(&cfg, "http_server");
 	if (hs) {
