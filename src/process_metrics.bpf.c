@@ -1513,6 +1513,31 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 
 	bpf_map_update_elem(&fd_map, &fk, fi, BPF_ANY);
 	bpf_map_delete_elem(&openat_args_map, &pid_tgid);
+
+	/* Отправляем событие file_open через кольцевой буфер */
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (fe) {
+		BPF_ZERO_PTR(fe, sizeof(*fe));
+		fe->type = EVENT_FILE_OPEN;
+		fe->tgid = tgid;
+		fe->timestamp_ns = bpf_ktime_get_boot_ns();
+		fe->cgroup_id = bpf_get_current_cgroup_id();
+		bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+		__builtin_memcpy(fe->path, fi->path, BPF_FILE_PATH_MAX);
+		fe->flags = fi->flags;
+		fe->uid = (__u32)bpf_get_current_uid_gid();
+
+		struct task_struct *task =
+			(struct task_struct *)bpf_get_current_task();
+		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+		fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+		bpf_ringbuf_submit(fe, 0);
+	} else {
+		RB_STAT_DROP_FILE();
+	}
+
 	return 0;
 }
 
@@ -1768,6 +1793,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->read_bytes = fi->read_bytes;
 		fe->write_bytes = fi->write_bytes;
 		fe->open_count = fi->open_count;
+		fe->fsync_count = fi->fsync_count;
 
 		/* Получаем ppid */
 		struct task_struct *task =
@@ -1981,6 +2007,281 @@ int handle_pwrite_exit(struct trace_event_raw_sys_exit *ctx)
 	if (fi)
 		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
 
+	return 0;
+}
+
+/* ── readv/writev: scatter/gather I/O ────────────────────────────────── */
+
+SEC("tracepoint/syscalls/sys_enter_readv")
+int handle_readv_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 key0 = 0;
+	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
+	if (!fc || !fc->track_bytes)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	if (!bpf_map_lookup_elem(&fd_map, &fk))
+		return 0;
+
+	struct rw_args ra = { .fd = fd };
+	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_readv")
+int handle_readv_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct rw_args *ra = bpf_map_lookup_elem(&rw_args_map, &pid_tgid);
+	if (!ra)
+		return 0;
+
+	long ret = ctx->ret;
+	int fd = ra->fd;
+	bpf_map_delete_elem(&rw_args_map, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->read_bytes, (__u64)ret);
+
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_writev")
+int handle_writev_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 key0 = 0;
+	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
+	if (!fc || !fc->track_bytes)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	if (!bpf_map_lookup_elem(&fd_map, &fk))
+		return 0;
+
+	struct rw_args ra = { .fd = fd };
+	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_writev")
+int handle_writev_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct rw_args *ra = bpf_map_lookup_elem(&rw_args_map, &pid_tgid);
+	if (!ra)
+		return 0;
+
+	long ret = ctx->ret;
+	int fd = ra->fd;
+	bpf_map_delete_elem(&rw_args_map, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
+
+	return 0;
+}
+
+/* ── sendfile64: zero-copy file transfer ─────────────────────────────── */
+/* args[0]=out_fd, args[1]=in_fd, ret=bytes transferred */
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, BPF_ARGS_MAP_SIZE);
+	__type(key, __u64);    /* pid_tgid */
+	__type(value, struct sendfile_args);
+} sendfile_args_map SEC(".maps");
+
+SEC("tracepoint/syscalls/sys_enter_sendfile64")
+int handle_sendfile_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 key0 = 0;
+	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
+	if (!fc || !fc->track_bytes)
+		return 0;
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int out_fd = (int)ctx->args[0];
+	int in_fd  = (int)ctx->args[1];
+
+	/* Хотя бы один fd должен отслеживаться */
+	struct fd_key fk_out = { .tgid = tgid, .fd = out_fd };
+	struct fd_key fk_in  = { .tgid = tgid, .fd = in_fd };
+	if (!bpf_map_lookup_elem(&fd_map, &fk_out) &&
+	    !bpf_map_lookup_elem(&fd_map, &fk_in))
+		return 0;
+
+	struct sendfile_args sa = { .out_fd = out_fd, .in_fd = in_fd };
+	bpf_map_update_elem(&sendfile_args_map, &pid_tgid, &sa, BPF_ANY);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_sendfile64")
+int handle_sendfile_exit(struct trace_event_raw_sys_exit *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct sendfile_args *sa = bpf_map_lookup_elem(
+		&sendfile_args_map, &pid_tgid);
+	if (!sa)
+		return 0;
+
+	long ret = ctx->ret;
+	int out_fd = sa->out_fd;
+	int in_fd  = sa->in_fd;
+	bpf_map_delete_elem(&sendfile_args_map, &pid_tgid);
+
+	if (ret <= 0)
+		return 0;
+
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+	__u64 bytes = (__u64)ret;
+
+	/* read_bytes → in_fd, write_bytes → out_fd */
+	struct fd_key fk_in = { .tgid = tgid, .fd = in_fd };
+	struct fd_info *fi_in = bpf_map_lookup_elem(&fd_map, &fk_in);
+	if (fi_in)
+		__sync_fetch_and_add(&fi_in->read_bytes, bytes);
+
+	struct fd_key fk_out = { .tgid = tgid, .fd = out_fd };
+	struct fd_info *fi_out = bpf_map_lookup_elem(&fd_map, &fk_out);
+	if (fi_out)
+		__sync_fetch_and_add(&fi_out->write_bytes, bytes);
+
+	return 0;
+}
+
+/* ── fsync/fdatasync: счётчик вызовов ────────────────────────────────── */
+
+SEC("tracepoint/syscalls/sys_enter_fsync")
+int handle_fsync_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->fsync_count, 1);
+
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_fdatasync")
+int handle_fdatasync_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	int fd = (int)ctx->args[0];
+	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
+	if (fi)
+		__sync_fetch_and_add(&fi->fsync_count, 1);
+
+	return 0;
+}
+
+/* ── chmod/chown: security-аудит файловых операций ───────────────────── */
+
+SEC("tracepoint/syscalls/sys_enter_fchmodat")
+int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	const char *filename = (const char *)ctx->args[1];
+	__u32 mode = (__u32)ctx->args[2];
+
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
+
+	BPF_ZERO_PTR(fe, sizeof(*fe));
+	fe->type = EVENT_FILE_CHMOD;
+	fe->tgid = tgid;
+	fe->uid  = (__u32)bpf_get_current_uid_gid();
+	fe->timestamp_ns = bpf_ktime_get_boot_ns();
+	fe->cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
+	fe->chmod_mode = mode;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+	bpf_ringbuf_submit(fe, 0);
+	return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_fchownat")
+int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	const char *filename = (const char *)ctx->args[1];
+	__u32 uid = (__u32)ctx->args[2];
+	__u32 gid = (__u32)ctx->args[3];
+
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
+
+	BPF_ZERO_PTR(fe, sizeof(*fe));
+	fe->type = EVENT_FILE_CHOWN;
+	fe->tgid = tgid;
+	fe->uid  = (__u32)bpf_get_current_uid_gid();
+	fe->timestamp_ns = bpf_ktime_get_boot_ns();
+	fe->cgroup_id = bpf_get_current_cgroup_id();
+	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
+	fe->chown_uid = uid;
+	fe->chown_gid = gid;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
+	fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
+
+	bpf_ringbuf_submit(fe, 0);
 	return 0;
 }
 

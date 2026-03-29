@@ -151,6 +151,7 @@ enum event_type {
 	EVENT_EXIT           = 3,
 	EVENT_OOM_KILL       = 4,
 	EVENT_FILE_CLOSE     = 5,
+	EVENT_FILE_OPEN      = 6,
 	EVENT_NET_CLOSE      = 6,
 	EVENT_NET_LISTEN     = 12,
 	EVENT_NET_CONNECT    = 13,
@@ -163,6 +164,8 @@ enum event_type {
 	EVENT_FILE_RENAME    = 15,
 	EVENT_FILE_UNLINK    = 16,
 	EVENT_FILE_TRUNCATE  = 17,
+	EVENT_FILE_CHMOD     = 18,
+	EVENT_FILE_CHOWN     = 19,
 	/* события жизненного цикла cgroup */
 	EVENT_CGROUP_MKDIR           = 20,
 	EVENT_CGROUP_RMDIR           = 21,
@@ -265,6 +268,15 @@ struct rw_args {
 };
 
 /*
+ * Временное хранилище аргументов sendfile64 между входом и выходом из syscall.
+ * Ключ: pid_tgid (__u64)
+ */
+struct sendfile_args {
+	int   out_fd;
+	int   in_fd;
+};
+
+/*
  * Состояние отслеживания по fd в fd_map.
  * Ключ: struct fd_key { __u32 tgid; int fd; }
  */
@@ -279,6 +291,7 @@ struct fd_info {
 	__u64 read_bytes;
 	__u64 write_bytes;
 	__u32 open_count;    /* сколько раз этот fd был открыт */
+	__u32 fsync_count;   /* количество fsync/fdatasync вызовов */
 	__u64 start_ns;      /* время открытия файла (boot ns) */
 };
 
@@ -301,8 +314,12 @@ struct file_event {
 	__u64 read_bytes;
 	__u64 write_bytes;
 	__u32 open_count;
+	__u32 fsync_count;              /* fsync/fdatasync вызовы */
 	char  path2[BPF_FILE_PATH_MAX]; /* rename: new_path */
 	__u64 truncate_size;            /* truncate: new_size */
+	__u32 chmod_mode;               /* chmod: новый mode */
+	__u32 chown_uid;                /* chown: новый uid */
+	__u32 chown_gid;                /* chown: новый gid */
 };
 
 /*

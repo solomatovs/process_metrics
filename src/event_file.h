@@ -93,6 +93,10 @@ struct metric_event {
 	__u64 file_read_bytes;
 	__u64 file_write_bytes;
 	__u32 file_open_count;
+	__u32 file_fsync_count;
+	__u32 file_chmod_mode;           /* chmod: новый mode (octal) */
+	__u32 file_chown_uid;            /* chown: новый uid */
+	__u32 file_chown_gid;            /* chown: новый gid */
 
 	/* ── метрики отслеживания сети (только EVENT_NET_CLOSE) ────── */
 	char  net_local_addr[EV_ADDR_LEN];   /* форматированная строка IP */

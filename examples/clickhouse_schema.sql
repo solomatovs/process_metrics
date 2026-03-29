@@ -80,6 +80,10 @@ CREATE TABLE _pm_target (
     file_read_bytes        UInt64                      CODEC(Delta, ZSTD(1)),
     file_write_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
     file_open_count        UInt32                      CODEC(T64, ZSTD(1)),
+    file_fsync_count       UInt32                      CODEC(T64, ZSTD(1)),
+    file_chmod_mode        UInt32                      CODEC(T64, ZSTD(1)),
+    file_chown_uid         UInt32                      CODEC(T64, ZSTD(1)),
+    file_chown_gid         UInt32                      CODEC(T64, ZSTD(1)),
     net_local_addr         String                      CODEC(ZSTD(1)),
     net_remote_addr        String                      CODEC(ZSTD(1)),
     net_local_port         UInt16                      CODEC(T64, ZSTD(1)),
@@ -110,6 +114,7 @@ CREATE TABLE _pm_target (
     INDEX idx_pid       pid            TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_cgroup    cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_login     login_name     TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_tags      tags           TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_sec_addr  sec_remote_addr TYPE bloom_filter(0.01) GRANULARITY 4
 )
 ENGINE = MergeTree()

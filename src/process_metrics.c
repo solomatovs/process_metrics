@@ -2501,7 +2501,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * без вызова clock_gettime.
 	 * Cgroup резолвится из кэша (resolve_cgroup_fast), без обхода /sys.
 	 */
-	if (type == EVENT_FILE_CLOSE) {
+	if (type == EVENT_FILE_CLOSE || type == EVENT_FILE_OPEN) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -2531,7 +2531,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.timestamp_ns = fe->timestamp_ns
 					 + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    "file_close");
+				    type == EVENT_FILE_OPEN ? "file_open" : "file_close");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги из userspace hash table (O(1)) */
@@ -2566,6 +2566,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.file_read_bytes = fe->read_bytes;
 			cev.file_write_bytes = fe->write_bytes;
 			cev.file_open_count = fe->open_count;
+			cev.file_fsync_count = fe->fsync_count;
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 
@@ -2576,9 +2577,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	}
 
-	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE ──────────────────── */
+	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE / FILE_CHMOD / FILE_CHOWN */
 	if (type == EVENT_FILE_RENAME || type == EVENT_FILE_UNLINK
-	    || type == EVENT_FILE_TRUNCATE) {
+	    || type == EVENT_FILE_TRUNCATE
+	    || type == EVENT_FILE_CHMOD || type == EVENT_FILE_CHOWN) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -2598,9 +2600,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 					 + (__u64)g_boot_to_wall_ns;
 
 			const char *etype =
-				type == EVENT_FILE_RENAME  ? "file_rename"  :
-				type == EVENT_FILE_UNLINK  ? "file_unlink"  :
-				                             "file_truncate";
+				type == EVENT_FILE_RENAME   ? "file_rename"   :
+				type == EVENT_FILE_UNLINK   ? "file_unlink"   :
+				type == EVENT_FILE_TRUNCATE ? "file_truncate" :
+				type == EVENT_FILE_CHMOD    ? "file_chmod"    :
+				type == EVENT_FILE_CHOWN    ? "file_chown"    :
+				                              "file_unknown";
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), etype);
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
@@ -2634,6 +2639,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 					    fe->path2);
 			} else if (type == EVENT_FILE_TRUNCATE) {
 				cev.file_write_bytes = fe->truncate_size;
+			} else if (type == EVENT_FILE_CHMOD) {
+				cev.file_chmod_mode = fe->chmod_mode;
+			} else if (type == EVENT_FILE_CHOWN) {
+				cev.file_chown_uid = fe->chown_uid;
+				cev.file_chown_gid = fe->chown_gid;
 			}
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
@@ -4424,6 +4434,7 @@ static void write_snapshot(void)
 					cev.file_read_bytes = fi.read_bytes;
 					cev.file_write_bytes = fi.write_bytes;
 					cev.file_open_count = fi.open_count;
+					cev.file_fsync_count = fi.fsync_count;
 
 					if (fi.start_ns > 0 &&
 					    boot_ns > fi.start_ns)
