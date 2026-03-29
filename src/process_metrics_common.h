@@ -11,7 +11,7 @@
 #endif
 
 #define COMM_LEN        16
-#define CMDLINE_MAX     256   /* должно быть степенью двойки */
+#define CMDLINE_MAX     4096
 #define MAX_PROCS       65536
 
 /* ── размеры буферов для /proc и текстового ввода-вывода ──────────── */
@@ -29,6 +29,7 @@
 #define PWD_BUF_LEN     1024  /* буфер для getpwuid_r */
 #define PROC_VAL_LEN    64    /* однострочное значение: oom_score_adj, cgroup cpu.max */
 #define BIND_ADDR_LEN   64    /* адрес привязки HTTP-сервера */
+#define HTTP_MAX_ALLOW  32    /* макс. кол-во записей в allow-списке */
 
 /* ── ёмкости хеш-таблиц и кешей (userspace) ───────────────────────── */
 #define MAX_RULES            64     /* максимум правил трекинга */

@@ -38,6 +38,26 @@ static pthread_t     g_thread;
 static volatile int  g_running;
 static int           g_max_connections;
 static volatile int  g_active_connections;
+static int                    g_allow_count;
+static struct http_allow_entry g_allow[HTTP_MAX_ALLOW];
+
+/*
+ * Проверяет, разрешён ли IP-адрес клиента по allow-списку.
+ * Возвращает 1 если разрешён, 0 если нет.
+ * Пустой allow-список (g_allow_count == 0) разрешает всех.
+ */
+static int is_allowed(const struct sockaddr_in *addr)
+{
+	if (g_allow_count == 0)
+		return 1;
+
+	in_addr_t ip = ntohl(addr->sin_addr.s_addr);
+	for (int i = 0; i < g_allow_count; i++) {
+		if ((ip & g_allow[i].mask) == g_allow[i].network)
+			return 1;
+	}
+	return 0;
+}
 
 /* ── форматирование CSV (делегировано csv_format.c) ──────────────── */
 
@@ -324,6 +344,12 @@ static void *server_thread(void *arg)
 			continue;
 		}
 
+		/* Проверяем allow-список */
+		if (!is_allowed(&client_addr)) {
+			close(client_fd);
+			continue;
+		}
+
 		/* Проверяем лимит одновременных подключений */
 		if (__atomic_load_n(&g_active_connections, __ATOMIC_RELAXED) >=
 		    g_max_connections) {
@@ -404,6 +430,8 @@ int http_server_start(const struct http_config *cfg)
 
 	g_running = 1;
 	g_max_connections = cfg->max_connections;
+	g_allow_count = cfg->allow_count;
+	memcpy(g_allow, cfg->allow, sizeof(g_allow[0]) * cfg->allow_count);
 
 	if (pthread_create(&g_thread, NULL, server_thread, NULL) != 0) {
 		fprintf(stderr, "ERROR: http_server: pthread_create: %s\n",

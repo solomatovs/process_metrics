@@ -71,7 +71,6 @@ static const char *cfg_config_file     = NULL;
 static char        cfg_hostname[EF_HOSTNAME_LEN]    = "";
 static int         cfg_snapshot_interval           = 30;
 static int         cfg_refresh_interval            = 0;  /* 0 = использовать snapshot_interval */
-static int         cfg_cmdline_max_len             = 500;
 static int         cfg_exec_rate_limit             = 0;  /* 0 = без ограничений */
 static int         cfg_cgroup_metrics              = 1;  /* 1 = читать файлы cgroup */
 static int         cfg_refresh_proc                = 1;  /* 1 = обновлять cmdline/comm из /proc */
@@ -1580,8 +1579,6 @@ static int load_config(const char *path)
 	if (cfg_refresh_interval > cfg_snapshot_interval)
 		cfg_refresh_interval = cfg_snapshot_interval;
 
-	if (config_lookup_int(&cfg, "cmdline_max_len", &int_val))
-		cfg_cmdline_max_len = int_val;
 	if (config_lookup_int(&cfg, "exec_rate_limit", &int_val))
 		cfg_exec_rate_limit = int_val;
 
@@ -1596,6 +1593,7 @@ static int load_config(const char *path)
 	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
 	g_http_cfg.port = 10003;
+	g_http_cfg.max_connections = 1;
 	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "127.0.0.1");
 
 	config_setting_t *hs = config_lookup(&cfg, "http_server");
@@ -1607,6 +1605,59 @@ static int load_config(const char *path)
 		if (config_setting_lookup_string(hs, "bind", &str_val))
 			snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind),
 				 "%s", str_val);
+		if (config_setting_lookup_int(hs, "max_connections", &int_val))
+			g_http_cfg.max_connections = int_val;
+
+		/* allow = ("10.0.0.0/8", "192.168.1.0/24", "127.0.0.1"); */
+		config_setting_t *allow = config_setting_get_member(hs, "allow");
+		if (allow) {
+			int cnt = config_setting_length(allow);
+			if (cnt > HTTP_MAX_ALLOW) {
+				fprintf(stderr,
+					"WARN: http_server: allow list truncated to %d entries\n",
+					HTTP_MAX_ALLOW);
+				cnt = HTTP_MAX_ALLOW;
+			}
+			for (int i = 0; i < cnt; i++) {
+				const char *cidr = config_setting_get_string_elem(allow, i);
+				if (!cidr) continue;
+
+				char ip_buf[64];
+				snprintf(ip_buf, sizeof(ip_buf), "%s", cidr);
+
+				int prefix = 32;
+				char *slash = strchr(ip_buf, '/');
+				if (slash) {
+					*slash = '\0';
+					prefix = atoi(slash + 1);
+					if (prefix < 0 || prefix > 32) {
+						fprintf(stderr,
+							"ERROR: http_server: invalid prefix /%d in '%s'\n",
+							prefix, cidr);
+						config_destroy(&cfg);
+						return 1;
+					}
+				}
+
+				struct in_addr parsed;
+				if (inet_pton(AF_INET, ip_buf, &parsed) != 1) {
+					fprintf(stderr,
+						"ERROR: http_server: invalid IP in '%s'\n",
+						cidr);
+					config_destroy(&cfg);
+					return 1;
+				}
+
+				in_addr_t mask = (prefix == 0) ? 0
+					: htonl(~((1U << (32 - prefix)) - 1));
+				g_http_cfg.allow[g_http_cfg.allow_count].mask =
+					ntohl(mask);
+				g_http_cfg.allow[g_http_cfg.allow_count].network =
+					ntohl(parsed.s_addr) & ntohl(mask);
+				g_http_cfg.allow_count++;
+			}
+		}
+
 		long long ll_val;
 		if (config_setting_lookup_int64(hs, "max_buffer_size", &ll_val))
 			cfg_max_data_size = ll_val;

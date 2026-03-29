@@ -32,7 +32,49 @@
  * bpf_ringbuf_submit, иначе поля, не заданные явно (например tx_bytes,
  * rx_bytes в sock_info), будут содержать мусор со стека BPF.
  */
-#define BPF_ZERO(var) __builtin_memset(&(var), 0, sizeof(var))
+/*
+ * BPF_ZERO: обнуление структуры, совместимое с BPF.
+ *
+ * clang для BPF inline'ит __builtin_memset до ~512 байт.
+ * Для больших struct (CMDLINE_MAX=1024 → struct event ~1224 байт)
+ * используем побайтовый цикл с #pragma unroll.
+ */
+static __always_inline void _bpf_zero(void *p, unsigned int sz)
+{
+	unsigned long *lp = (unsigned long *)p;
+	unsigned int longs = sz / sizeof(unsigned long);
+	unsigned int i;
+
+	#pragma unroll
+	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
+		if (i >= longs)
+			break;
+		lp[i] = 0;
+	}
+}
+
+#define BPF_ZERO(var)         _bpf_zero(&(var), sizeof(var))
+#define BPF_ZERO_PTR(ptr, sz) _bpf_zero((ptr), (sz))
+
+/*
+ * _bpf_copy: chunked memcpy для BPF (аналогично _bpf_zero).
+ * clang не inline'ит __builtin_memcpy > ~1024 байт.
+ */
+static __always_inline void _bpf_copy(void *dst, const void *src,
+				      unsigned int sz)
+{
+	unsigned long *dp = (unsigned long *)dst;
+	const unsigned long *sp = (const unsigned long *)src;
+	unsigned int longs = sz / sizeof(unsigned long);
+	unsigned int i;
+
+	#pragma unroll
+	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
+		if (i >= longs)
+			break;
+		dp[i] = sp[i];
+	}
+}
 
 /* ── rodata (настраивается из пространства пользователя перед загрузкой) ── */
 
@@ -618,7 +660,7 @@ int handle_exec(void *ctx)
 	}
 
 	/* Обнуляем структуру события (требование BPF-верификатора) */
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type         = EVENT_EXEC;
 	e->tgid         = tgid;
 	e->ppid         = ppid;
@@ -693,7 +735,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	if (!child_pi)
 		return 0;
 
-	__builtin_memset(child_pi, 0, sizeof(*child_pi));
+	BPF_ZERO_PTR(child_pi, sizeof(*child_pi));
 	child_pi->tgid      = child_tgid;
 	child_pi->ppid      = parent_tgid;
 	child_pi->uid       = (__u32)bpf_get_current_uid_gid();
@@ -711,7 +753,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 	struct proc_info *parent_pi = bpf_map_lookup_elem(&proc_map, &parent_tgid);
 	if (parent_pi) {
-		__builtin_memcpy(child_pi->cmdline, parent_pi->cmdline, CMDLINE_MAX);
+		_bpf_copy(child_pi->cmdline, parent_pi->cmdline, CMDLINE_MAX);
 		child_pi->cmdline_len = parent_pi->cmdline_len;
 	}
 	bpf_map_update_elem(&proc_map, &child_tgid, child_pi, BPF_NOEXIST);
@@ -723,7 +765,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type         = EVENT_FORK;
 	e->tgid         = child_tgid;
 	e->ppid         = parent_tgid;
@@ -998,7 +1040,7 @@ int handle_exit(void *ctx)
 		return 0;
 	}
 
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type         = EVENT_EXIT;
 	e->tgid         = tgid;
 	e->uid          = (__u32)bpf_get_current_uid_gid();
@@ -1028,7 +1070,7 @@ int handle_exit(void *ctx)
 		e->oom_killed    = info->oom_killed;
 		e->net_tx_bytes  = info->net_tx_bytes;
 		e->net_rx_bytes  = info->net_rx_bytes;
-		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
+		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
 		e->loginuid      = info->loginuid;
 		e->sessionid     = info->sessionid;
@@ -1078,7 +1120,7 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type         = EVENT_OOM_KILL;
 	e->tgid         = tgid;
 	e->uid          = (__u32)bpf_get_current_uid_gid();
@@ -1095,7 +1137,7 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 		e->cpu_ns        = info->cpu_ns;
 		e->start_ns      = info->start_ns;
 		e->cmdline_len   = info->cmdline_len;
-		__builtin_memcpy(e->cmdline, info->cmdline, CMDLINE_MAX);
+		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 	}
 
 	bpf_ringbuf_submit(e, 0);
@@ -1156,7 +1198,7 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(se, 0, sizeof(*se));
+	BPF_ZERO_PTR(se, sizeof(*se));
 	se->type         = EVENT_SIGNAL;
 	se->sender_tgid  = sender_tgid;
 	se->sender_uid   = (__u32)bpf_get_current_uid_gid();
@@ -1197,7 +1239,7 @@ int handle_sys_exit_chdir(struct trace_event_raw_sys_exit *ctx)
 		RB_STAT_DROP_PROC();
 		return 0;
 	}
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type = EVENT_CHDIR;
 	e->tgid = tgid;
 	bpf_ringbuf_submit(e, 0);
@@ -1220,7 +1262,7 @@ int handle_sys_exit_fchdir(struct trace_event_raw_sys_exit *ctx)
 		RB_STAT_DROP_PROC();
 		return 0;
 	}
-	__builtin_memset(e, 0, sizeof(*e));
+	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type = EVENT_CHDIR;
 	e->tgid = tgid;
 	bpf_ringbuf_submit(e, 0);
@@ -1453,7 +1495,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 	RB_STAT_TOTAL_FILE();
 	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
 	if (fe) {
-		__builtin_memset(fe, 0, sizeof(*fe));
+		BPF_ZERO_PTR(fe, sizeof(*fe));
 		fe->type = EVENT_FILE_CLOSE;
 		fe->tgid = tgid;
 		fe->timestamp_ns = bpf_ktime_get_boot_ns();
@@ -1688,7 +1730,7 @@ static __always_inline void emit_net_event(struct sock_info *si,
 		return;
 	}
 
-	__builtin_memset(ne, 0, sizeof(*ne));
+	BPF_ZERO_PTR(ne, sizeof(*ne));
 	ne->type         = evt_type;
 	ne->tgid         = si->tgid;
 	ne->uid          = si->uid;
@@ -1730,7 +1772,7 @@ static __always_inline void emit_net_close(struct sock_info *si,
 		return;
 	}
 
-	__builtin_memset(ne, 0, sizeof(*ne));
+	BPF_ZERO_PTR(ne, sizeof(*ne));
 	ne->type         = EVENT_NET_CLOSE;
 	ne->tgid         = si->tgid;
 	ne->uid          = si->uid;
@@ -2178,7 +2220,7 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(re, 0, sizeof(*re));
+	BPF_ZERO_PTR(re, sizeof(*re));
 	re->type = EVENT_TCP_RETRANSMIT;
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
 
@@ -2227,7 +2269,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 		return 0;
 	}
 
-	__builtin_memset(se, 0, sizeof(*se));
+	BPF_ZERO_PTR(se, sizeof(*se));
 	se->type = EVENT_SYN_RECV;
 	se->timestamp_ns = bpf_ktime_get_boot_ns();
 
@@ -2306,7 +2348,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(re, 0, sizeof(*re));
+	BPF_ZERO_PTR(re, sizeof(*re));
 	re->type = EVENT_RST;
 	re->direction = 0; /* отправлен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
@@ -2350,7 +2392,7 @@ int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 		return 0;
 	}
 
-	__builtin_memset(re, 0, sizeof(*re));
+	BPF_ZERO_PTR(re, sizeof(*re));
 	re->type = EVENT_RST;
 	re->direction = 0; /* отправлен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
@@ -2396,7 +2438,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 	}
 
-	__builtin_memset(re, 0, sizeof(*re));
+	BPF_ZERO_PTR(re, sizeof(*re));
 	re->type = EVENT_RST;
 	re->direction = 1; /* получен */
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
@@ -2609,7 +2651,7 @@ static __always_inline int emit_cgroup_event(void *ctx, __u32 type)
 		return 0;
 	}
 
-	__builtin_memset(ce, 0, sizeof(*ce));
+	BPF_ZERO_PTR(ce, sizeof(*ce));
 	ce->type         = type;
 	ce->id           = tp->id;
 	ce->level        = tp->level;
@@ -2668,7 +2710,7 @@ static __always_inline int emit_cgroup_migrate(void *ctx, __u32 type)
 		return 0;
 	}
 
-	__builtin_memset(ce, 0, sizeof(*ce));
+	BPF_ZERO_PTR(ce, sizeof(*ce));
 	ce->type         = type;
 	ce->id           = tp->dst_id;
 	ce->level        = tp->dst_level;
@@ -2711,7 +2753,7 @@ static __always_inline int emit_cgroup_state(void *ctx, __u32 type)
 		return 0;
 	}
 
-	__builtin_memset(ce, 0, sizeof(*ce));
+	BPF_ZERO_PTR(ce, sizeof(*ce));
 	ce->type         = type;
 	ce->id           = tp->id;
 	ce->level        = tp->level;

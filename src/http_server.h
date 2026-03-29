@@ -11,13 +11,22 @@
 #define HTTP_SERVER_H
 
 #include <linux/types.h>
+#include <netinet/in.h>
 #include "process_metrics_common.h"
+
+/* Запись allow-списка: сеть + маска (host byte order) */
+struct http_allow_entry {
+	in_addr_t network;   /* IP & mask */
+	in_addr_t mask;      /* маска (напр. 0xFFFFFF00 для /24) */
+};
 
 struct http_config {
 	int  port;           /* порт для прослушивания (по умолчанию: 9091) */
 	char bind[BIND_ADDR_LEN]; /* адрес привязки (по умолчанию: "0.0.0.0") */
 	int  enabled;        /* 0 = отключён */
 	int  max_connections; /* макс. одновременных подключений (по умолчанию: 1) */
+	int  allow_count;    /* кол-во записей в allow (0 = принимать всех) */
+	struct http_allow_entry allow[HTTP_MAX_ALLOW];
 };
 
 /*
