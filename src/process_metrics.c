@@ -2079,6 +2079,29 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 		fclose(sf);
 	}
 
+	/* Чтение loginuid/sessionid из /proc/PID/ (audit) */
+	{
+		char apath[PROC_PATH_LEN];
+		FILE *af;
+		unsigned int aval;
+
+		snprintf(apath, sizeof(apath), "/proc/%u/loginuid", pid);
+		af = fopen(apath, "r");
+		if (af) {
+			if (fscanf(af, "%u", &aval) == 1)
+				pi->loginuid = (__u32)aval;
+			fclose(af);
+		}
+
+		snprintf(apath, sizeof(apath), "/proc/%u/sessionid", pid);
+		af = fopen(apath, "r");
+		if (af) {
+			if (fscanf(af, "%u", &aval) == 1)
+				pi->sessionid = (__u32)aval;
+			fclose(af);
+		}
+	}
+
 	/* Чтение IO из /proc/PID/io (требует root или ptrace) */
 	char iopath[PROC_PATH_LEN];
 	snprintf(iopath, sizeof(iopath), "/proc/%u/io", pid);
