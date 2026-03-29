@@ -2064,9 +2064,11 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 		char sline[PROC_STATUS_LINE];
 		while (fgets(sline, sizeof(sline), sf)) {
 			unsigned long val;
-			unsigned int uid_val;
-			if (sscanf(sline, "Uid:\t%u", &uid_val) == 1)
-				pi->uid = (__u32)uid_val;
+			unsigned int uid_val, euid_val;
+			if (sscanf(sline, "Uid:\t%u\t%u", &uid_val, &euid_val) == 2) {
+				pi->uid  = (__u32)uid_val;
+				pi->euid = (__u32)euid_val;
+			}
 			else if (sscanf(sline, "RssShmem: %lu kB", &val) == 1)
 				pi->shmem_pages = (__u64)(val * 1024 / page_size);
 			else if (sscanf(sline, "VmSwap: %lu kB", &val) == 1)

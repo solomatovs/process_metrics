@@ -772,6 +772,9 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	e->tgid         = child_tgid;
 	e->ppid         = parent_tgid;
 	e->uid          = child_pi->uid;
+	e->loginuid     = child_pi->loginuid;
+	e->sessionid    = child_pi->sessionid;
+	e->euid         = child_pi->euid;
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id    = child_pi->cgroup_id;
 	e->start_ns     = child_pi->start_ns;
