@@ -380,7 +380,7 @@ struct track_info {
 	__u16 rule_id;
 	__u8  is_root;
 	__u8  _pad;       /* явное выравнивание — верификатор ядра 5.15 требует инициализации всех байт стека */
-};
+} __attribute__((aligned(8)));
 
 /*
  * Событие кольцевого буфера — отправляется из BPF в userspace при fork/exec/exit.
@@ -480,7 +480,7 @@ struct sock_info {
 	__u64 rx_calls;       /* количество вызовов recvmsg */
 	__u64 start_ns;       /* время начала соединения (boot ns) */
 	__u8  is_listener;    /* 1 = слушающий сокет (не соединение) */
-};
+} __attribute__((aligned(8)));
 
 /*
  * Событие закрытия сетевого соединения — отправляется из BPF в userspace
@@ -600,7 +600,7 @@ struct udp_agg_key {
 	__u8  af;
 	__u8  remote_addr[16];
 	__u16 remote_port;
-};
+} __attribute__((aligned(8)));
 
 struct udp_agg_val {
 	__u64 tx_packets;
@@ -616,7 +616,7 @@ struct icmp_agg_key {
 	__u8  src_addr[16];
 	__u8  icmp_type;
 	__u8  icmp_code;
-};
+} __attribute__((aligned(8)));
 
 struct icmp_agg_val {
 	__u64 count;
