@@ -2051,11 +2051,9 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 			    const char *tags, const char *cgroup)
 {
 	memset(out, 0, sizeof(*out));
-	/* Используем реальное время вместо BPF-метки относительно загрузки */
-	struct timespec ts_now;
-	clock_gettime(CLOCK_REALTIME, &ts_now);
-	out->timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
-			  + (__u64)ts_now.tv_nsec;
+	/* Время из BPF (boot_ns) → wall clock через предвычисленное смещение.
+	 * Точнее чем clock_gettime в userspace — отражает момент syscall в ядре. */
+	out->timestamp_ns = e->timestamp_ns + (__u64)g_boot_to_wall_ns;
 	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
 	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
 	if (tags)
