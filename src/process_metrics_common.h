@@ -203,6 +203,11 @@ enum proc_status {
 	PROC_STATUS_EXITED = 1,   /* процесс завершился (exit/kill/oom) */
 };
 
+enum sock_status {
+	SOCK_STATUS_OPEN   = 0,   /* соединение живое (default) */
+	SOCK_STATUS_CLOSED = 1,   /* соединение закрыто, ожидает snapshot + удаления */
+};
+
 /* ── отслеживание cgroup ─────────────────────────────────────────── */
 
 #define CGROUP_PATH_MAX  256
@@ -525,6 +530,7 @@ struct sock_info {
 	__u64 rx_calls;       /* количество вызовов recvmsg */
 	__u64 start_ns;       /* время начала соединения (boot ns) */
 	__u8  is_listener;    /* 1 = слушающий сокет (не соединение) */
+	__u8  status;         /* enum sock_status: OPEN=0, CLOSED=1 */
 } __attribute__((aligned(8)));
 
 /*

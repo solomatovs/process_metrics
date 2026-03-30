@@ -2698,29 +2698,30 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
 	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
 
+	/* Отложенное удаление: помечаем CLOSED вместо delete.
+	 * write_snapshot() запишет финальный conn_snapshot и удалит. */
+	si->status = SOCK_STATUS_CLOSED;
+
 	/* TCP state на момент close:
 	 * ESTABLISHED(1) = инициатор закрытия (шлёт FIN первым)
 	 * CLOSE_WAIT(8)  = реагирует на чужой FIN */
 	__u8 tcp_state = BPF_CORE_READ(sk, __sk_common.skc_state);
 	emit_net_close(si, bpf_ktime_get_boot_ns(), tcp_state);
 
-	/* Сохраняем sk_ptr для kretprobe (отложенное удаление из sock_map) */
+	/* Сохраняем sk_ptr для kretprobe (tcp_send_active_reset
+	 * всё ещё может обращаться к sock_map между kprobe и kretprobe) */
 	__u32 zero = 0;
 	bpf_map_update_elem(&tcp_close_sk, &zero, &sk_ptr, BPF_ANY);
 	return 0;
 }
 
+/* kretp_tcp_close: больше не нужен — sock_map запись удаляется
+ * в userspace write_snapshot() после snapshot'а (отложенное удаление).
+ * Программа оставлена пустой для совместимости скелетона,
+ * но отключается через BPF_PROG_DISABLE при !need_sock_map. */
 SEC("kretprobe/tcp_close")
 int BPF_KRETPROBE(kretp_tcp_close)
 {
-	__u32 zero = 0;
-	__u64 *sk_ptr_p = bpf_map_lookup_elem(&tcp_close_sk, &zero);
-	if (!sk_ptr_p || !*sk_ptr_p)
-		return 0;
-
-	__u64 sk_ptr = *sk_ptr_p;
-	*sk_ptr_p = 0; /* сбрасываем */
-	bpf_map_delete_elem(&sock_map, &sk_ptr);
 	return 0;
 }
 

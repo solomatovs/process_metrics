@@ -167,34 +167,11 @@ static int cfg_emit_cgroup         = 1;
  * Используется для адаптивного refresh_interval и heartbeat диагностики. */
 static int g_last_map_count    = 0;   /* proc_map (refresh_processes) */
 static int g_last_conn_count   = 0;   /* sock_map (write_snapshot) */
-static int g_last_fd_count     = 0;   /* fd_map (write_snapshot) */
 
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
 static struct file_prefix cfg_file_exclude[FILE_MAX_PREFIXES];
 static int cfg_file_exclude_count           = 0;
-
-/* ── file path include/exclude фильтр (userspace, для file_snapshot) ── */
-
-static int file_path_allowed(const char *path)
-{
-	if (cfg_file_include_count > 0) {
-		int matched = 0;
-		for (int i = 0; i < cfg_file_include_count; i++)
-			if (strncmp(path, cfg_file_include[i].prefix,
-				    cfg_file_include[i].len) == 0) {
-				matched = 1;
-				break;
-			}
-		if (!matched)
-			return 0;
-	}
-	for (int i = 0; i < cfg_file_exclude_count; i++)
-		if (strncmp(path, cfg_file_exclude[i].prefix,
-			    cfg_file_exclude[i].len) == 0)
-			return 0;
-	return 1;
-}
 
 /* ── глобальные переменные ─────────────────────────────────────────── */
 
@@ -2641,10 +2618,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			memset(&cev, 0, sizeof(cev));
 
 			/* Время: BPF boot_ns → wall clock через предвычисленное смещение */
-			cev.timestamp_ns = fe->timestamp_ns
-					 + (__u64)g_boot_to_wall_ns;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    type == EVENT_FILE_OPEN ? "file_open" : "file_close");
+			cev.timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), type == EVENT_FILE_OPEN ? "file_open" : "file_close");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги из userspace hash table (O(1)) */
@@ -2659,8 +2634,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Identity из proc_map */
 			{
 				struct proc_info pi_file;
-				if (bpf_map_lookup_elem(proc_map_fd,
-							&fe->tgid, &pi_file) == 0) {
+				if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0) {
 					cev.loginuid  = pi_file.loginuid;
 					cev.sessionid = pi_file.sessionid;
 					cev.euid      = pi_file.euid;
@@ -2669,12 +2643,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 
 			/* Cgroup из кэша — линейный поиск по ~50 записям, без syscall */
-			resolve_cgroup_fast_ts(fe->cgroup_id,
-					       cev.cgroup, sizeof(cev.cgroup));
+			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
 
 			/* Файловые метрики: путь, флаги, прочитано/записано, кол-во открытий */
-			fast_strcpy(cev.file_path, sizeof(cev.file_path),
-				    fe->path);
+			fast_strcpy(cev.file_path, sizeof(cev.file_path), fe->path);
 			cev.file_flags = (__u32)fe->flags;
 			cev.file_read_bytes = fe->read_bytes;
 			cev.file_write_bytes = fe->write_bytes;
@@ -2716,8 +2688,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 
-			cev.timestamp_ns = fe->timestamp_ns
-					 + (__u64)g_boot_to_wall_ns;
+			cev.timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
 
 			const char *etype =
 				type == EVENT_FILE_RENAME   ? "file_rename"   :
@@ -2746,11 +2717,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cev.tty_nr    = pi_mut.tty_nr;
 			}
 
-			resolve_cgroup_fast_ts(fe->cgroup_id,
-					       cev.cgroup, sizeof(cev.cgroup));
+			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
 
-			fast_strcpy(cev.file_path, sizeof(cev.file_path),
-				    fe->path);
+			fast_strcpy(cev.file_path, sizeof(cev.file_path), fe->path);
 			cev.file_flags = (__u32)fe->flags;
 
 			if (type == EVENT_FILE_RENAME) {
@@ -3107,8 +3076,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			clock_gettime(CLOCK_REALTIME, &ts_now);
 			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 					 + (__u64)ts_now.tv_nsec;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				 "syn_recv");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), "syn_recv");
 			cev.pid = se_syn->tgid;
 			cev.uid = se_syn->uid;
 			memcpy(cev.comm, se_syn->comm, COMM_LEN);
@@ -3183,18 +3151,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
-					 + (__u64)ts_now.tv_nsec;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    rste->direction ? "rst_recv" : "rst_sent");
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC + (__u64)ts_now.tv_nsec;
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), rste->direction ? "rst_recv" : "rst_sent");
 			cev.pid = rste->tgid;
 			cev.uid = rste->uid;
 			memcpy(cev.comm, rste->comm, COMM_LEN);
 			resolve_cgroup_fast_ts(rste->cgroup_id, cev.cgroup,
 					       sizeof(cev.cgroup));
 			struct track_info ti;
-			if (bpf_map_lookup_elem(tracked_map_fd,
-						&rste->tgid, &ti) == 0) {
+			if (bpf_map_lookup_elem(tracked_map_fd, &rste->tgid, &ti) == 0) {
 				if (ti.rule_id < num_rules)
 					fast_strcpy(cev.rule, sizeof(cev.rule),
 						    rules[ti.rule_id].name);
@@ -4206,13 +4171,11 @@ static void write_snapshot(void)
 		int err = bpf_map_get_next_key(tracked_map_fd, NULL, &key);
 		while (err == 0 && fork_rec_iter++ < MAX_PROCS) {
 			__u32 next;
-			int next_err = bpf_map_get_next_key(tracked_map_fd,
-							    &key, &next);
+			int next_err = bpf_map_get_next_key(tracked_map_fd, &key, &next);
 
 			/* Быстрая проверка: есть ли pid в pidtree? */
 			pthread_rwlock_rdlock(&g_pidtree_lock);
-			__u32 ppid_in_tree = pidtree_lookup_in(pt_pid, pt_ppid,
-							       key);
+			__u32 ppid_in_tree = pidtree_lookup_in(pt_pid, pt_ppid, key);
 			pthread_rwlock_unlock(&g_pidtree_lock);
 
 			if (ppid_in_tree == 0) {
@@ -4329,10 +4292,14 @@ static void write_snapshot(void)
 		}
 
 		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &key, &ti) != 0)
-			continue;
+		int tracked = bpf_map_lookup_elem(tracked_map_fd, &key, &ti) == 0;
 
 		int is_exited = (pi.status != PROC_STATUS_ALIVE);
+
+		/* EXITED: записываем snapshot даже если handle_exit
+		 * уже удалил из tracked_map (короткоживущий процесс). */
+		if (!tracked && !is_exited)
+			continue;
 
 		/* Завершённые → в dead_keys, но НЕ пропускаются.
 		 * При переполнении буфера — flush и продолжаем сбор. */
@@ -4345,7 +4312,7 @@ static void write_snapshot(void)
 			dead_keys[dead_count++] = key;
 		}
 
-		const char *rule_name = (ti.rule_id < num_rules)
+		const char *rule_name = (tracked && ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		/* Разрешение cgroup из кэша */
@@ -4386,17 +4353,14 @@ static void write_snapshot(void)
 			snprintf(cev.tags, sizeof(cev.tags), "%s",
 				 tags_lookup_copy(snap_tgid, snap_data, key));
 #endif
-			cev.root_pid = ti.root_pid;
+			cev.root_pid = tracked ? ti.root_pid : 0;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
 			cev.uid = pi.uid;
 			memcpy(cev.comm, pi.comm, COMM_LEN);
-			cmdline_split(pi.cmdline, pi.cmdline_len,
-				      cev.exec_path, sizeof(cev.exec_path),
-				      cev.args, sizeof(cev.args));
-			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s",
-				 cg_path);
-			cev.is_root = ti.is_root;
+			cmdline_split(pi.cmdline, pi.cmdline_len, cev.exec_path, sizeof(cev.exec_path), cev.args, sizeof(cev.args));
+			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
+			cev.is_root = tracked ? ti.is_root : 0;
 			cev.state = pi.state;
 			cev.cpu_ns = pi.cpu_ns;
 			cev.cpu_usage_ratio = cpu_ratio;
@@ -4418,8 +4382,7 @@ static void write_snapshot(void)
 			cev.net_tx_bytes = pi.net_tx_bytes;
 			cev.net_rx_bytes = pi.net_rx_bytes;
 			cev.start_time_ns = pi.start_ns;
-			cev.uptime_seconds = (__u64)(uptime_sec > 0
-						     ? uptime_sec : 0);
+			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
 
 			cev.loginuid       = pi.loginuid;
 			cev.sessionid      = pi.sessionid;
@@ -4490,6 +4453,8 @@ static void write_snapshot(void)
 	if (cfg_net_tracking_enabled && g_http_cfg.enabled) {
 		int sm_fd = bpf_map__fd(skel->maps.sock_map);
 
+		int closed_sock_count = 0;
+
 		__u64 sk_key;
 		int sk_iter = 0;
 		int sk_err = bpf_map_get_next_key(sm_fd, NULL, &sk_key);
@@ -4500,12 +4465,16 @@ static void write_snapshot(void)
 							       &sk_next);
 			struct sock_info si;
 			if (bpf_map_lookup_elem(sm_fd, &sk_key, &si) == 0) {
+
 				struct track_info ti;
-				if (bpf_map_lookup_elem(tracked_map_fd,
-							&si.tgid, &ti) == 0)
+				int tracked = bpf_map_lookup_elem(tracked_map_fd,
+								  &si.tgid, &ti) == 0;
+				/* CLOSED: записываем snapshot даже если процесс
+				 * уже не в tracked_map (короткоживущий). */
+				if (tracked || si.status == SOCK_STATUS_CLOSED)
 				{
 					const char *rname =
-						(ti.rule_id < num_rules)
+						(tracked && ti.rule_id < num_rules)
 						? rules[ti.rule_id].name
 						: RULE_NOT_MATCH;
 
@@ -4526,10 +4495,10 @@ static void write_snapshot(void)
 							snap_data,
 							si.tgid));
 #endif
-					cev.root_pid = ti.root_pid;
+					cev.root_pid = tracked ? ti.root_pid : 0;
 					cev.pid = si.tgid;
 					cev.uid = si.uid;
-					cev.is_root = ti.is_root;
+					cev.is_root = tracked ? ti.is_root : 0;
 
 					/* comm, ppid, identity из proc_map */
 					struct proc_info cpi;
@@ -4592,107 +4561,26 @@ static void write_snapshot(void)
 					ef_append(&cev, cfg_hostname);
 					conn_count++;
 				}
+
+				/* CLOSED → удаляем ПОСЛЕ snapshot записи */
+				if (si.status == SOCK_STATUS_CLOSED) {
+					bpf_map_delete_elem(sm_fd, &sk_key);
+					closed_sock_count++;
+				}
 			}
 
 			if (sk_next_err != 0)
 				break;
 			sk_key = sk_next;
 		}
+
+		if (closed_sock_count > 0)
+			LOG_DEBUG(cfg_log_level, "conn_snapshot: cleaned %d closed socks",
+				  closed_sock_count);
 	}
 
-	/* ── file_snapshot: метрики открытых файлов ──────────────────── */
-	int file_snap_count = 0;
-	if (cfg_file_tracking_enabled && g_http_cfg.enabled) {
-		int fm_fd = bpf_map__fd(skel->maps.fd_map);
-
-		struct fd_key fk_key;
-		int fk_iter = 0;
-		int fk_err = bpf_map_get_next_key(fm_fd, NULL, &fk_key);
-		while (fk_err == 0 && fk_iter++ < BPF_FD_MAP_SIZE) {
-			struct fd_key fk_next;
-			int fk_next_err = bpf_map_get_next_key(fm_fd,
-							       &fk_key,
-							       &fk_next);
-
-			struct fd_info fi;
-			if (bpf_map_lookup_elem(fm_fd, &fk_key, &fi) == 0
-			    && fi.path[0] != '\0'
-			    && file_path_allowed(fi.path)) {
-				struct track_info ti;
-				if (bpf_map_lookup_elem(tracked_map_fd,
-							&fk_key.tgid,
-							&ti) == 0)
-				{
-					const char *rname =
-						(ti.rule_id < num_rules)
-						? rules[ti.rule_id].name
-						: RULE_NOT_MATCH;
-
-					struct metric_event cev;
-					memset(&cev, 0, sizeof(cev));
-					cev.timestamp_ns = snap_timestamp_ns;
-					fast_strcpy(cev.event_type,
-						    sizeof(cev.event_type),
-						    "file_snapshot");
-					fast_strcpy(cev.rule,
-						    sizeof(cev.rule),
-						    rname);
-#ifndef NO_TAGS
-					fast_strcpy(cev.tags,
-						    sizeof(cev.tags),
-						    tags_lookup_copy(
-							snap_tgid,
-							snap_data,
-							fk_key.tgid));
-#endif
-					cev.root_pid = ti.root_pid;
-					cev.pid = fk_key.tgid;
-					cev.is_root = ti.is_root;
-
-					struct proc_info fpi;
-					if (bpf_map_lookup_elem(
-						proc_map_fd,
-						&fk_key.tgid, &fpi) == 0) {
-						cev.ppid = fpi.ppid;
-						cev.uid  = fpi.uid;
-						memcpy(cev.comm, fpi.comm,
-						       COMM_LEN);
-						cev.loginuid  = fpi.loginuid;
-						cev.sessionid = fpi.sessionid;
-						cev.euid      = fpi.euid;
-						cev.tty_nr    = fpi.tty_nr;
-					}
-
-					fast_strcpy(cev.file_path,
-						    sizeof(cev.file_path),
-						    fi.path);
-					cev.file_flags = (__u32)fi.flags;
-					cev.file_read_bytes = fi.read_bytes;
-					cev.file_write_bytes = fi.write_bytes;
-					cev.file_open_count = fi.open_count;
-					cev.file_fsync_count = fi.fsync_count;
-
-					if (fi.start_ns > 0 &&
-					    boot_ns > fi.start_ns)
-						cev.net_duration_ms =
-							(boot_ns - fi.start_ns)
-							/ NS_PER_MS;
-
-					pidtree_get_chain_copy(
-						snap_pt_pid, snap_pt_ppid,
-						fk_key.tgid,
-						cev.parent_pids,
-						&cev.parent_pids_len);
-					ef_append(&cev, cfg_hostname);
-					file_snap_count++;
-				}
-			}
-
-			if (fk_next_err != 0)
-				break;
-			fk_key = fk_next;
-		}
-	}
+	/* file_snapshot убран: file_open/file_close events через ring buffer
+	 * полностью покрывают файловый I/O, включая короткоживущие fd. */
 
 	ef_batch_unlock();
 
@@ -4700,12 +4588,11 @@ static void write_snapshot(void)
 	dead_total += flush_dead_keys(dead_keys, dead_count);
 
 	if (cfg_log_snapshot)
-		LOG_INFO("snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
-		       pid_count, dead_total, snap_count, conn_count, file_snap_count);
+		LOG_INFO("snapshot: %d PIDs (%d exited), %d events, %d conns",
+		       pid_count, dead_total, snap_count, conn_count);
 
 	/* Обновляем глобальные счётчики для heartbeat */
 	g_last_conn_count = conn_count;
-	g_last_fd_count = file_snap_count;
 
 	/* Статистика ring buffer'ов — логируем только НОВЫЕ drops */
 	{
@@ -5388,13 +5275,12 @@ int main(int argc, char *argv[])
 							__ATOMIC_RELAXED);
 			}
 			LOG_INFO("heartbeat: %d refreshes, %d snapshots | "
-			       "maps: tracked=%d conns=%d fds=%d | "
+			       "maps: tracked=%d conns=%d | "
 			       "events/%ds: proc=%llu file=%llu file_ops=%llu "
 			       "net=%llu sec=%llu cgroup=%llu",
 			       hb_refreshes, hb_snapshots,
 			       g_last_map_count,
 			       g_last_conn_count,
-			       g_last_fd_count,
 			       cfg_heartbeat_interval,
 			       (unsigned long long)(ev[0] - prev_ev[0]),
 			       (unsigned long long)(ev[1] - prev_ev[1]),
