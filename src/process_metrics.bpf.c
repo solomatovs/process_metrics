@@ -1053,11 +1053,20 @@ int handle_exit(void *ctx)
 		info->oom_score_adj = final_oom_adj;
 	}
 
+	/* Удаляем карты ДО резервирования ring buffer.
+	 * При fork storm ring buffer переполняется, reserve возвращает NULL,
+	 * и если delete после reserve — записи остаются навсегда (65K EXITED).
+	 * Указатель info (из proc_map lookup) остаётся валидным до delete,
+	 * поэтому удаляем tracked_map первой, а proc_map — после заполнения
+	 * события данными из info. */
+	bpf_map_delete_elem(&tracked_map, &tgid);
+
 	/* Отправляем событие EXIT в ring buffer */
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
 	if (!e) {
 		RB_STAT_DROP_PROC();
+		bpf_map_delete_elem(&proc_map, &tgid);
 		return 0;
 	}
 
@@ -1110,12 +1119,8 @@ int handle_exit(void *ctx)
 
 	bpf_ringbuf_submit(e, 0);
 
-	/* Удаляем карты ПОСЛЕ отправки exit-события.
-	 * При fork storm'ах отложенный cleanup в userspace не успевает:
-	 * карты забиваются до 65K мёртвыми записями, refresh_processes
-	 * тратит 100% CPU на итерацию kill(pid,0)→ESRCH.
-	 * Удаление в BPF — O(1), мгновенно освобождает слот. */
-	bpf_map_delete_elem(&tracked_map, &tgid);
+	/* proc_map удаляем после submit — info указатель использовался выше.
+	 * tracked_map уже удалена перед reserve. */
 	bpf_map_delete_elem(&proc_map, &tgid);
 
 	return 0;
@@ -1491,6 +1496,16 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 
 	const char *pathname = (const char *)ctx->args[1];
 	bpf_probe_read_user_str(sc->path, sizeof(sc->path), pathname);
+
+	/* Относительные пути (openat с dirfd != AT_FDCWD) не содержат
+	 * абсолютного контекста — include/exclude фильтры не работают.
+	 * Управляется file_tracking.absolute_paths_only (default true). */
+	{
+		__u32 zero = 0;
+		struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &zero);
+		if (fc && fc->absolute_paths_only && sc->path[0] != '/')
+			return 0;
+	}
 
 	if (!path_matches_include(sc->path))
 		return 0;

@@ -31,17 +31,17 @@
 #   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
 #   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
 #
-# Ресурсы (по результатам стресс-тестирования, ~1600 PIDs, все коллекторы вкл):
+# Ресурсы (по результатам стресс-тестирования, ~400 PIDs, все коллекторы вкл,
+# snapshot_interval=3s, file_tracking с широким include, BPF_FILE_PATH_MAX=1024):
 #
-#   CPU в production (snapshot_interval=60):  ~5-15% одного ядра.
-#       При стрессе (snapshot=3s + fork/exec storm): ~20% одного ядра.
-#       Деградация (ringbuf drops) начинается при CPUQuota < 20%.
-#       CPUQuota=25% — минимум без drops при экстремальной нагрузке.
+#   CPU:  ~1.3% system-wide (0.4% userspace + 0.9% BPF ядро).
+#       При стрессе (12 I/O workers, 86K file events/20s): ~1.3% total.
+#       Деградация (ringbuf drops) начинается при CPUQuota < 15%.
 #
-#   RAM:  ~287 МБ (256 МБ BPF ring buffers + BPF maps + uid/docker кэш).
-#       BPF ring buffers размещаются в ядре и не учитываются в cgroup memory.
-#       Userspace RSS ≈ 30 МБ + HTTP-буфер (max_buffer_size, по умолчанию 256 МБ).
-#       MemoryMax=384M — достаточно с запасом. OOM при < 256 МБ.
+#   RAM:  Userspace RSS ≈ 375 МБ (HTTP buffer 256 МБ + хеш-таблицы + stacks).
+#       BPF карты ядра (НЕ в cgroup): proc_map 280 МБ, fd_map 71 МБ,
+#       ring buffers 42 МБ, sock_map/tracked/tid 26 МБ = ~420 МБ.
+#       MemoryMax=896M — достаточно с запасом для userspace RSS.
 #
 #   Disk: 0 (все данные в RAM, disk I/O отсутствует).
 
@@ -90,16 +90,12 @@ ExecStart=/usr/local/bin/process_metrics -c /etc/process_metrics/process_metrics
 ExecReload=/bin/kill -HUP $MAINPID
 
 # --- Остановка и рестарт ---
-TimeoutStopSec=5
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-# Стресс-тест (snapshot=3s, fork storm, все коллекторы):
-#   CPUQuota=20%  → 0 drops (граница)
-#   CPUQuota=15%  → 70% drops
-#   RSS стабильно ~287 МБ при любой нагрузке
-MemoryMax=384M
+MemoryMax=896M
 CPUQuota=25%
 
 # --- Hardening ---

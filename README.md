@@ -6,7 +6,8 @@
 
 ## Возможности
 
-- **19 типов событий**: snapshot, conn_snapshot, fork, exec, exit, oom_kill, file_close, net_listen, net_connect, net_accept, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv, udp_agg, icmp_agg, disk_usage
+- **26 типов событий**: snapshot, conn_snapshot, file_snapshot, fork, exec, exit, oom_kill, file_open, file_close, file_rename, file_unlink, file_truncate, file_chmod, file_chown, net_listen, net_connect, net_accept, net_close, signal, tcp_retrans, syn_recv, rst_sent, rst_recv, udp_agg, icmp_agg, disk_usage
+- **Управление emit-событий**: каждый тип события можно отключить в секции своего коллектора (`emit_*` флаги) без влияния на BPF хуки и snapshot
 - **90+ полей** на событие: CPU, RSS, swap, I/O, page faults, context switches, threads, namespaces, cgroup v2, сеть (до каждого TCP-соединения с подсчётом вызовов), файлы, сигналы, диски
 - **Правила отслеживания**: regex-фильтрация по командной строке с наследованием потомков
 - **Кольцевой буфер в RAM**: все данные в памяти, без файлового I/O на горячем пути
@@ -141,7 +142,8 @@ sudo systemctl reload process_metrics   # или kill -HUP <pid>
 |-----------|----------|---------|-------------|
 | `cgroup_metrics` | memory.max/current, swap, cpu.weight, pids из cgroup v2 | поля в `snapshot` | вкл |
 | `net_tracking` | TCP/UDP lifecycle + security-пробы + per-connection снимки | `net_listen`, `net_connect`, `net_accept`, `net_close`, `conn_snapshot`, `tcp_retrans`, `syn_recv`, `rst_sent`, `rst_recv`, `udp_agg` | выкл |
-| `file_tracking` | open/close/read/write через tracepoints | `file_close` | выкл |
+| `file_tracking` | open/close/rename/unlink/truncate/chmod/chown + file_snapshot | `file_open`, `file_close`, `file_rename`, `file_unlink`, `file_truncate`, `file_chmod`, `file_chown`, `file_snapshot` | выкл |
+| `process_tracking` | emit-флаги процессных событий (BPF хуки работают всегда) | `exec`, `fork`, `exit`, `oom_kill`, `signal`, `chdir` | вкл |
 | `disk_tracking` | Заполненность дисков через statvfs() | `disk_usage` | вкл |
 | `icmp_tracking` | Глобальная агрегация ICMP (не привязана к процессам) | `icmp_agg` | выкл |
 
@@ -185,23 +187,47 @@ net_tracking = {
 
 ### Остальные коллекторы
 
-`file_tracking` — объект с `enabled`, `tcp_bytes` (бывший `track_bytes`), `include` и `exclude` (списки префиксов путей). Без `include` отслеживаются все пути (кроме `exclude`).
+`file_tracking` — `enabled`, `track_bytes`, `include`/`exclude` (списки префиксов путей), `emit_*` флаги. Отслеживает: open, close (с накопленными read/write/pread/pwrite/readv/writev/sendfile байтами), rename, unlink, truncate, chmod, chown. Генерирует `file_snapshot` — периодический снимок каждого открытого файла (аналог conn_snapshot для сети).
+
+`process_tracking` — `emit_*` флаги для process lifecycle событий. BPF хуки fork/exec/exit работают **всегда** (нужны для tracking). Флаги управляют только отправкой в CSV.
 
 `disk_tracking` поддерживает `fs_types` (типы ФС), `include` и `exclude` (префиксы точек монтирования). По умолчанию мониторит: ext2/3/4, xfs, btrfs, vfat, zfs, ntfs, fuseblk, f2fs. Дедуплицирует bind-mount'ы одного устройства.
 
 `icmp_tracking` — глобальная агрегация ICMP-пакетов по (src_addr, type, code). Не привязана к процессам. Верхнеуровневая опция в конфиге.
 
+### emit-флаги: управление отправкой событий
+
+Каждый коллектор содержит `emit_*` флаги, управляющие **только** отправкой событий в CSV → ClickHouse. BPF хуки, ring buffer, state-логика (pidtree, tags, tracking) и snapshot'ы работают всегда.
+
+```conf
+file_tracking = {
+    enabled = true;            # BPF хуки (CPU)
+    emit_open  = false;        # отключить file_open в CSV
+    emit_close = true;         # оставить file_close
+};
+
+net_tracking = {
+    enabled = true;            # BPF хуки
+    emit_connect = false;      # отключить net_connect в CSV
+};
+
+process_tracking = {
+    emit_fork = false;         # отключить fork в CSV (tracking работает)
+};
+```
+
 ### BPF ring buffer'ы
 
-Настраиваемые через секцию `ring_buffers`. Дефолтные размеры выдерживают 35K+ TCP conn/sec с 0 drops (стресс-тестировано: 1M соединений за 30 сек при полном трекинге).
+Настраиваемые через секцию `ring_buffers`. 6 изолированных буферов с отдельными poll-потоками.
 
 | Буфер | Дефолт | События | Когда увеличивать |
 |-------|--------|---------|-------------------|
-| `proc` | 2 МБ | fork/exec/exit/oom_kill | Fork-штормы (>10K fork/sec) |
-| `file` | 2 МБ | file_close | Массовое открытие файлов |
-| `net` | 4 МБ | net_listen/connect/accept/close, signal | >50K TCP conn/sec |
-| `sec` | 1 МБ | tcp_retrans, syn_recv, rst_sent/recv | DDoS с >100K events/sec |
-| `cgroup` | 128 КБ | cgroup mkdir/rmdir | Docker-штормы |
+| `proc` | 16 МБ | fork/exec/exit/oom_kill/signal (~3800 events × 4320B) | Fork-штормы (>10K fork/sec) |
+| `file` | 16 МБ | file_close/rename/unlink/truncate/chmod/chown (~7800 × 2152B) | Массовые файловые мутации |
+| `fopen` | 4 МБ | file_open (~1900 × 2152B, допустимы потери) | Массовое открытие файлов |
+| `net` | 4 МБ | net_listen/connect/accept/close (~30K × 136B) | >50K TCP conn/sec |
+| `sec` | 1 МБ | tcp_retrans, syn_recv, rst_sent/recv (~12K × 88B) | DDoS с >100K events/sec |
+| `cgroup` | 128 КБ | cgroup mkdir/rmdir (~400 × 312B) | Docker-штормы |
 
 Ring buffer'ы аллоцируются ядром и не учитываются в cgroup memory лимитах. Значения автоматически округляются до степени 2.
 

@@ -10,6 +10,8 @@
 #include <linux/types.h>
 #endif
 
+#include "constants.h"
+
 #define COMM_LEN        16
 #define CMDLINE_MAX     4096
 #define MAX_PROCS       65536
@@ -241,8 +243,9 @@ struct cgroup_event {
  * Конфигурация, передаваемая из пространства пользователя в BPF через карты.
  */
 struct file_config {
-	__u8  enabled;       /* 1 = отслеживать open/close */
-	__u8  track_bytes;   /* 1 = также считать байты чтения/записи по fd */
+	__u8  enabled;             /* 1 = отслеживать open/close */
+	__u8  track_bytes;         /* 1 = также считать байты чтения/записи по fd */
+	__u8  absolute_paths_only; /* 1 = отбрасывать относительные пути (без /) */
 };
 
 /*

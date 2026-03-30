@@ -38,6 +38,7 @@ static pthread_t     g_thread;
 static volatile int  g_running;
 static int           g_max_connections;
 static volatile int  g_active_connections;
+static volatile int  g_client_fd = -1;   /* текущий клиентский сокет (для прерывания при shutdown) */
 static int                    g_allow_count;
 static struct http_allow_entry g_allow[HTTP_MAX_ALLOW];
 
@@ -186,55 +187,56 @@ static void handle_csv_stream(int client_fd, int clear)
 	int cork = 1;
 	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 
-	/* Отправляем HTTP-заголовок (без Content-Length — поток до закрытия) */
-	if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
-		ef_read_end(&iter, 0);
-		goto uncork;
-	}
-
-	char *sendbuf = malloc(SEND_BUF_SIZE);
-	if (!sendbuf) {
-		ef_read_end(&iter, 0);
-		goto uncork;
-	}
-	int used = 0;
-
-	/* Заголовок столбцов CSV */
-	int hdr_len;
-	const char *hdr = csv_header(&hdr_len);
-	if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
-		       hdr, hdr_len) < 0) {
-		ef_read_end(&iter, 0);
-		free(sendbuf);
-		goto uncork;
-	}
-
-	int ok = 1;
-	char row_buf[HTTP_ROW_BUF_SIZE];
-	for (int i = 0; i < n; i++) {
-		const struct ef_record *rec = ef_read_next(&iter);
-		if (!rec)
-			break;
-
-		int len = format_csv_row(row_buf, sizeof(row_buf), rec);
-		if (len <= 0)
-			continue;
-
-		if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
-			       row_buf, len) < 0) {
-			ok = 0;
+	do {
+		/* Отправляем HTTP-заголовок (без Content-Length — поток до закрытия) */
+		if (send_stream_header(client_fd, "text/csv; charset=utf-8") < 0) {
+			ef_read_end(&iter, 0);
 			break;
 		}
-	}
 
-	/* Сбрасываем оставшиеся данные */
-	if (ok && flush_sendbuf(client_fd, sendbuf, &used) < 0)
-		ok = 0;
+		char *sendbuf = malloc(SEND_BUF_SIZE);
+		if (!sendbuf) {
+			ef_read_end(&iter, 0);
+			break;
+		}
+		int used = 0;
 
-	ef_read_end(&iter, clear && ok);
-	free(sendbuf);
+		/* Заголовок столбцов CSV */
+		int hdr_len;
+		const char *hdr = csv_header(&hdr_len);
+		if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
+			       hdr, hdr_len) < 0) {
+			ef_read_end(&iter, 0);
+			free(sendbuf);
+			break;
+		}
 
-uncork:
+		int ok = 1;
+		char row_buf[HTTP_ROW_BUF_SIZE];
+		for (int i = 0; i < n; i++) {
+			const struct ef_record *rec = ef_read_next(&iter);
+			if (!rec)
+				break;
+
+			int len = format_csv_row(row_buf, sizeof(row_buf), rec);
+			if (len <= 0)
+				continue;
+
+			if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
+				       row_buf, len) < 0) {
+				ok = 0;
+				break;
+			}
+		}
+
+		/* Сбрасываем оставшиеся данные */
+		if (ok && flush_sendbuf(client_fd, sendbuf, &used) < 0)
+			ok = 0;
+
+		ef_read_end(&iter, clear && ok);
+		free(sendbuf);
+	} while (0);
+
 	cork = 0;
 	setsockopt(client_fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
 }
@@ -365,7 +367,9 @@ static void *server_thread(void *arg)
 		setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
 			   &tv, sizeof(tv));
 
+		__atomic_store_n(&g_client_fd, client_fd, __ATOMIC_RELEASE);
 		handle_request(client_fd, &client_addr);
+		__atomic_store_n(&g_client_fd, -1, __ATOMIC_RELEASE);
 		close(client_fd);
 
 		__atomic_sub_fetch(&g_active_connections, 1, __ATOMIC_RELAXED);
@@ -417,7 +421,7 @@ int http_server_start(const struct http_config *cfg)
 		return -1;
 	}
 
-	if (listen(g_listen_fd, 5) < 0) {
+	if (listen(g_listen_fd, HTTP_LISTEN_BACKLOG) < 0) {
 		fprintf(stderr, "ERROR: http_server: listen: %s\n",
 			strerror(errno));
 		close(g_listen_fd);
@@ -425,7 +429,7 @@ int http_server_start(const struct http_config *cfg)
 		return -1;
 	}
 
-	struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+	struct timeval tv = { .tv_sec = HTTP_LISTEN_TIMEOUT_SEC, .tv_usec = 0 };
 	setsockopt(g_listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
 	g_running = 1;
@@ -460,6 +464,12 @@ void http_server_stop(void)
 		close(g_listen_fd);
 		g_listen_fd = -1;
 	}
+
+	/* Прерываем активное клиентское соединение (send/recv),
+	 * чтобы http-поток не блокировался до SO_SNDTIMEO. */
+	int cfd = __atomic_load_n(&g_client_fd, __ATOMIC_ACQUIRE);
+	if (cfd >= 0)
+		shutdown(cfd, SHUT_RDWR);
 
 	pthread_join(g_thread, NULL);
 }

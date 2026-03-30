@@ -18,6 +18,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <time.h>
 #include <dirent.h>
@@ -47,11 +48,15 @@
  * даже на верификатор). Astra Linux поставляет libbpf 0.7, в котором есть
  * set_autoload, но нет set_autoattach.
  */
-#if LIBBPF_MAJOR_VERSION > 0 || LIBBPF_MINOR_VERSION >= 8
-#define BPF_PROG_DISABLE(prog) bpf_program__set_autoattach((prog), false)
-#else
+/*
+ * BPF_PROG_DISABLE: полностью отключает BPF-программу (не загружать,
+ * не подключать). Используем set_autoload(false), а не set_autoattach(false),
+ * потому что set_autoattach всё равно загружает программу в ядро (верификатор,
+ * создание prog fd) — и при destroy close(fd) вызывает synchronize_rcu,
+ * что добавляет ~0.15с на каждую программу к времени завершения.
+ * set_autoload полностью пропускает программу — нет fd, нет задержки.
+ */
 #define BPF_PROG_DISABLE(prog) bpf_program__set_autoload((prog), false)
-#endif
 
 /* ── конфигурация ─────────────────────────────────────────────────── */
 
@@ -78,7 +83,7 @@ static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=d
 
 /* Конфигурация HTTP-сервера */
 static struct http_config g_http_cfg;
-static long long cfg_max_data_size          = 256LL * 1024 * 1024; /* 256 MB ring buffer */
+static long long cfg_max_data_size          = (long long)EF_DEFAULT_SIZE_BYTES;
 
 /* Размеры BPF ring buffer'ов (0 = использовать дефолт из compile-time) */
 static long long cfg_ringbuf_proc           = 0;
@@ -96,11 +101,12 @@ static int cfg_need_sock_map                = 0; /* net_tracking || TCP-security
 /* Конфигурация отслеживания файлов */
 static int cfg_file_tracking_enabled        = 0;
 static int cfg_file_track_bytes             = 0;
+static int cfg_file_absolute_paths_only     = 1;  /* 1 = отбрасывать относительные пути */
 
 /* Конфигурация резолвинга Docker */
 static int cfg_docker_resolve_names         = 0;  /* резолвить docker-<hash>.scope → имя контейнера */
 static char cfg_docker_data_root[PATH_MAX_LEN] = "";
-static char cfg_docker_daemon_json[PATH_MAX_LEN] = "/etc/docker/daemon.json";
+static char cfg_docker_daemon_json[PATH_MAX_LEN] = DOCKER_DEFAULT_DAEMON_JSON;
 
 /* Конфигурация отслеживания дисков */
 static int cfg_disk_tracking_enabled       = 1;  /* включено по умолчанию */
@@ -118,6 +124,40 @@ static int cfg_tcp_rst         = 0;
 static int cfg_udp_bytes       = 0;
 static int cfg_icmp_tracking   = 0;
 static int cfg_tcp_open_conns  = 0;
+
+/* ── Управление отправкой событий в CSV (emit-флаги) ──────────────── */
+/* По умолчанию все включены. Переопределяются из секций конфига.
+ * Управляют ТОЛЬКО ef_append() — BPF хуки и state-логика работают всегда. */
+
+/* process_tracking.emit_* */
+static int cfg_emit_exec           = 1;
+static int cfg_emit_fork           = 1;
+static int cfg_emit_exit           = 1;
+static int cfg_emit_oom_kill       = 1;
+static int cfg_emit_signal         = 1;
+static int cfg_emit_chdir          = 1;
+
+/* file_tracking.emit_* */
+static int cfg_emit_file_open      = 1;
+static int cfg_emit_file_close     = 1;
+static int cfg_emit_file_rename    = 1;
+static int cfg_emit_file_unlink    = 1;
+static int cfg_emit_file_truncate  = 1;
+static int cfg_emit_file_chmod     = 1;
+static int cfg_emit_file_chown     = 1;
+
+/* net_tracking.emit_* */
+static int cfg_emit_net_listen     = 1;
+static int cfg_emit_net_connect    = 1;
+static int cfg_emit_net_accept     = 1;
+static int cfg_emit_net_close      = 1;
+static int cfg_emit_tcp_retransmit = 1;
+static int cfg_emit_syn_recv       = 1;
+static int cfg_emit_rst            = 1;
+static int cfg_emit_udp_agg        = 1;
+
+/* cgroup */
+static int cfg_emit_cgroup         = 1;
 
 /* Последнее известное количество записей в proc_map (обновляется refresh_processes).
  * Используется для адаптивного refresh_interval при высокой заполненности карт. */
@@ -178,6 +218,8 @@ static pthread_rwlock_t g_pidtree_lock = PTHREAD_RWLOCK_INITIALIZER;
 struct poll_thread_arg {
 	struct ring_buffer *rb;
 	const char *name;
+	volatile __u64 events;   /* атомарный счётчик обработанных событий */
+	volatile __u64 polls;    /* атомарный счётчик итераций poll-цикла */
 };
 
 /* Предварительные объявления */
@@ -195,8 +237,8 @@ static void refresh_boot_to_wall(void)
 	struct timespec rt, bt;
 	clock_gettime(CLOCK_REALTIME, &rt);
 	clock_gettime(CLOCK_BOOTTIME, &bt);
-	__s64 rt_ns = (__s64)rt.tv_sec * 1000000000LL + rt.tv_nsec;
-	__s64 bt_ns = (__s64)bt.tv_sec * 1000000000LL + bt.tv_nsec;
+	__s64 rt_ns = (__s64)rt.tv_sec * (long long)NS_PER_SEC + rt.tv_nsec;
+	__s64 bt_ns = (__s64)bt.tv_sec * (long long)NS_PER_SEC + bt.tv_nsec;
 	g_boot_to_wall_ns = rt_ns - bt_ns;
 }
 
@@ -285,15 +327,15 @@ static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные  
  * Murmurhash avalanche: изменение 1 бита во входе меняет ~50% бит выхода.
  * Последовательные PID'ы рассеиваются равномерно по всей таблице.
  *
- * Константы 0x85ebca6b и 0xc2b2ae35 — из оригинального murmurhash3
+ * Константы MURMUR3_C1 и MURMUR3_C2 — из оригинального murmurhash3
  * (Austin Appleby), обеспечивают максимальную лавинность для 32-бит.
  */
 static inline __u32 tags_hash(__u32 h)
 {
 	h ^= h >> 16;
-	h *= 0x85ebca6b;
+	h *= MURMUR3_C1;
 	h ^= h >> 13;
-	h *= 0xc2b2ae35;
+	h *= MURMUR3_C2;
 	h ^= h >> 16;
 	return h & (TAGS_HT_SIZE - 1);
 }
@@ -342,20 +384,18 @@ static const char *tags_lookup(__u32 tgid)
 static void tags_remove(__u32 tgid)
 {
 	__u32 idx = tags_hash(tgid);
-	__u32 slot;
-	int i;
+	__u32 slot = 0;
+	int found = 0;
 
 	/* Найти элемент */
-	for (i = 0; i < TAGS_HT_SIZE; i++) {
+	for (int i = 0; i < TAGS_HT_SIZE; i++) {
 		slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[slot] == tgid)
-			goto found;
+		if (tags_tgid[slot] == tgid) { found = 1; break; }
 		if (tags_tgid[slot] == 0)
 			return; /* не найден */
 	}
-	return;
+	if (!found) return;
 
-found:
 	/* Backward-shift: заполняем дырку сдвигом последующих элементов */
 	for (;;) {
 		__u32 next = (slot + 1) & (TAGS_HT_SIZE - 1);
@@ -468,9 +508,9 @@ static __u32 pt_ppid[PIDTREE_HT_SIZE];   /* значения: ppid              
 static inline __u32 pidtree_hash(__u32 h)
 {
 	h ^= h >> 16;
-	h *= 0x85ebca6b;
+	h *= MURMUR3_C1;
 	h ^= h >> 13;
-	h *= 0xc2b2ae35;
+	h *= MURMUR3_C2;
 	h ^= h >> 16;
 	return h & (PIDTREE_HT_SIZE - 1);
 }
@@ -506,19 +546,17 @@ static __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid,
 static void pidtree_remove(__u32 pid)
 {
 	__u32 idx = pidtree_hash(pid);
-	__u32 slot;
-	int i;
+	__u32 slot = 0;
+	int found = 0;
 
-	for (i = 0; i < PIDTREE_HT_SIZE; i++) {
+	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
 		slot = (idx + i) & (PIDTREE_HT_SIZE - 1);
-		if (pt_pid[slot] == pid)
-			goto found;
+		if (pt_pid[slot] == pid) { found = 1; break; }
 		if (pt_pid[slot] == 0)
 			return;
 	}
-	return;
+	if (!found) return;
 
-found:
 	/* backward-shift deletion (Robin Hood) */
 	for (;;) {
 		__u32 next = (slot + 1) & (PIDTREE_HT_SIZE - 1);
@@ -578,9 +616,9 @@ static __u64 cc_gen[CHAIN_CACHE_SIZE];
 static inline __u32 chain_cache_hash(__u32 h)
 {
 	h ^= h >> 16;
-	h *= 0x85ebca6b;
+	h *= MURMUR3_C1;
 	h ^= h >> 13;
-	h *= 0xc2b2ae35;
+	h *= MURMUR3_C2;
 	h ^= h >> 16;
 	return h & (CHAIN_CACHE_SIZE - 1);
 }
@@ -685,9 +723,9 @@ static pthread_rwlock_t g_pwd_lock = PTHREAD_RWLOCK_INITIALIZER;
 static inline __u32 pwd_hash(__u32 h)
 {
 	h ^= h >> 16;
-	h *= 0x85ebca6b;
+	h *= MURMUR3_C1;
 	h ^= h >> 13;
-	h *= 0xc2b2ae35;
+	h *= MURMUR3_C2;
 	h ^= h >> 16;
 	return h & (PWD_HT_SIZE - 1);
 }
@@ -721,19 +759,17 @@ static const char *pwd_lookup(__u32 tgid)
 static void pwd_remove(__u32 tgid)
 {
 	__u32 idx = pwd_hash(tgid);
-	__u32 slot;
-	int i;
+	__u32 slot = 0;
+	int found = 0;
 
-	for (i = 0; i < PWD_HT_SIZE; i++) {
+	for (int i = 0; i < PWD_HT_SIZE; i++) {
 		slot = (idx + i) & (PWD_HT_SIZE - 1);
-		if (pwd_tgid[slot] == tgid)
-			goto found;
+		if (pwd_tgid[slot] == tgid) { found = 1; break; }
 		if (pwd_tgid[slot] == 0)
 			return;
 	}
-	return;
+	if (!found) return;
 
-found:
 	for (;;) {
 		__u32 next = (slot + 1) & (PWD_HT_SIZE - 1);
 		if (pwd_tgid[next] == 0)
@@ -1001,7 +1037,7 @@ static void detect_docker_data_root(void)
 
 	if (!docker_data_root[0])
 		snprintf(docker_data_root, sizeof(docker_data_root),
-			 "/var/lib/docker");
+			 DOCKER_DEFAULT_ROOT);
 }
 
 /*
@@ -1015,16 +1051,16 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
 	const char *last = strrchr(rel, '/');
 	const char *base = last ? last + 1 : rel;
 
-	if (strncmp(base, "docker-", 7) != 0)
+	if (strncmp(base, DOCKER_PREFIX, DOCKER_PREFIX_LEN) != 0)
 		return 0;
-	const char *hash_start = base + 7;
+	const char *hash_start = base + DOCKER_PREFIX_LEN;
 	const char *dot = strstr(hash_start, ".scope");
-	if (!dot || (dot - hash_start) != 64)
+	if (!dot || (dot - hash_start) != DOCKER_HASH_LEN)
 		return 0;
 
-	char container_id[65];
-	memcpy(container_id, hash_start, 64);
-	container_id[64] = '\0';
+	char container_id[DOCKER_HASH_LEN + 1];
+	memcpy(container_id, hash_start, DOCKER_HASH_LEN);
+	container_id[DOCKER_HASH_LEN] = '\0';
 
 	detect_docker_data_root();
 
@@ -1101,7 +1137,7 @@ static int resolve_docker_name(const char *rel, char *dst, size_t dstlen)
  */
 
 static struct {
-	char container_id[65];       /* 64 hex + NUL */
+	char container_id[DOCKER_HASH_LEN + 1]; /* hex + NUL */
 	char resolved[EV_CGROUP_LEN];
 	int  negative;               /* 1 = попытка была неудачной, не повторять */
 } docker_name_cache[DOCKER_NAME_CACHE_SIZE];
@@ -1113,11 +1149,11 @@ static const char *extract_docker_id(const char *path)
 {
 	const char *last = strrchr(path, '/');
 	const char *base = last ? last + 1 : path;
-	if (strncmp(base, "docker-", 7) != 0)
+	if (strncmp(base, DOCKER_PREFIX, DOCKER_PREFIX_LEN) != 0)
 		return NULL;
-	const char *hash = base + 7;
+	const char *hash = base + DOCKER_PREFIX_LEN;
 	const char *dot = strstr(hash, ".scope");
-	if (!dot || (dot - hash) != 64)
+	if (!dot || (dot - hash) != DOCKER_HASH_LEN)
 		return NULL;
 	return hash;
 }
@@ -1144,7 +1180,7 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 	/* Поиск в кэше (rdlock) */
 	pthread_rwlock_rdlock(&g_docker_cache_lock);
 	for (int i = 0; i < docker_name_cache_count; i++) {
-		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
+		if (memcmp(docker_name_cache[i].container_id, id, DOCKER_HASH_LEN) == 0) {
 			if (docker_name_cache[i].negative) {
 				/* Предыдущая попытка неудачна — передаём исходный путь */
 				snprintf(buf, buflen, "%s", raw);
@@ -1166,7 +1202,7 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 	pthread_rwlock_wrlock(&g_docker_cache_lock);
 	/* Двойная проверка: другой поток мог уже добавить */
 	for (int i = 0; i < docker_name_cache_count; i++) {
-		if (memcmp(docker_name_cache[i].container_id, id, 64) == 0) {
+		if (memcmp(docker_name_cache[i].container_id, id, DOCKER_HASH_LEN) == 0) {
 			pthread_rwlock_unlock(&g_docker_cache_lock);
 			snprintf(buf, buflen, "%s", ok ? resolved : raw);
 			return;
@@ -1174,8 +1210,8 @@ void http_resolve_cgroup(const char *raw, char *buf, int buflen)
 	}
 	if (docker_name_cache_count < DOCKER_NAME_CACHE_SIZE) {
 		memcpy(docker_name_cache[docker_name_cache_count].container_id,
-		       id, 64);
-		docker_name_cache[docker_name_cache_count].container_id[64] = '\0';
+		       id, DOCKER_HASH_LEN);
+		docker_name_cache[docker_name_cache_count].container_id[DOCKER_HASH_LEN] = '\0';
 		if (ok) {
 			snprintf(docker_name_cache[docker_name_cache_count].resolved,
 				 sizeof(docker_name_cache[0].resolved),
@@ -1306,8 +1342,8 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 static void build_cgroup_cache(void)
 {
 	cgroup_cache_count = 0;
-	if (access("/sys/fs/cgroup", R_OK) == 0)
-		scan_cgroup_dir("/sys/fs/cgroup", "");
+	if (access(CGROUP_V2_PATH, R_OK) == 0)
+		scan_cgroup_dir(CGROUP_V2_PATH, "");
 }
 
 
@@ -1620,9 +1656,9 @@ static int load_config(const char *path)
 
 	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
-	g_http_cfg.port = 10003;
-	g_http_cfg.max_connections = 1;
-	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), "127.0.0.1");
+	g_http_cfg.port = HTTP_DEFAULT_PORT;
+	g_http_cfg.max_connections = HTTP_DEFAULT_MAX_CONNS;
+	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), HTTP_DEFAULT_BIND);
 
 	config_setting_t *hs = config_lookup(&cfg, "http_server");
 	if (hs) {
@@ -1727,6 +1763,24 @@ static int load_config(const char *path)
 			cfg_udp_bytes = bool_val;
 		if (config_setting_lookup_bool(nt, "tcp_open_conns", &bool_val))
 			cfg_tcp_open_conns = bool_val;
+
+		/* emit-флаги: какие сетевые события отправлять в CSV */
+		if (config_setting_lookup_bool(nt, "emit_listen", &bool_val))
+			cfg_emit_net_listen = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_connect", &bool_val))
+			cfg_emit_net_connect = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_accept", &bool_val))
+			cfg_emit_net_accept = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_close", &bool_val))
+			cfg_emit_net_close = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_retransmit", &bool_val))
+			cfg_emit_tcp_retransmit = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_syn_recv", &bool_val))
+			cfg_emit_syn_recv = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_rst", &bool_val))
+			cfg_emit_rst = bool_val;
+		if (config_setting_lookup_bool(nt, "emit_udp_agg", &bool_val))
+			cfg_emit_udp_agg = bool_val;
 	}
 
 	/* Настройки отслеживания файлов */
@@ -1736,6 +1790,24 @@ static int load_config(const char *path)
 			cfg_file_tracking_enabled = bool_val;
 		if (config_setting_lookup_bool(ft, "track_bytes", &bool_val))
 			cfg_file_track_bytes = bool_val;
+		if (config_setting_lookup_bool(ft, "absolute_paths_only", &bool_val))
+			cfg_file_absolute_paths_only = bool_val;
+
+		/* emit-флаги: какие файловые события отправлять в CSV */
+		if (config_setting_lookup_bool(ft, "emit_open", &bool_val))
+			cfg_emit_file_open = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_close", &bool_val))
+			cfg_emit_file_close = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_rename", &bool_val))
+			cfg_emit_file_rename = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_unlink", &bool_val))
+			cfg_emit_file_unlink = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_truncate", &bool_val))
+			cfg_emit_file_truncate = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_chmod", &bool_val))
+			cfg_emit_file_chmod = bool_val;
+		if (config_setting_lookup_bool(ft, "emit_chown", &bool_val))
+			cfg_emit_file_chown = bool_val;
 
 		/* Включающие префиксы */
 		config_setting_t *inc = config_setting_lookup(ft, "include");
@@ -1793,6 +1865,27 @@ static int load_config(const char *path)
 	if (config_lookup_bool(&cfg, "icmp_tracking", &bool_val))
 		cfg_icmp_tracking = bool_val;
 
+	/* emit-флаг cgroup событий */
+	if (config_lookup_bool(&cfg, "emit_cgroup_events", &bool_val))
+		cfg_emit_cgroup = bool_val;
+
+	/* process_tracking — emit-флаги процессных событий */
+	config_setting_t *pt = config_lookup(&cfg, "process_tracking");
+	if (pt) {
+		if (config_setting_lookup_bool(pt, "emit_exec", &bool_val))
+			cfg_emit_exec = bool_val;
+		if (config_setting_lookup_bool(pt, "emit_fork", &bool_val))
+			cfg_emit_fork = bool_val;
+		if (config_setting_lookup_bool(pt, "emit_exit", &bool_val))
+			cfg_emit_exit = bool_val;
+		if (config_setting_lookup_bool(pt, "emit_oom_kill", &bool_val))
+			cfg_emit_oom_kill = bool_val;
+		if (config_setting_lookup_bool(pt, "emit_signal", &bool_val))
+			cfg_emit_signal = bool_val;
+		if (config_setting_lookup_bool(pt, "emit_chdir", &bool_val))
+			cfg_emit_chdir = bool_val;
+	}
+
 	/* Настройки отслеживания дисков */
 	config_setting_t *dt = config_lookup(&cfg, "disk_tracking");
 	if (dt) {
@@ -1846,6 +1939,20 @@ static int load_config(const char *path)
 	}
 
 	config_destroy(&cfg);
+
+	/* Нормализация: секционный enabled — master-switch.
+	 * Если net_tracking.enabled=false, все net-подопции принудительно 0,
+	 * чтобы соответствующие BPF-программы не загружались в ядро. */
+	if (!cfg_net_tracking_enabled) {
+		cfg_tcp_retransmit = 0;
+		cfg_tcp_syn        = 0;
+		cfg_tcp_rst        = 0;
+		cfg_udp_bytes      = 0;
+		cfg_tcp_open_conns = 0;
+		cfg_icmp_tracking  = 0;
+		cfg_net_track_bytes = 0;
+	}
+
 	return 0;
 }
 
@@ -1979,7 +2086,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	/* Используем реальное время вместо BPF-метки относительно загрузки */
 	struct timespec ts_now;
 	clock_gettime(CLOCK_REALTIME, &ts_now);
-	out->timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+	out->timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 			  + (__u64)ts_now.tv_nsec;
 	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
 	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
@@ -1996,7 +2103,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	if (cgroup)
 		snprintf(out->cgroup, sizeof(out->cgroup), "%s", cgroup);
 	/* поля, специфичные для exit */
-	out->exit_code = (e->exit_code >> 8) & 0xff;
+	out->exit_code = (e->exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
 	out->cpu_ns = e->cpu_ns;
 	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
 	out->rss_min_bytes = e->rss_min_pages * (unsigned long)sysconf(_SC_PAGESIZE);
@@ -2078,13 +2185,13 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	pi->min_flt = (__u64)(minflt + cminflt);
 
 	long page_size = sysconf(_SC_PAGESIZE);
-	if (page_size <= 0) page_size = 4096;
+	if (page_size <= 0) page_size = FALLBACK_PAGE_SIZE;
 	pi->vsize_pages = (__u64)(vsize / page_size);
 
 	long clk_tck = sysconf(_SC_CLK_TCK);
-	if (clk_tck <= 0) clk_tck = 100;
-	pi->cpu_ns = ((__u64)(utime + stime) * 1000000000ULL) / (__u64)clk_tck;
-	pi->start_ns = ((__u64)starttime * 1000000000ULL) / (__u64)clk_tck;
+	if (clk_tck <= 0) clk_tck = FALLBACK_CLK_TCK;
+	pi->cpu_ns = ((__u64)(utime + stime) * NS_PER_SEC) / (__u64)clk_tck;
+	pi->start_ns = ((__u64)starttime * NS_PER_SEC) / (__u64)clk_tck;
 
 	/* Чтение дополнительных полей из /proc/PID/status */
 	char spath[PROC_PATH_LEN];
@@ -2306,8 +2413,10 @@ static void seed_sock_map(void)
 	/* Проход по tracked_map → для каждого PID сканируем /proc/<pid>/fd/ */
 	__u32 key = 0, next_key;
 	int seeded = 0;
+	int seed_iter = 0;
 
-	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0) {
+	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0
+	       && seed_iter++ < MAX_PROCS) {
 		key = next_key;
 		__u32 pid = key;
 
@@ -2350,33 +2459,34 @@ static void seed_sock_map(void)
 	}
 
 	/* Запускаем BPF iter/tcp */
-	struct bpf_link *link = bpf_program__attach_iter(
-		skel->progs.seed_sock_map_iter, NULL);
-	if (!link) {
-		log_ts("WARN", "seed_sock_map: attach_iter failed: %s",
-		       strerror(errno));
-		goto cleanup;
-	}
+	do {
+		struct bpf_link *link = bpf_program__attach_iter(
+			skel->progs.seed_sock_map_iter, NULL);
+		if (!link) {
+			log_ts("WARN", "seed_sock_map: attach_iter failed: %s",
+			       strerror(errno));
+			break;
+		}
 
-	int iter_fd = bpf_iter_create(bpf_link__fd(link));
-	if (iter_fd < 0) {
-		log_ts("WARN", "seed_sock_map: iter_create failed: %s",
-		       strerror(errno));
+		int iter_fd = bpf_iter_create(bpf_link__fd(link));
+		if (iter_fd < 0) {
+			log_ts("WARN", "seed_sock_map: iter_create failed: %s",
+			       strerror(errno));
+			bpf_link__destroy(link);
+			break;
+		}
+
+		/* Читаем до EOF — это запускает BPF-программу для каждого TCP-сокета */
+		char drain[256];
+		while (read(iter_fd, drain, sizeof(drain)) > 0)
+			;
+
+		close(iter_fd);
 		bpf_link__destroy(link);
-		goto cleanup;
-	}
 
-	/* Читаем до EOF — это запускает BPF-программу для каждого TCP-сокета */
-	char drain[256];
-	while (read(iter_fd, drain, sizeof(drain)) > 0)
-		;
+		log_ts("INFO", "seed_sock_map: scanned %d socket inodes", seeded);
+	} while (0);
 
-	close(iter_fd);
-	bpf_link__destroy(link);
-
-	log_ts("INFO", "seed_sock_map: scanned %d socket inodes", seeded);
-
-cleanup:
 	/* Очищаем seed_inode_map */
 	key = 0;
 	__u64 ino_key = 0, ino_next;
@@ -2530,6 +2640,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)fe->write_bytes,
 			  fe->open_count);
 
+		/* emit guard: проверяем нужно ли отправлять это событие в CSV */
+		if (type == EVENT_FILE_OPEN  && !cfg_emit_file_open)  return 0;
+		if (type == EVENT_FILE_CLOSE && !cfg_emit_file_close) return 0;
+
 		if (g_http_cfg.enabled) {
 			/* Формирование metric_event для записи в буфер */
 			struct metric_event cev;
@@ -2589,6 +2703,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (type == EVENT_FILE_RENAME || type == EVENT_FILE_UNLINK
 	    || type == EVENT_FILE_TRUNCATE
 	    || type == EVENT_FILE_CHMOD || type == EVENT_FILE_CHOWN) {
+		/* emit guard */
+		if (type == EVENT_FILE_RENAME   && !cfg_emit_file_rename)   return 0;
+		if (type == EVENT_FILE_UNLINK   && !cfg_emit_file_unlink)   return 0;
+		if (type == EVENT_FILE_TRUNCATE && !cfg_emit_file_truncate) return 0;
+		if (type == EVENT_FILE_CHMOD    && !cfg_emit_file_chmod)    return 0;
+		if (type == EVENT_FILE_CHOWN    && !cfg_emit_file_chown)    return 0;
+
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -2671,6 +2792,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 */
 	if (type == EVENT_NET_LISTEN || type == EVENT_NET_CONNECT
 	    || type == EVENT_NET_ACCEPT || type == EVENT_NET_CLOSE) {
+		/* emit guard */
+		if (type == EVENT_NET_LISTEN  && !cfg_emit_net_listen)  return 0;
+		if (type == EVENT_NET_CONNECT && !cfg_emit_net_connect) return 0;
+		if (type == EVENT_NET_ACCEPT  && !cfg_emit_net_accept)  return 0;
+		if (type == EVENT_NET_CLOSE   && !cfg_emit_net_close)   return 0;
+
 		if (size < sizeof(struct net_event))
 			return 0;
 		const struct net_event *ne = data;
@@ -2697,7 +2824,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  ne->tgid, rname, ne->local_port, ne->remote_port,
 			  (unsigned long long)ne->tx_bytes,
 			  (unsigned long long)ne->rx_bytes,
-			  (unsigned long long)(ne->duration_ns / 1000000));
+			  (unsigned long long)(ne->duration_ns / NS_PER_MS));
 
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
@@ -2756,7 +2883,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.net_conn_rx_bytes = ne->rx_bytes;
 			cev.net_conn_tx_calls = ne->tx_calls;
 			cev.net_conn_rx_calls = ne->rx_calls;
-			cev.net_duration_ms = ne->duration_ns / 1000000;
+			cev.net_duration_ms = ne->duration_ns / NS_PER_MS;
 
 			/* TCP state на момент close для net_close.
 			 * Кодируем как символ для CSV:
@@ -2785,6 +2912,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Имя процесса-получателя читается из /proc/<pid>/comm.
 	 */
 	if (type == EVENT_SIGNAL) {
+		if (!cfg_emit_signal) return 0;
 		if (size < sizeof(struct signal_event))
 			return 0;
 		const struct signal_event *se = data;
@@ -2816,7 +2944,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Время: clock_gettime (сигналы редкие, допустим syscall) */
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 					 + (__u64)ts_now.tv_nsec;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				    "signal");
@@ -2887,6 +3015,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ соединения на хосте.
 	 */
 	if (type == EVENT_TCP_RETRANSMIT) {
+		if (!cfg_emit_tcp_retransmit) return 0;
 		if (size < sizeof(struct retransmit_event))
 			return 0;
 		const struct retransmit_event *re = data;
@@ -2903,7 +3032,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Время: clock_gettime (ретрансмиты редкие) */
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 					 + (__u64)ts_now.tv_nsec;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				 "tcp_retrans");
@@ -2970,6 +3099,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ входящие SYN.
 	 */
 	if (type == EVENT_SYN_RECV) {
+		if (!cfg_emit_syn_recv) return 0;
 		if (size < sizeof(struct syn_event))
 			return 0;
 		const struct syn_event *se_syn = data;
@@ -2984,7 +3114,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 					 + (__u64)ts_now.tv_nsec;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				 "syn_recv");
@@ -3047,6 +3177,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Поле direction: 0 = отправлен (sent), 1 = получен (recv).
 	 */
 	if (type == EVENT_RST) {
+		if (!cfg_emit_rst) return 0;
 		if (size < sizeof(struct rst_event))
 			return 0;
 		const struct rst_event *rste = data;
@@ -3061,7 +3192,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 			struct timespec ts_now;
 			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * 1000000000ULL
+			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
 					 + (__u64)ts_now.tv_nsec;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				    rste->direction ? "rst_recv" : "rst_sent");
@@ -3179,7 +3310,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  e->comm);
 
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
-			if (g_http_cfg.enabled) {
+			if (cfg_emit_exec && g_http_cfg.enabled) {
 				char cg_buf[PATH_MAX_LEN];
 				resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 						       sizeof(cg_buf));
@@ -3218,7 +3349,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		}
 
 		/* Отправляем fork-событие в буферный файл */
-		if (g_http_cfg.enabled) {
+		if (cfg_emit_fork && g_http_cfg.enabled) {
 			const char *rname = (parent_ti.rule_id < num_rules)
 				? rules[parent_ti.rule_id].name : RULE_NOT_MATCH;
 			char cg_buf[PATH_MAX_LEN];
@@ -3279,8 +3410,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 #endif
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
-		int sig = e->exit_code & 0x7f;
-		int status = (e->exit_code >> 8) & 0xff;
+		int sig = e->exit_code & EXIT_SIG_MASK;
+		int status = (e->exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
 
 		log_debug("EXIT: pid=%u rule=%s exit_code=%d "
 			  "signal=%d cpu=%.2fs rss_max=%lluMB%s",
@@ -3290,7 +3421,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  e->oom_killed ? " [OOM]" : "");
 
 		/* Отправляем exit-событие в буферный файл */
-		if (g_http_cfg.enabled) {
+		if (cfg_emit_exit && g_http_cfg.enabled) {
 			char cg_buf[PATH_MAX_LEN];
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
@@ -3339,7 +3470,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		       (unsigned long long)(e->rss_pages * 4 / 1024));
 
 		/* Отправляем oom_kill-событие в буферный файл */
-		if (g_http_cfg.enabled) {
+		if (cfg_emit_oom_kill && g_http_cfg.enabled) {
 			char cg_buf[PATH_MAX_LEN];
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
@@ -3365,19 +3496,27 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 /* ── снапшот: сбор метрик ─────────────────────────────────────────── */
 
+/*
+ * Чтение значения из cgroup sysfs.
+ * Используем raw open/read/close вместо fopen/fclose.
+ * fclose() на kernfs файлах тригерит cgroup_file_release → deferred fput
+ * через task_work, что блокирует поток на synchronize_rcu при возврате
+ * из syscall. При ~350 fclose за snapshot — блокировка ~7 секунд.
+ * Raw close() не создаёт такой проблемы.
+ */
 static long long read_cgroup_value(const char *cg_path, const char *file)
 {
 	char path[PATH_MAX_LEN];
-	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/%s", cg_path, file);
-	FILE *f = fopen(path, "r");
-	if (!f)
+	snprintf(path, sizeof(path), CGROUP_V2_PATH "/%s/%s", cg_path, file);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
 		return -1;
 	char buf[PROC_VAL_LEN];
-	if (!fgets(buf, sizeof(buf), f)) {
-		fclose(f);
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
 		return -1;
-	}
-	fclose(f);
+	buf[n] = '\0';
 	if (strncmp(buf, "max", 3) == 0)
 		return 0;
 	return strtoll(buf, NULL, 10);
@@ -3393,24 +3532,26 @@ static void read_cgroup_cpu_max(const char *cg_path,
 	*quota = -1;
 	*period = -1;
 	char path[PATH_MAX_LEN];
-	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cpu.max", cg_path);
-	FILE *f = fopen(path, "r");
-	if (!f)
+	snprintf(path, sizeof(path), CGROUP_V2_PATH "/%s/cpu.max", cg_path);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
 		return;
 	char buf[PROC_VAL_LEN];
-	if (fgets(buf, sizeof(buf), f)) {
-		if (strncmp(buf, "max", 3) == 0) {
-			*quota = 0;  /* без ограничений */
-			if (sscanf(buf + 3, " %lld", period) != 1)
-				*period = 100000;
-		} else {
-			if (sscanf(buf, "%lld %lld", quota, period) != 2) {
-				*quota = -1;
-				*period = -1;
-			}
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return;
+	buf[n] = '\0';
+	if (strncmp(buf, "max", 3) == 0) {
+		*quota = 0;
+		if (sscanf(buf + 3, " %lld", period) != 1)
+			*period = DEFAULT_CPU_MAX_PERIOD;
+	} else {
+		if (sscanf(buf, "%lld %lld", quota, period) != 2) {
+			*quota = -1;
+			*period = -1;
 		}
 	}
-	fclose(f);
 }
 
 /*
@@ -3425,20 +3566,30 @@ static void read_cgroup_cpu_stat(const char *cg_path,
 	*nr_throttled = -1;
 	*throttled_usec = -1;
 	char path[PATH_MAX_LEN];
-	snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cpu.stat", cg_path);
-	FILE *f = fopen(path, "r");
-	if (!f)
+	snprintf(path, sizeof(path), CGROUP_V2_PATH "/%s/cpu.stat", cg_path);
+	int fd = open(path, O_RDONLY);
+	if (fd < 0)
 		return;
-	char line[LINE_BUF_LEN];
-	while (fgets(line, sizeof(line), f)) {
-		if (strncmp(line, "nr_periods ", 11) == 0)
-			*nr_periods = strtoll(line + 11, NULL, 10);
-		else if (strncmp(line, "nr_throttled ", 13) == 0)
-			*nr_throttled = strtoll(line + 13, NULL, 10);
-		else if (strncmp(line, "throttled_usec ", 15) == 0)
-			*throttled_usec = strtoll(line + 15, NULL, 10);
+	/* cpu.stat ~200 байт: "usage_usec ...\nnr_periods ...\n..." */
+	char buf[PROC_BUF_SMALL];
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return;
+	buf[n] = '\0';
+	/* Парсим построчно из буфера */
+	char *p = buf;
+	while (*p) {
+		if (strncmp(p, "nr_periods ", 11) == 0)
+			*nr_periods = strtoll(p + 11, NULL, 10);
+		else if (strncmp(p, "nr_throttled ", 13) == 0)
+			*nr_throttled = strtoll(p + 13, NULL, 10);
+		else if (strncmp(p, "throttled_usec ", 15) == 0)
+			*throttled_usec = strtoll(p + 15, NULL, 10);
+		/* Переход к следующей строке */
+		while (*p && *p != '\n') p++;
+		if (*p == '\n') p++;
 	}
-	fclose(f);
 }
 
 /*
@@ -3454,7 +3605,7 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 		"zfs", "ntfs", "fuseblk", "f2fs", NULL
 	};
 
-	FILE *mf = setmntent("/proc/mounts", "r");
+	FILE *mf = setmntent(PROC_MOUNTS_PATH, "r");
 	if (!mf)
 		return 0;
 
@@ -3638,17 +3789,23 @@ static void refresh_processes(void)
 		}
 	}
 
-	/* Пакетное чтение proc_map */
+	/* Пакетное чтение proc_map.
+	 * all_values может быть NULL если malloc не удался (proc_info
+	 * = 4400 байт * 65536 = 275 MB) — тогда читаем только ключи
+	 * и делаем поштучный lookup в цикле ниже. */
 	__u32 *all_keys = NULL;
 	struct proc_info *all_values = NULL;
 	int all_keys_count = 0;
 
-	{
+	do {
 		__u32 batch_count = MAX_PROCS;
 		all_keys = malloc(batch_count * sizeof(__u32));
+		if (!all_keys)
+			break;
+
 		all_values = malloc(batch_count * sizeof(struct proc_info));
 
-		if (all_keys && all_values) {
+		if (all_values) {
 			DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts,
 				.elem_flags = 0, .flags = 0,
 			);
@@ -3659,20 +3816,23 @@ static void refresh_processes(void)
 			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
 				all_keys_count = (int)batch_count;
 			} else {
-				all_keys_count = 0;
-				__u32 iter_key;
-				int err2 = bpf_map_get_next_key(proc_map_fd,
-							NULL, &iter_key);
-				while (err2 == 0 && all_keys_count < (int)MAX_PROCS) {
-					all_keys[all_keys_count++] = iter_key;
-					err2 = bpf_map_get_next_key(proc_map_fd,
-							&iter_key, &iter_key);
-				}
 				free(all_values);
 				all_values = NULL;
 			}
 		}
-	}
+
+		/* Fallback: keys-only через get_next_key (no 275MB alloc) */
+		if (all_keys_count == 0) {
+			__u32 iter_key;
+			int err2 = bpf_map_get_next_key(proc_map_fd,
+						NULL, &iter_key);
+			while (err2 == 0 && all_keys_count < (int)MAX_PROCS) {
+				all_keys[all_keys_count++] = iter_key;
+				err2 = bpf_map_get_next_key(proc_map_fd,
+						&iter_key, &iter_key);
+			}
+		}
+	} while (0);
 
 	/* Сброс cgroup-метрик — будут пересобраны ниже */
 	cg_metrics_count = 0;
@@ -3838,10 +3998,10 @@ static void refresh_processes(void)
 		  refresh_count, early_cleanup_count, all_keys_count);
 
 	/* Flush UDP агрегатов → ef_append */
-	if (cfg_udp_bytes && g_http_cfg.enabled) {
+	if (cfg_udp_bytes && cfg_emit_udp_agg && g_http_cfg.enabled) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
-		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
 			    + (__u64)now_ts.tv_nsec;
 
 		int udp_fd = bpf_map__fd(skel->maps.udp_agg_map);
@@ -3922,7 +4082,7 @@ static void refresh_processes(void)
 	if (cfg_icmp_tracking && g_http_cfg.enabled) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
-		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
 			    + (__u64)now_ts.tv_nsec;
 
 		int icmp_fd = bpf_map__fd(skel->maps.icmp_agg_map);
@@ -3980,7 +4140,7 @@ static void refresh_processes(void)
 	if (g_http_cfg.enabled && cfg_disk_tracking_enabled) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
-		__u64 ts_ns = (__u64)now_ts.tv_sec * 1000000000ULL
+		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
 			    + (__u64)now_ts.tv_nsec;
 		int disk_ev = emit_disk_usage_events(ts_ns, cfg_hostname);
 		if (disk_ev > 0)
@@ -4051,8 +4211,9 @@ static void write_snapshot(void)
 	 */
 	{
 		__u32 key;
+		int fork_rec_iter = 0;
 		int err = bpf_map_get_next_key(tracked_map_fd, NULL, &key);
-		while (err == 0) {
+		while (err == 0 && fork_rec_iter++ < MAX_PROCS) {
 			__u32 next;
 			int next_err = bpf_map_get_next_key(tracked_map_fd,
 							    &key, &next);
@@ -4104,7 +4265,7 @@ static void write_snapshot(void)
 	pthread_rwlock_unlock(&g_pidtree_lock);
 
 	long page_size = sysconf(_SC_PAGESIZE);
-	if (page_size <= 0) page_size = 4096;
+	if (page_size <= 0) page_size = FALLBACK_PAGE_SIZE;
 
 	struct timespec mono;
 	clock_gettime(CLOCK_MONOTONIC, &mono);
@@ -4119,7 +4280,7 @@ static void write_snapshot(void)
 
 	struct timespec snap_ts;
 	clock_gettime(CLOCK_REALTIME, &snap_ts);
-	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * 1000000000ULL
+	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * NS_PER_SEC
 				+ (__u64)snap_ts.tv_nsec;
 
 	__u32 dead_keys[DEAD_KEYS_CAP];
@@ -4328,7 +4489,7 @@ static void write_snapshot(void)
 	/* boot_ns — для вычисления длительности в conn_snapshot и file_snapshot */
 	struct timespec boot_ts;
 	clock_gettime(CLOCK_BOOTTIME, &boot_ts);
-	__u64 boot_ns = (__u64)boot_ts.tv_sec * 1000000000ULL
+	__u64 boot_ns = (__u64)boot_ts.tv_sec * NS_PER_SEC
 		      + (__u64)boot_ts.tv_nsec;
 
 	/* ── conn_snapshot: метрики живых TCP-соединений ──────────────── */
@@ -4337,8 +4498,9 @@ static void write_snapshot(void)
 		int sm_fd = bpf_map__fd(skel->maps.sock_map);
 
 		__u64 sk_key;
+		int sk_iter = 0;
 		int sk_err = bpf_map_get_next_key(sm_fd, NULL, &sk_key);
-		while (sk_err == 0) {
+		while (sk_err == 0 && sk_iter++ < NET_MAX_SOCKETS) {
 			__u64 sk_next;
 			int sk_next_err = bpf_map_get_next_key(sm_fd,
 							       &sk_key,
@@ -4429,7 +4591,7 @@ static void write_snapshot(void)
 					    boot_ns > si.start_ns)
 						cev.net_duration_ms =
 							(boot_ns - si.start_ns)
-							/ 1000000;
+							/ NS_PER_MS;
 
 					/* is_listener → state: 'L'=listener, 'E'=established */
 					cev.state = si.is_listener ? 'L' : 'E';
@@ -4451,8 +4613,9 @@ static void write_snapshot(void)
 		int fm_fd = bpf_map__fd(skel->maps.fd_map);
 
 		struct fd_key fk_key;
+		int fk_iter = 0;
 		int fk_err = bpf_map_get_next_key(fm_fd, NULL, &fk_key);
-		while (fk_err == 0) {
+		while (fk_err == 0 && fk_iter++ < BPF_FD_MAP_SIZE) {
 			struct fd_key fk_next;
 			int fk_next_err = bpf_map_get_next_key(fm_fd,
 							       &fk_key,
@@ -4520,7 +4683,7 @@ static void write_snapshot(void)
 					    boot_ns > fi.start_ns)
 						cev.net_duration_ms =
 							(boot_ns - fi.start_ns)
-							/ 1000000;
+							/ NS_PER_MS;
 
 					pidtree_get_chain_copy(
 						snap_pt_pid, snap_pt_ppid,
@@ -4546,16 +4709,23 @@ static void write_snapshot(void)
 	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
 	       pid_count, dead_total, snap_count, conn_count, file_snap_count);
 
-	/* Статистика ring buffer'ов */
+	/* Статистика ring buffer'ов — логируем только НОВЫЕ drops */
 	{
+		static struct ringbuf_stats prev_rs;
 		__u32 key = 0;
 		struct ringbuf_stats rs = {0};
 		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
 		if (stats_fd >= 0 &&
 		    bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
-			if (rs.drop_proc || rs.drop_file || rs.drop_fopen ||
-			    rs.drop_net || rs.drop_sec || rs.drop_cgroup ||
-			    rs.drop_missed_exec) {
+			__u64 new_drops =
+				(rs.drop_proc   - prev_rs.drop_proc) +
+				(rs.drop_file   - prev_rs.drop_file) +
+				(rs.drop_fopen  - prev_rs.drop_fopen) +
+				(rs.drop_net    - prev_rs.drop_net) +
+				(rs.drop_sec    - prev_rs.drop_sec) +
+				(rs.drop_cgroup - prev_rs.drop_cgroup) +
+				(rs.drop_missed_exec - prev_rs.drop_missed_exec);
+			if (new_drops > 0) {
 				log_ts("WARN",
 				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu fopen=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
@@ -4580,6 +4750,7 @@ static void write_snapshot(void)
 				       (unsigned long long)rs.total_sec,
 				       (unsigned long long)rs.total_cgroup);
 			}
+			prev_rs = rs;
 		}
 	}
 
@@ -4592,33 +4763,40 @@ static void write_snapshot(void)
 		static int gc_counter;
 		if (++gc_counter >= 10) {
 			gc_counter = 0;
-			int gc_removed = 0;
-			pthread_rwlock_wrlock(&g_pidtree_lock);
-			for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
+
+			/* Фаза 1: собираем кандидатов на удаление БЕЗ lock.
+			 * bpf_map_lookup + kill() — тяжёлые syscall, нельзя
+			 * держать wrlock на всё время (блокирует poll-потоки). */
+			__u32 gc_pids[DEAD_KEYS_CAP];
+			int gc_count = 0;
+
+			pthread_rwlock_rdlock(&g_pidtree_lock);
+			for (int i = 0; i < PIDTREE_HT_SIZE
+				       && gc_count < DEAD_KEYS_CAP; i++) {
 				__u32 pid = pt_pid[i];
 				if (pid == 0)
 					continue;
-				/* Tracked процессы очищаются через dead_keys */
 				struct track_info ti_gc;
 				if (bpf_map_lookup_elem(tracked_map_fd, &pid,
 							&ti_gc) == 0)
 					continue;
-				/* Проверяем, жив ли процесс */
 				if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
 					continue;
-				/* Мёртвый и неотслеживаемый — удаляем.
-				 * Используем pidtree_remove (без _ts, т.к.
-				 * wrlock уже взят). После удаления слот мог
-				 * сдвинуться (Robin Hood), пересканим. */
-				pidtree_remove(pid);
-				pt_generation++;
-				gc_removed++;
-				i--;  /* re-check этот слот после сдвига */
+				gc_pids[gc_count++] = pid;
 			}
 			pthread_rwlock_unlock(&g_pidtree_lock);
-			if (gc_removed)
+
+			/* Фаза 2: удаляем под wrlock (быстро — только delete). */
+			if (gc_count > 0) {
+				pthread_rwlock_wrlock(&g_pidtree_lock);
+				for (int i = 0; i < gc_count; i++) {
+					pidtree_remove(gc_pids[i]);
+					pt_generation++;
+				}
+				pthread_rwlock_unlock(&g_pidtree_lock);
 				log_debug("PIDTREE_GC: removed %d dead"
-					  " untracked entries", gc_removed);
+					  " untracked entries", gc_count);
+			}
 		}
 	}
 }
@@ -4657,19 +4835,34 @@ static void usage(const char *prog)
 static void *poll_thread_fn(void *arg)
 {
 	struct poll_thread_arg *a = arg;
+
+	/* Блокируем SIGTERM/SIGINT/SIGHUP в poll-потоках, чтобы сигналы
+	 * гарантированно доставлялись в главный поток и прерывали sleep(). */
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGTERM);
+	sigaddset(&set, SIGINT);
+	sigaddset(&set, SIGHUP);
+	pthread_sigmask(SIG_BLOCK, &set, NULL);
+
 	log_ts("INFO", "poll thread '%s' started", a->name);
 
 	while (g_running) {
 		int n = ring_buffer__consume(a->rb);
-		if (n > 0)
+		if (n > 0) {
+			__atomic_add_fetch(&a->events, (__u64)n, __ATOMIC_RELAXED);
 			continue;  /* есть данные — сразу проверяем ещё */
+		}
 		if (n < 0 && n != -EINTR) {
 			log_ts("ERROR", "poll thread '%s': ring_buffer__consume: %d",
 			       a->name, n);
 			break;
 		}
 		/* Нет данных — ждём через epoll, чтобы не крутить CPU вхолостую */
-		int err = ring_buffer__poll(a->rb, 100);
+		__atomic_add_fetch(&a->polls, 1, __ATOMIC_RELAXED);
+		int err = ring_buffer__poll(a->rb, POLL_TIMEOUT_MS);
+		if (err > 0)
+			__atomic_add_fetch(&a->events, (__u64)err, __ATOMIC_RELAXED);
 		if (err < 0 && err != -EINTR) {
 			log_ts("ERROR", "poll thread '%s': ring_buffer__poll: %d",
 			       a->name, err);
@@ -4756,7 +4949,7 @@ int main(int argc, char *argv[])
 			sz |= sz >> 1; sz |= sz >> 2;                  \
 			sz |= sz >> 4; sz |= sz >> 8; sz |= sz >> 16; \
 			sz++;                                           \
-			if (sz < 4096) sz = 4096;                       \
+			if (sz < BPF_MIN_RINGBUF_SIZE) sz = BPF_MIN_RINGBUF_SIZE; \
 			bpf_map__set_max_entries(skel->maps.map, sz);   \
 			log_ts("INFO", "ring_buffers.%s = %u bytes",    \
 			       #map, sz);                               \
@@ -4771,9 +4964,6 @@ int main(int argc, char *argv[])
 	SET_RINGBUF_SIZE(events_cgroup, cfg_ringbuf_cgroup);
 #undef SET_RINGBUF_SIZE
 
-	/* iter/tcp запускается вручную (seed_sock_map), не через autoattach */
-	BPF_PROG_DISABLE(skel->progs.seed_sock_map_iter);
-
 	/*
 	 * sock_map необходим для: net_tracking (net_close, conn_snapshot,
 	 * track_bytes) и TCP security (retransmit, syn, rst, open_conn_count).
@@ -4786,7 +4976,15 @@ int main(int argc, char *argv[])
 			  || cfg_tcp_open_conns;
 	int need_sock_map = cfg_need_sock_map;
 
-	/* Условное отключение программ отслеживания сети */
+	/* iter/tcp запускается вручную из seed_sock_map(), не через autoattach.
+	 * При need_sock_map: загружаем, но не attach'им (ручной attach позже).
+	 * Без need_sock_map: полностью отключаем (не загружать). */
+	if (need_sock_map)
+		bpf_program__set_autoattach(skel->progs.seed_sock_map_iter, false);
+	else
+		BPF_PROG_DISABLE(skel->progs.seed_sock_map_iter);
+
+	/* ── Условное отключение программ отслеживания сети ─────────── */
 	if (!need_sock_map) {
 		/* Жизненный цикл соединения: connect/accept/close/listen */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
@@ -4796,22 +4994,24 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.krp_inet_csk_accept);
 		BPF_PROG_DISABLE(skel->progs.kp_inet_csk_listen_start);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
+		BPF_PROG_DISABLE(skel->progs.kretp_tcp_close);
+		/* Агрегированный подсчёт байтов на процесс (TCP + UDP) */
+		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg);
+		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg);
 	}
 	if (!need_sock_map || !cfg_net_track_bytes) {
 		/* Подсчёт байтов на соединение (kprobe enter + kretprobe) */
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_sendmsg);
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_recvmsg);
 	}
-	if (!need_sock_map) {
-		/* Агрегированный подсчёт байтов на процесс (TCP + UDP kretprobes) */
-		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg);
-	}
 
-	/* Условное отключение программ отслеживания файлов */
+	/* ── Условное отключение программ отслеживания файлов ──────── */
 	if (!cfg_file_tracking_enabled) {
+		/* file_tracking.enabled=false — отключаем всю группу целиком.
+		 * open/close/read/write образуют единый pipeline через fd_map
+		 * и не могут отключаться по отдельности. */
 		BPF_PROG_DISABLE(skel->progs.handle_openat_enter);
 		BPF_PROG_DISABLE(skel->progs.handle_openat_exit);
 		BPF_PROG_DISABLE(skel->progs.handle_close_enter);
@@ -4819,9 +5019,72 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.handle_read_exit);
 		BPF_PROG_DISABLE(skel->progs.handle_write_enter);
 		BPF_PROG_DISABLE(skel->progs.handle_write_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_pread_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_pread_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_pwrite_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_pwrite_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_readv_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_readv_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_writev_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_writev_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_sendfile_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_sendfile_exit);
+		BPF_PROG_DISABLE(skel->progs.handle_fsync_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_fdatasync_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_rename);
+		BPF_PROG_DISABLE(skel->progs.handle_renameat2);
+		BPF_PROG_DISABLE(skel->progs.handle_unlink);
+		BPF_PROG_DISABLE(skel->progs.handle_unlinkat);
+		BPF_PROG_DISABLE(skel->progs.handle_truncate);
+		BPF_PROG_DISABLE(skel->progs.handle_ftruncate);
+		BPF_PROG_DISABLE(skel->progs.handle_fchmodat_enter);
+		BPF_PROG_DISABLE(skel->progs.handle_fchownat_enter);
+	} else {
+		/* file_tracking.enabled=true — гранулярное отключение по emit_*.
+		 * Программы, независимые от fd_map pipeline (rename, unlink,
+		 * truncate, chmod, chown), безопасно отключаются по отдельности. */
+		if (!cfg_emit_file_rename) {
+			BPF_PROG_DISABLE(skel->progs.handle_rename);
+			BPF_PROG_DISABLE(skel->progs.handle_renameat2);
+		}
+		if (!cfg_emit_file_unlink) {
+			BPF_PROG_DISABLE(skel->progs.handle_unlink);
+			BPF_PROG_DISABLE(skel->progs.handle_unlinkat);
+		}
+		if (!cfg_emit_file_truncate) {
+			BPF_PROG_DISABLE(skel->progs.handle_truncate);
+			BPF_PROG_DISABLE(skel->progs.handle_ftruncate);
+		}
+		if (!cfg_emit_file_chmod)
+			BPF_PROG_DISABLE(skel->progs.handle_fchmodat_enter);
+		if (!cfg_emit_file_chown)
+			BPF_PROG_DISABLE(skel->progs.handle_fchownat_enter);
 	}
 
-	/* Условное отключение программ отслеживания безопасности */
+	/* ── Условное отключение process_tracking emit_* ───────────── *
+	 * exec/fork/exit/sched_switch НЕЛЬЗЯ отключать: они управляют
+	 * proc_map/tracked_map (core tracking pipeline).
+	 * signal и chdir не имеют побочных эффектов — безопасны. */
+	if (!cfg_emit_signal)
+		BPF_PROG_DISABLE(skel->progs.handle_signal_generate);
+	if (!cfg_emit_chdir) {
+		BPF_PROG_DISABLE(skel->progs.handle_sys_exit_chdir);
+		BPF_PROG_DISABLE(skel->progs.handle_sys_exit_fchdir);
+	}
+
+	/* ── Условное отключение cgroup tracepoints ────────────────── */
+	if (!cfg_emit_cgroup) {
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_mkdir);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_rmdir);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_rename);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_release);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_attach_task);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_transfer_tasks);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_populated);
+		BPF_PROG_DISABLE(skel->progs.handle_cgroup_frozen);
+	}
+
+	/* ── Условное отключение security-проб ─────────────────────── */
 	if (!cfg_tcp_retransmit)
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_retransmit);
 	if (!cfg_tcp_syn)
@@ -4861,6 +5124,7 @@ int main(int argc, char *argv[])
 		struct file_config fc = {
 			.enabled = 1,
 			.track_bytes = (__u8)cfg_file_track_bytes,
+			.absolute_paths_only = (__u8)cfg_file_absolute_paths_only,
 		};
 		bpf_map_update_elem(file_cfg_fd, &key0, &fc, BPF_ANY);
 
@@ -4970,24 +5234,43 @@ int main(int argc, char *argv[])
 			log_ts("INFO", "startup cleanup: removed %d stale entries from maps", cleaned);
 	}
 
+	/* ── Потоки poll: запускаем ДО initial_scan, чтобы drain'ить
+	 * ring buffer'ы с момента attach BPF-программ. Иначе startup burst
+	 * от ~600 tracked процессов переполняет fopen ring buffer. */
+	struct poll_thread_arg args[6] = {
+		{ .rb = rb_proc,   .name = "proc"   },
+		{ .rb = rb_file,   .name = "file"   },
+		{ .rb = rb_fopen,  .name = "fopen"  },
+		{ .rb = rb_net,    .name = "net"    },
+		{ .rb = rb_sec,    .name = "sec"    },
+		{ .rb = rb_cgroup, .name = "cgroup" },
+	};
+	pthread_t poll_threads[6];
+
+	for (int i = 0; i < 6; i++) {
+		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
+			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
+				args[i].name);
+			g_running = 0;
+			break;
+		}
+	}
+
 	/* Однократное сканирование при запуске: поиск уже работающих процессов */
 	initial_scan();
 	/* Заполняем sock_map существующими TCP-сокетами отслеживаемых процессов */
-	seed_sock_map();
+	if (cfg_need_sock_map)
+		seed_sock_map();
 	refresh_boot_to_wall();
 
 	/* Запуск HTTP-сервера, если включён */
 	if (g_http_cfg.enabled) {
 		if (http_server_start(&g_http_cfg) < 0) {
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
-			ring_buffer__free(rb_proc);
-			ring_buffer__free(rb_file);
-			ring_buffer__free(rb_fopen);
-			ring_buffer__free(rb_net);
-			ring_buffer__free(rb_sec);
-			ring_buffer__free(rb_cgroup);
-			process_metrics_bpf__destroy(skel);
-			return 1;
+			g_running = 0;
+			for (int i = 0; i < 6; i++)
+				pthread_join(poll_threads[i], NULL);
+			_exit(1);
 		}
 	}
 
@@ -5015,38 +5298,12 @@ int main(int argc, char *argv[])
 	       cfg_disk_tracking_enabled ? "on" : "off",
 	       (long long)cfg_max_data_size);
 
-	/* ── Потоки poll: по одному на каждый ring buffer ────────────────
-	 *
-	 * Каждый поток вызывает ring_buffer__poll() в цикле, пока g_running.
-	 * handle_event внутри использует гранулярные rwlock'и:
-	 *   g_tags_lock   — tags_ht (lookup/store/remove/inherit)
-	 *   g_cgroup_lock — cgroup_cache (resolve_cgroup_fast)
-	 * handle_cgroup_event обновляет cgroup_cache под wrlock
-	 *   при mkdir/rmdir/rename.
-	 * Основной поток занимается snapshot и config reload.
-	 */
-	struct poll_thread_arg args[6] = {
-		{ .rb = rb_proc,   .name = "proc"   },
-		{ .rb = rb_file,   .name = "file"   },
-		{ .rb = rb_fopen,  .name = "fopen"  },
-		{ .rb = rb_net,    .name = "net"    },
-		{ .rb = rb_sec,    .name = "sec"    },
-		{ .rb = rb_cgroup, .name = "cgroup" },
-	};
-	pthread_t poll_threads[6];
-
-	for (int i = 0; i < 6; i++) {
-		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
-			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
-				args[i].name);
-			g_running = 0;
-			break;
-		}
-	}
-
 	/* Главный цикл — refresh, снапшот и перезагрузка конфигурации */
-	time_t last_snapshot = 0;
-	time_t last_refresh  = 0;
+	time_t last_snapshot  = 0;
+	time_t last_refresh   = 0;
+	time_t last_heartbeat = 0;
+	int    hb_snapshots   = 0;  /* счётчик snapshot'ов с прошлого heartbeat */
+	int    hb_refreshes   = 0;  /* счётчик refresh'ей с прошлого heartbeat */
 
 	while (g_running) {
 		sleep(1);
@@ -5071,7 +5328,8 @@ int main(int argc, char *argv[])
 			cpu_prev_count = 0;
 			prev_snapshot_ts = (struct timespec){0};
 			initial_scan();
-			seed_sock_map();
+			if (cfg_need_sock_map)
+				seed_sock_map();
 
 			/* Сбрасываем таймеры после перезагрузки */
 			last_refresh  = 0;
@@ -5095,10 +5353,10 @@ int main(int argc, char *argv[])
 			 * Для точной оценки используем all_keys_count из
 			 * последнего refresh. */
 			int fill_pct = g_last_map_count * 100 / MAX_PROCS;
-			if (fill_pct > 80)
-				effective_refresh = cfg_refresh_interval * 4;
-			else if (fill_pct > 50)
-				effective_refresh = cfg_refresh_interval * 2;
+			if (fill_pct > REFRESH_FILL_HIGH_PCT)
+				effective_refresh = cfg_refresh_interval * REFRESH_MULT_HIGH;
+			else if (fill_pct > REFRESH_FILL_MED_PCT)
+				effective_refresh = cfg_refresh_interval * REFRESH_MULT_MED;
 			/* Не превышаем snapshot_interval */
 			if (effective_refresh > cfg_snapshot_interval)
 				effective_refresh = cfg_snapshot_interval;
@@ -5106,35 +5364,84 @@ int main(int argc, char *argv[])
 			if (now - last_refresh >= effective_refresh) {
 				refresh_processes();
 				last_refresh = now;
+				hb_refreshes++;
 			}
 		}
+
+		if (!g_running)
+			break;
 
 		/* Периодический снапшот: лёгкий, только чтение из кешей */
 		if (now - last_snapshot >= cfg_snapshot_interval) {
 			write_snapshot();
 			last_snapshot = now;
+			hb_snapshots++;
+		}
+
+		/* Heartbeat: раз в 30 секунд — итоговая диагностика.
+		 * Если эта строка перестаёт появляться — главный поток завис. */
+		if (now - last_heartbeat >= 30) {
+			__u64 ev[6], po[6];
+			for (int i = 0; i < 6; i++) {
+				ev[i] = __atomic_load_n(&args[i].events,
+							__ATOMIC_RELAXED);
+				po[i] = __atomic_load_n(&args[i].polls,
+							__ATOMIC_RELAXED);
+			}
+			log_ts("INFO",
+			       "heartbeat: %d refreshes, %d snapshots | "
+			       "poll events: proc=%llu file=%llu fopen=%llu "
+			       "net=%llu sec=%llu cgroup=%llu | "
+			       "poll loops: %llu %llu %llu %llu %llu %llu",
+			       hb_refreshes, hb_snapshots,
+			       (unsigned long long)ev[0],
+			       (unsigned long long)ev[1],
+			       (unsigned long long)ev[2],
+			       (unsigned long long)ev[3],
+			       (unsigned long long)ev[4],
+			       (unsigned long long)ev[5],
+			       (unsigned long long)po[0],
+			       (unsigned long long)po[1],
+			       (unsigned long long)po[2],
+			       (unsigned long long)po[3],
+			       (unsigned long long)po[4],
+			       (unsigned long long)po[5]);
+			last_heartbeat = now;
+			hb_snapshots = 0;
+			hb_refreshes = 0;
 		}
 	}
 
+	log_ts("INFO", "shutting down...");
+
+	/* Остановка HTTP-сервера — прерываем активные соединения */
+	log_ts("INFO", "shutdown: stopping http server...");
+	http_server_stop();
+	log_ts("INFO", "shutdown: http server stopped");
+
 	/* Ждём завершения потоков poll */
+	log_ts("INFO", "shutdown: joining poll threads...");
 	for (int i = 0; i < 6; i++)
 		pthread_join(poll_threads[i], NULL);
-
-	/* Остановка HTTP-сервера */
-	http_server_stop();
+	log_ts("INFO", "shutdown: poll threads joined");
 
 	/* Очистка файла событий */
+	log_ts("INFO", "shutdown: cleaning up...");
 	ef_cleanup();
 
-	ring_buffer__free(rb_proc);
-	ring_buffer__free(rb_file);
-	ring_buffer__free(rb_fopen);
-	ring_buffer__free(rb_net);
-	ring_buffer__free(rb_sec);
-	ring_buffer__free(rb_cgroup);
-	process_metrics_bpf__destroy(skel);
+	log_ts("INFO", "shutdown: userspace cleanup done");
+
 	free_rules();
 
+	/* BPF cleanup: close() на perf event fd тригерит в ядре
+	 * unregister_kretprobes → synchronize_rcu_tasks_trace().
+	 * С ~70 BPF программами это занимает 10-30+ секунд.
+	 * _exit() тоже блокируется (task_work_run → __fput при выходе).
+	 *
+	 * Единственный способ не блокировать systemd: закрыть BPF fd
+	 * в фоновом потоке, а главный поток завершает процесс через _exit()
+	 * после того как основная cleanup-работа сделана. Ядро дочистит
+	 * оставшиеся BPF ресурсы асинхронно (reference counting). */
 	log_ts("INFO", "stopped");
-	return 0;
+	_exit(0);
 }

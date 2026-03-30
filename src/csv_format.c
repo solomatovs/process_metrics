@@ -192,8 +192,8 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 		memcpy(p, "0000-00-00 00:00:00.000", 23);
 		return p + 23;
 	}
-	time_t sec = (time_t)(ts_ns / 1000000000ULL);
-	unsigned ms = (unsigned)((ts_ns % 1000000000ULL) / 1000000);
+	time_t sec = (time_t)(ts_ns / NS_PER_SEC);
+	unsigned ms = (unsigned)((ts_ns % NS_PER_SEC) / NS_PER_MS);
 	struct tm tm;
 	gmtime_r(&sec, &tm);
 
@@ -262,7 +262,7 @@ int csv_format_row(char *buf, int buflen,
 	 *   (args, exec, tags, cgroup, pwd) ограничены EV_ESC_SIZE.
 	 *   Итого в худшем случае: ~6000 байт.  Буфер 8192 байт безопасен.
 	 */
-	if (buflen < 4096)
+	if (buflen < CSV_MIN_BUF_SIZE)
 		return -1;
 
 	const struct metric_event *ev = &rec->event;
@@ -292,7 +292,7 @@ int csv_format_row(char *buf, int buflen,
 	}
 	U32(ev->loginuid);
 	/* login_name (разрешается из loginuid) */
-	if (ev->loginuid == 4294967295U) {
+	if (ev->loginuid == AUDIT_UID_UNSET) {
 		STR("AUDIT_UID_UNSET", 64);
 	} else if (resolvers && resolvers->resolve_uid) {
 		char lname[USERNAME_LEN];

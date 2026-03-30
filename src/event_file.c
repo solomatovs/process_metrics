@@ -46,11 +46,11 @@ static __u32 ring_count(void)
 int ef_init(__u64 max_size_bytes)
 {
 	if (max_size_bytes == 0)
-		max_size_bytes = 256ULL * 1024 * 1024; /* 256 МБ по умолчанию */
+		max_size_bytes = EF_DEFAULT_SIZE_BYTES;
 
 	__u64 cap = max_size_bytes / sizeof(struct ef_record);
-	if (cap < 64)
-		cap = 64;
+	if (cap < EF_MIN_CAPACITY)
+		cap = EF_MIN_CAPACITY;
 	if (cap > EF_MAX_CAPACITY)
 		cap = EF_MAX_CAPACITY; /* предельное ограничение: ~2.7 ГБ */
 
