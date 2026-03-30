@@ -60,6 +60,9 @@
 #define BPF_UDP_AGG_SIZE     16384  /* агрегация UDP-трафика */
 #define BPF_ICMP_AGG_SIZE    8192   /* агрегация ICMP-трафика */
 
+/* ── poll-потоки и heartbeat ───────────────────────────────────────── */
+#define NUM_POLL_THREADS         6     /* proc, file, file_ops, net, sec, cgroup */
+
 /* ── HTTP-сервер ───────────────────────────────────────────────────── */
 #define HTTP_SEND_BUF_SIZE       (128 * 1024) /* буфер отправки HTTP (128 КБ) */
 #define HTTP_ROW_BUF_SIZE        8192         /* буфер одной CSV-строки */
@@ -102,7 +105,7 @@
 #define RINGBUF_FILE_EVENTS  4096   /* struct file_event=2152B → 4096 × 2176 = 16 MB */
 #endif
 #ifndef RINGBUF_FOPEN_EVENTS
-#define RINGBUF_FOPEN_EVENTS 2048   /* struct file_event=2152B → 2048 × 2176 = 4 MB (шумный, допустимы потери) */
+#define RINGBUF_FOPEN_EVENTS 512    /* struct file_event=2152B → 512 × 2176 = 1 MB (редкие: unlink/truncate/chmod/chown) */
 #endif
 #ifndef RINGBUF_NET_EVENTS
 #define RINGBUF_NET_EVENTS   32768
@@ -135,13 +138,13 @@
 struct ringbuf_stats {
 	__u64 drop_proc;       /* потери в events_proc */
 	__u64 drop_file;       /* потери в events_file (close/rename/chmod/...) */
-	__u64 drop_fopen;      /* потери в events_fopen (file_open) */
+	__u64 drop_file_ops;   /* потери в events_file_ops (unlink/truncate/chmod/chown) */
 	__u64 drop_net;        /* потери в events_net */
 	__u64 drop_sec;        /* потери в events_sec (security: retransmit, syn, rst) */
 	__u64 drop_cgroup;     /* потери в events_cgroup */
 	__u64 total_proc;      /* всего событий proc */
 	__u64 total_file;      /* всего событий file (close/rename/chmod/...) */
-	__u64 total_fopen;     /* всего событий fopen */
+	__u64 total_file_ops;  /* всего событий file_ops */
 	__u64 total_net;       /* всего событий net */
 	__u64 total_sec;       /* всего событий sec */
 	__u64 total_cgroup;    /* всего событий cgroup */

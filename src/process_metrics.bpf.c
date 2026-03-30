@@ -106,18 +106,18 @@ struct {
 } events_proc SEC(".maps");
 
 /* Ring buffer для файловых мутаций: close/rename/unlink/truncate/chmod/chown
- * (аудитно-важные, потеря недопустима) */
+ * Большой буфер для симметричных open/close и частых rename. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_FILE_SIZE);
 } events_file SEC(".maps");
 
-/* Ring buffer для file_open — шумный, допустимы потери при storm.
- * Отделён от events_file чтобы не вытеснять close/rename/chmod. */
+/* Ring buffer для редких файловых операций (unlink, truncate, chmod, chown).
+ * Отделён от events_file чтобы burst open/close не вытеснял аудит-события. */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, RINGBUF_FOPEN_SIZE);
-} events_fopen SEC(".maps");
+} events_file_ops SEC(".maps");
 
 /* Ring buffer для сетевых событий (net_event) */
 struct {
@@ -187,11 +187,11 @@ static __always_inline void rb_stat_inc(__u64 offset)
 
 #define RB_STAT_TOTAL_PROC()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
 #define RB_STAT_TOTAL_FILE()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
-#define RB_STAT_TOTAL_FOPEN() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_fopen))
+#define RB_STAT_TOTAL_FILE_OPS() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file_ops))
 #define RB_STAT_TOTAL_NET()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_net))
 #define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
 #define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
-#define RB_STAT_DROP_FOPEN()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_fopen))
+#define RB_STAT_DROP_FILE_OPS()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file_ops))
 #define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
 #define RB_STAT_TOTAL_SEC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_sec))
 #define RB_STAT_DROP_SEC()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_sec))
@@ -1554,11 +1554,9 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 	bpf_map_update_elem(&fd_map, &fk, fi, BPF_ANY);
 	bpf_map_delete_elem(&openat_args_map, &pid_tgid);
 
-	/* Отправляем событие file_open через отдельный ring buffer (events_fopen).
-	 * Отделён от events_file чтобы шумный file_open не вытеснял
-	 * аудитно-важные close/rename/chmod. */
-	RB_STAT_TOTAL_FOPEN();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_fopen, sizeof(*fe), 0);
+	/* file_open → events_file (общий буфер с close/rename) */
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
 	if (fe) {
 		BPF_ZERO_PTR(fe, sizeof(*fe));
 		fe->type = EVENT_FILE_OPEN;
@@ -1577,7 +1575,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 
 		bpf_ringbuf_submit(fe, 0);
 	} else {
-		RB_STAT_DROP_FOPEN();
+		RB_STAT_DROP_FILE();
 	}
 
 	return 0;
@@ -1673,10 +1671,10 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 	if (path_matches_exclude(sc->path))
 		return 0;
 
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
+	RB_STAT_TOTAL_FILE_OPS();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_UNLINK;
@@ -1737,10 +1735,10 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	if (path_matches_exclude(sc->path))
 		return 0;
 
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
+	RB_STAT_TOTAL_FILE_OPS();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;
@@ -1781,10 +1779,10 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 	if (!fi || fi->path[0] == '\0')
 		return 0;
 
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
+	RB_STAT_TOTAL_FILE_OPS();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;
@@ -2263,10 +2261,10 @@ int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
 	const char *filename = (const char *)ctx->args[1];
 	__u32 mode = (__u32)ctx->args[2];
 
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	RB_STAT_TOTAL_FILE_OPS();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops, sizeof(*fe), 0);
 	if (!fe) {
-		RB_STAT_DROP_FILE();
+		RB_STAT_DROP_FILE_OPS();
 		return 0;
 	}
 
@@ -2301,10 +2299,10 @@ int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 uid = (__u32)ctx->args[2];
 	__u32 gid = (__u32)ctx->args[3];
 
-	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	RB_STAT_TOTAL_FILE_OPS();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops, sizeof(*fe), 0);
 	if (!fe) {
-		RB_STAT_DROP_FILE();
+		RB_STAT_DROP_FILE_OPS();
 		return 0;
 	}
 

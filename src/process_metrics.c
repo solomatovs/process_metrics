@@ -80,6 +80,7 @@ static int         cfg_exec_rate_limit             = 0;  /* 0 = без огра�
 static int         cfg_cgroup_metrics              = 1;  /* 1 = читать файлы cgroup */
 static int         cfg_refresh_proc                = 1;  /* 1 = обновлять cmdline/comm из /proc */
 static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=debug */
+static int         cfg_heartbeat_interval          = 30; /* секунды, 0 = отключить */
 
 /* Конфигурация HTTP-сервера */
 static struct http_config g_http_cfg;
@@ -88,7 +89,7 @@ static long long cfg_max_data_size          = (long long)EF_DEFAULT_SIZE_BYTES;
 /* Размеры BPF ring buffer'ов (0 = использовать дефолт из compile-time) */
 static long long cfg_ringbuf_proc           = 0;
 static long long cfg_ringbuf_file           = 0;
-static long long cfg_ringbuf_fopen          = 0;
+static long long cfg_ringbuf_file_ops       = 0;
 static long long cfg_ringbuf_net            = 0;
 static long long cfg_ringbuf_sec            = 0;
 static long long cfg_ringbuf_cgroup         = 0;
@@ -1653,6 +1654,8 @@ static int load_config(const char *path)
 		cfg_refresh_proc = bool_val;
 	if (config_lookup_int(&cfg, "log_level", &int_val))
 		cfg_log_level = int_val;
+	if (config_lookup_int(&cfg, "heartbeat_interval", &int_val))
+		cfg_heartbeat_interval = int_val;
 
 	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
@@ -1735,8 +1738,8 @@ static int load_config(const char *path)
 			cfg_ringbuf_proc = ll_val;
 		if (config_setting_lookup_int64(rb, "file", &ll_val))
 			cfg_ringbuf_file = ll_val;
-		if (config_setting_lookup_int64(rb, "fopen", &ll_val))
-			cfg_ringbuf_fopen = ll_val;
+		if (config_setting_lookup_int64(rb, "file_ops", &ll_val))
+			cfg_ringbuf_file_ops = ll_val;
 		if (config_setting_lookup_int64(rb, "net", &ll_val))
 			cfg_ringbuf_net = ll_val;
 		if (config_setting_lookup_int64(rb, "sec", &ll_val))
@@ -4720,20 +4723,20 @@ static void write_snapshot(void)
 			__u64 new_drops =
 				(rs.drop_proc   - prev_rs.drop_proc) +
 				(rs.drop_file   - prev_rs.drop_file) +
-				(rs.drop_fopen  - prev_rs.drop_fopen) +
+				(rs.drop_file_ops  - prev_rs.drop_file_ops) +
 				(rs.drop_net    - prev_rs.drop_net) +
 				(rs.drop_sec    - prev_rs.drop_sec) +
 				(rs.drop_cgroup - prev_rs.drop_cgroup) +
 				(rs.drop_missed_exec - prev_rs.drop_missed_exec);
 			if (new_drops > 0) {
 				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu fopen=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
+				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu file_ops=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
 				       (unsigned long long)rs.total_file,
-				       (unsigned long long)rs.drop_fopen,
-				       (unsigned long long)rs.total_fopen,
+				       (unsigned long long)rs.drop_file_ops,
+				       (unsigned long long)rs.total_file_ops,
 				       (unsigned long long)rs.drop_net,
 				       (unsigned long long)rs.total_net,
 				       (unsigned long long)rs.drop_sec,
@@ -4958,7 +4961,7 @@ int main(int argc, char *argv[])
 
 	SET_RINGBUF_SIZE(events_proc,  cfg_ringbuf_proc);
 	SET_RINGBUF_SIZE(events_file,  cfg_ringbuf_file);
-	SET_RINGBUF_SIZE(events_fopen, cfg_ringbuf_fopen);
+	SET_RINGBUF_SIZE(events_file_ops, cfg_ringbuf_file_ops);
 	SET_RINGBUF_SIZE(events_net,   cfg_ringbuf_net);
 	SET_RINGBUF_SIZE(events_sec,   cfg_ringbuf_sec);
 	SET_RINGBUF_SIZE(events_cgroup, cfg_ringbuf_cgroup);
@@ -5191,8 +5194,8 @@ int main(int argc, char *argv[])
 		bpf_map__fd(skel->maps.events_proc), handle_event, NULL, NULL);
 	struct ring_buffer *rb_file = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_file), handle_event, NULL, NULL);
-	struct ring_buffer *rb_fopen = ring_buffer__new(
-		bpf_map__fd(skel->maps.events_fopen), handle_event, NULL, NULL);
+	struct ring_buffer *rb_file_ops = ring_buffer__new(
+		bpf_map__fd(skel->maps.events_file_ops), handle_event, NULL, NULL);
 	struct ring_buffer *rb_net = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_net), handle_event, NULL, NULL);
 	struct ring_buffer *rb_sec = ring_buffer__new(
@@ -5200,11 +5203,11 @@ int main(int argc, char *argv[])
 	struct ring_buffer *rb_cgroup = ring_buffer__new(
 		bpf_map__fd(skel->maps.events_cgroup), handle_cgroup_event,
 		NULL, NULL);
-	if (!rb_proc || !rb_file || !rb_fopen || !rb_net || !rb_sec || !rb_cgroup) {
+	if (!rb_proc || !rb_file || !rb_file_ops || !rb_net || !rb_sec || !rb_cgroup) {
 		fprintf(stderr, "FATAL: failed to create ring buffers\n");
 		if (rb_proc)   ring_buffer__free(rb_proc);
 		if (rb_file)   ring_buffer__free(rb_file);
-		if (rb_fopen)  ring_buffer__free(rb_fopen);
+		if (rb_file_ops)  ring_buffer__free(rb_file_ops);
 		if (rb_net)    ring_buffer__free(rb_net);
 		if (rb_sec)    ring_buffer__free(rb_sec);
 		if (rb_cgroup) ring_buffer__free(rb_cgroup);
@@ -5237,17 +5240,17 @@ int main(int argc, char *argv[])
 	/* ── Потоки poll: запускаем ДО initial_scan, чтобы drain'ить
 	 * ring buffer'ы с момента attach BPF-программ. Иначе startup burst
 	 * от ~600 tracked процессов переполняет fopen ring buffer. */
-	struct poll_thread_arg args[6] = {
+	struct poll_thread_arg args[NUM_POLL_THREADS] = {
 		{ .rb = rb_proc,   .name = "proc"   },
 		{ .rb = rb_file,   .name = "file"   },
-		{ .rb = rb_fopen,  .name = "fopen"  },
+		{ .rb = rb_file_ops,  .name = "file_ops"  },
 		{ .rb = rb_net,    .name = "net"    },
 		{ .rb = rb_sec,    .name = "sec"    },
 		{ .rb = rb_cgroup, .name = "cgroup" },
 	};
-	pthread_t poll_threads[6];
+	pthread_t poll_threads[NUM_POLL_THREADS];
 
-	for (int i = 0; i < 6; i++) {
+	for (int i = 0; i < NUM_POLL_THREADS; i++) {
 		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
 			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
 				args[i].name);
@@ -5268,7 +5271,7 @@ int main(int argc, char *argv[])
 		if (http_server_start(&g_http_cfg) < 0) {
 			fprintf(stderr, "FATAL: HTTP server start failed\n");
 			g_running = 0;
-			for (int i = 0; i < 6; i++)
+			for (int i = 0; i < NUM_POLL_THREADS; i++)
 				pthread_join(poll_threads[i], NULL);
 			_exit(1);
 		}
@@ -5378,11 +5381,13 @@ int main(int argc, char *argv[])
 			hb_snapshots++;
 		}
 
-		/* Heartbeat: раз в 30 секунд — итоговая диагностика.
+		/* Heartbeat — дельта-диагностика за интервал.
 		 * Если эта строка перестаёт появляться — главный поток завис. */
-		if (now - last_heartbeat >= 30) {
-			__u64 ev[6], po[6];
-			for (int i = 0; i < 6; i++) {
+		if (cfg_heartbeat_interval > 0 &&
+		    now - last_heartbeat >= cfg_heartbeat_interval) {
+			static __u64 prev_ev[NUM_POLL_THREADS], prev_po[NUM_POLL_THREADS];
+			__u64 ev[NUM_POLL_THREADS], po[NUM_POLL_THREADS];
+			for (int i = 0; i < NUM_POLL_THREADS; i++) {
 				ev[i] = __atomic_load_n(&args[i].events,
 							__ATOMIC_RELAXED);
 				po[i] = __atomic_load_n(&args[i].polls,
@@ -5390,22 +5395,27 @@ int main(int argc, char *argv[])
 			}
 			log_ts("INFO",
 			       "heartbeat: %d refreshes, %d snapshots | "
-			       "poll events: proc=%llu file=%llu fopen=%llu "
+			       "events/%ds: proc=%llu file=%llu file_ops=%llu "
 			       "net=%llu sec=%llu cgroup=%llu | "
-			       "poll loops: %llu %llu %llu %llu %llu %llu",
+			       "polls: %llu %llu %llu %llu %llu %llu",
 			       hb_refreshes, hb_snapshots,
-			       (unsigned long long)ev[0],
-			       (unsigned long long)ev[1],
-			       (unsigned long long)ev[2],
-			       (unsigned long long)ev[3],
-			       (unsigned long long)ev[4],
-			       (unsigned long long)ev[5],
-			       (unsigned long long)po[0],
-			       (unsigned long long)po[1],
-			       (unsigned long long)po[2],
-			       (unsigned long long)po[3],
-			       (unsigned long long)po[4],
-			       (unsigned long long)po[5]);
+			       cfg_heartbeat_interval,
+			       (unsigned long long)(ev[0] - prev_ev[0]),
+			       (unsigned long long)(ev[1] - prev_ev[1]),
+			       (unsigned long long)(ev[2] - prev_ev[2]),
+			       (unsigned long long)(ev[3] - prev_ev[3]),
+			       (unsigned long long)(ev[4] - prev_ev[4]),
+			       (unsigned long long)(ev[5] - prev_ev[5]),
+			       (unsigned long long)(po[0] - prev_po[0]),
+			       (unsigned long long)(po[1] - prev_po[1]),
+			       (unsigned long long)(po[2] - prev_po[2]),
+			       (unsigned long long)(po[3] - prev_po[3]),
+			       (unsigned long long)(po[4] - prev_po[4]),
+			       (unsigned long long)(po[5] - prev_po[5]));
+			for (int i = 0; i < NUM_POLL_THREADS; i++) {
+				prev_ev[i] = ev[i];
+				prev_po[i] = po[i];
+			}
 			last_heartbeat = now;
 			hb_snapshots = 0;
 			hb_refreshes = 0;
@@ -5421,7 +5431,7 @@ int main(int argc, char *argv[])
 
 	/* Ждём завершения потоков poll */
 	log_ts("INFO", "shutdown: joining poll threads...");
-	for (int i = 0; i < 6; i++)
+	for (int i = 0; i < NUM_POLL_THREADS; i++)
 		pthread_join(poll_threads[i], NULL);
 	log_ts("INFO", "shutdown: poll threads joined");
 
