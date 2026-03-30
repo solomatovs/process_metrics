@@ -407,6 +407,50 @@ WHERE event_type IN ('net_listen', 'net_connect', 'net_accept',
                      'conn_snapshot', 'net_close')
   AND timestamp > now() - INTERVAL 5 MINUTE
 ORDER BY timestamp;
+
+-- Агрегация всех типов событий за сутки (проверка корректности сборки)
+-- Все 25 ожидаемых event_type перечислены явно, не зависит от данных в таблице
+SELECT
+    expected.event_type,
+    countIf(t.event_type != '') AS cnt,
+    if(cnt > 0, '✓', '✗') AS status
+FROM
+(
+    SELECT 'exec'           AS event_type UNION ALL
+    SELECT 'fork'           AS event_type UNION ALL
+    SELECT 'exit'           AS event_type UNION ALL
+    SELECT 'oom_kill'       AS event_type UNION ALL
+    SELECT 'file_open'      AS event_type UNION ALL
+    SELECT 'file_close'     AS event_type UNION ALL
+    SELECT 'file_rename'    AS event_type UNION ALL
+    SELECT 'file_unlink'    AS event_type UNION ALL
+    SELECT 'file_truncate'  AS event_type UNION ALL
+    SELECT 'file_chmod'     AS event_type UNION ALL
+    SELECT 'file_chown'     AS event_type UNION ALL
+    SELECT 'signal'         AS event_type UNION ALL
+    SELECT 'net_listen'     AS event_type UNION ALL
+    SELECT 'net_connect'    AS event_type UNION ALL
+    SELECT 'net_accept'     AS event_type UNION ALL
+    SELECT 'net_close'      AS event_type UNION ALL
+    SELECT 'tcp_retrans'    AS event_type UNION ALL
+    SELECT 'syn_recv'       AS event_type UNION ALL
+    SELECT 'rst_sent'       AS event_type UNION ALL
+    SELECT 'rst_recv'       AS event_type UNION ALL
+    SELECT 'udp_agg'        AS event_type UNION ALL
+    SELECT 'icmp_agg'       AS event_type UNION ALL
+    SELECT 'snapshot'       AS event_type UNION ALL
+    SELECT 'conn_snapshot'  AS event_type UNION ALL
+    SELECT 'file_snapshot'  AS event_type UNION ALL
+    SELECT 'disk_usage'     AS event_type
+) AS expected
+LEFT JOIN process_metrics AS t
+    ON t.event_type = expected.event_type
+    AND t.timestamp >= now() - INTERVAL 1 DAY
+GROUP BY expected.event_type
+ORDER BY
+    status ASC,
+    cnt DESC
+FORMAT PrettyCompactMonoBlock;
 ```
 
 ## Grafana
