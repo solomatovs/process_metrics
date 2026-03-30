@@ -25,6 +25,7 @@ struct http_config {
 	char bind[BIND_ADDR_LEN]; /* адрес привязки (по умолчанию: "0.0.0.0") */
 	int  enabled;        /* 0 = отключён */
 	int  max_connections; /* макс. одновременных подключений (по умолчанию: 1) */
+	int  log_requests;   /* 1 = логировать каждый HTTP-запрос (по умолчанию: 1) */
 	int  allow_count;    /* кол-во записей в allow (0 = принимать всех) */
 	struct http_allow_entry allow[HTTP_MAX_ALLOW];
 };

@@ -30,6 +30,7 @@
 #include "http_server.h"
 #include "event_file.h"
 #include "csv_format.h"
+#include "log.h"
 
 /* ── состояние ───────────────────────────────────────────────────── */
 
@@ -39,6 +40,7 @@ static volatile int  g_running;
 static int           g_max_connections;
 static volatile int  g_active_connections;
 static volatile int  g_client_fd = -1;   /* текущий клиентский сокет (для прерывания при shutdown) */
+static int           g_log_requests;
 static int                    g_allow_count;
 static struct http_allow_entry g_allow[HTTP_MAX_ALLOW];
 
@@ -273,7 +275,8 @@ static void handle_request(int client_fd,
 
 	/* Обработка HEAD /metrics — ClickHouse url() отправляет HEAD для проверки доступности */
 	if (strncmp(buf, "HEAD /metrics", 13) == 0) {
-		fprintf(stderr, "[INFO] http: HEAD /metrics from %s\n", peer_ip);
+		if (g_log_requests)
+			LOG_INFO("http: HEAD /metrics from %s", peer_ip);
 		send_response(client_fd, 200, "text/csv; charset=utf-8",
 			      "", 0);
 		return;
@@ -281,8 +284,8 @@ static void handle_request(int client_fd,
 
 	/* Обрабатываем только GET /metrics */
 	if (strncmp(buf, "GET /metrics", 12) != 0) {
-		fprintf(stderr, "[WARN] http: 404 from %s: %.40s\n",
-			peer_ip, buf);
+		LOG_WARN("http: 404 from %s: %.40s",
+		       peer_ip, buf);
 		const char *msg = "Not Found\n";
 		send_response(client_fd, 404, "text/plain",
 			      msg, (int)strlen(msg));
@@ -300,14 +303,14 @@ static void handle_request(int client_fd,
 				fmt_val[i++] = *fmt++;
 			fmt_val[i] = '\0';
 		}
-		fprintf(stderr,
-			"[WARN] http: unknown format=%s from %s, serving csv\n",
-			fmt_val, peer_ip);
+		LOG_WARN("http: unknown format=%s from %s, serving csv",
+		       fmt_val, peer_ip);
 	}
 
 	int do_clear = parse_clear(buf);
-	fprintf(stderr, "[INFO] http: GET /metrics%s from %s\n",
-		do_clear ? "?clear=1" : "", peer_ip);
+	if (g_log_requests)
+		LOG_INFO("http: GET /metrics%s from %s",
+		       do_clear ? "?clear=1" : "", peer_ip);
 	handle_csv_stream(client_fd, do_clear);
 }
 
@@ -341,8 +344,8 @@ static void *server_thread(void *arg)
 				continue;
 			if (!g_running)
 				break;
-			fprintf(stderr, "ERROR: http_server: accept: %s\n",
-				strerror(errno));
+			LOG_ERROR("http_server: accept: %s",
+			       strerror(errno));
 			continue;
 		}
 
@@ -386,16 +389,15 @@ int http_server_start(const struct http_config *cfg)
 		return 0;
 
 	if (cfg->max_connections <= 0) {
-		fprintf(stderr,
-			"ERROR: http_server: max_connections must be > 0 (got %d)\n",
-			cfg->max_connections);
+		LOG_ERROR("http_server: max_connections must be > 0 (got %d)",
+		       cfg->max_connections);
 		return -1;
 	}
 
 	g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (g_listen_fd < 0) {
-		fprintf(stderr, "ERROR: http_server: socket: %s\n",
-			strerror(errno));
+		LOG_ERROR("http_server: socket: %s",
+		       strerror(errno));
 		return -1;
 	}
 
@@ -413,17 +415,17 @@ int http_server_start(const struct http_config *cfg)
 		addr.sin_addr.s_addr = INADDR_ANY;
 
 	if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		fprintf(stderr, "ERROR: http_server: bind(%s:%d): %s\n",
-			cfg->bind[0] ? cfg->bind : "0.0.0.0",
-			cfg->port, strerror(errno));
+		LOG_ERROR("http_server: bind(%s:%d): %s",
+		       cfg->bind[0] ? cfg->bind : "0.0.0.0",
+		       cfg->port, strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
 	}
 
 	if (listen(g_listen_fd, HTTP_LISTEN_BACKLOG) < 0) {
-		fprintf(stderr, "ERROR: http_server: listen: %s\n",
-			strerror(errno));
+		LOG_ERROR("http_server: listen: %s",
+		       strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
@@ -434,19 +436,20 @@ int http_server_start(const struct http_config *cfg)
 
 	g_running = 1;
 	g_max_connections = cfg->max_connections;
+	g_log_requests = cfg->log_requests;
 	g_allow_count = cfg->allow_count;
 	memcpy(g_allow, cfg->allow, sizeof(g_allow[0]) * cfg->allow_count);
 
 	if (pthread_create(&g_thread, NULL, server_thread, NULL) != 0) {
-		fprintf(stderr, "ERROR: http_server: pthread_create: %s\n",
-			strerror(errno));
+		LOG_ERROR("http_server: pthread_create: %s",
+		       strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
 	}
 
-	fprintf(stderr, "INFO: http_server: listening on %s:%d\n",
-		cfg->bind[0] ? cfg->bind : "0.0.0.0", cfg->port);
+	LOG_INFO("http_server: listening on %s:%d",
+	       cfg->bind[0] ? cfg->bind : "0.0.0.0", cfg->port);
 	return 0;
 }
 

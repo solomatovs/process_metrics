@@ -39,6 +39,7 @@
 #include "process_metrics.skel.h"
 #include "event_file.h"
 #include "http_server.h"
+#include "log.h"
 
 /*
  * bpf_program__set_autoload  — libbpf >= 0.6 (пропускает загрузку + подключение)
@@ -81,6 +82,8 @@ static int         cfg_cgroup_metrics              = 1;  /* 1 = читать ф�
 static int         cfg_refresh_proc                = 1;  /* 1 = обновлять cmdline/comm из /proc */
 static int         cfg_log_level                   = 1;  /* 0=error, 1=info, 2=debug */
 static int         cfg_heartbeat_interval          = 30; /* секунды, 0 = отключить */
+static int         cfg_log_snapshot                = 1;  /* логировать snapshot строки */
+static int         cfg_log_refresh                 = 1;  /* логировать refresh строки */
 
 /* Конфигурация HTTP-сервера */
 static struct http_config g_http_cfg;
@@ -228,7 +231,7 @@ struct poll_thread_arg {
 /* Предварительные объявления */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
-static void log_ts(const char *level, const char *fmt, ...);
+/* log_ts определён в log.h */
 
 /* Смещение от boot-time к wall-clock (вычисляется однократно при старте,
  * обновляется каждый snapshot). BPF отправляет bpf_ktime_get_boot_ns(),
@@ -891,8 +894,6 @@ static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
 static int read_proc_cmdline(__u32 pid, char *dst, int dstlen);
 static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid,
 				__u8 is_root);
-static void log_debug(const char *fmt, ...);
-
 /*
  * Попытка начать отслеживание неизвестного PID через чтение /proc/<pid>/cmdline.
  * Вызывается, когда file_close/net_close/oom_kill/exit приходит для PID,
@@ -920,7 +921,7 @@ static int try_track_pid(__u32 pid)
 
 	track_pid_from_proc(pid, first, pid, 1);
 	tags_store_ts(pid, tags_buf);
-	log_debug("LATE_TRACK: pid=%u rule=%s tags=%s cmdline=%.60s",
+	LOG_DEBUG(cfg_log_level, "LATE_TRACK: pid=%u rule=%s tags=%s cmdline=%.60s",
 		  pid, rules[first].name, tags_buf, cmdline_str);
 	return first;
 }
@@ -1476,14 +1477,14 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 	case EVENT_CGROUP_MKDIR:
 		cgroup_cache_add(ce->id, ce->path);
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup mkdir: id=%llu level=%d path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup mkdir: id=%llu level=%d path=%s",
 			       (unsigned long long)ce->id, ce->level, ce->path);
 		break;
 
 	case EVENT_CGROUP_RMDIR:
 		cgroup_cache_remove(ce->id);
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup rmdir: id=%llu path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup rmdir: id=%llu path=%s",
 			       (unsigned long long)ce->id, ce->path);
 		break;
 
@@ -1491,51 +1492,51 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 		/* Обновляем путь для существующей записи */
 		cgroup_cache_add(ce->id, ce->path);
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup rename: id=%llu path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup rename: id=%llu path=%s",
 			       (unsigned long long)ce->id, ce->path);
 		break;
 
 	case EVENT_CGROUP_RELEASE:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup release: id=%llu path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup release: id=%llu path=%s",
 			       (unsigned long long)ce->id, ce->path);
 		break;
 
 	case EVENT_CGROUP_ATTACH_TASK:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup attach: pid=%d → id=%llu path=%s comm=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup attach: pid=%d → id=%llu path=%s comm=%s",
 			       ce->pid, (unsigned long long)ce->id,
 			       ce->path, ce->comm);
 		break;
 
 	case EVENT_CGROUP_TRANSFER_TASKS:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup transfer: pid=%d → id=%llu path=%s comm=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup transfer: pid=%d → id=%llu path=%s comm=%s",
 			       ce->pid, (unsigned long long)ce->id,
 			       ce->path, ce->comm);
 		break;
 
 	case EVENT_CGROUP_POPULATED:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup populated: id=%llu path=%s val=%d",
+			LOG_DEBUG(cfg_log_level, "cgroup populated: id=%llu path=%s val=%d",
 			       (unsigned long long)ce->id, ce->path, ce->val);
 		break;
 
 	case EVENT_CGROUP_FREEZE:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup freeze: id=%llu path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup freeze: id=%llu path=%s",
 			       (unsigned long long)ce->id, ce->path);
 		break;
 
 	case EVENT_CGROUP_UNFREEZE:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup unfreeze: id=%llu path=%s",
+			LOG_DEBUG(cfg_log_level, "cgroup unfreeze: id=%llu path=%s",
 			       (unsigned long long)ce->id, ce->path);
 		break;
 
 	case EVENT_CGROUP_FROZEN:
 		if (cfg_log_level >= 2)
-			log_ts("DEBUG", "cgroup frozen: id=%llu path=%s val=%d",
+			LOG_DEBUG(cfg_log_level, "cgroup frozen: id=%llu path=%s val=%d",
 			       (unsigned long long)ce->id, ce->path, ce->val);
 		break;
 
@@ -1561,17 +1562,17 @@ static int parse_rules_from_config(const char *path)
 	config_init(&cfg);
 
 	if (!config_read_file(&cfg, path)) {
-		fprintf(stderr, "FATAL: %s:%d - %s\n",
-			config_error_file(&cfg) ? config_error_file(&cfg) : path,
-			config_error_line(&cfg),
-			config_error_text(&cfg));
+		LOG_FATAL("%s:%d - %s",
+		       config_error_file(&cfg) ? config_error_file(&cfg) : path,
+		       config_error_line(&cfg),
+		       config_error_text(&cfg));
 		config_destroy(&cfg);
 		return -1;
 	}
 
 	config_setting_t *rs = config_lookup(&cfg, "rules");
 	if (!rs || !config_setting_is_list(rs)) {
-		fprintf(stderr, "FATAL: 'rules' list not found in %s\n", path);
+		LOG_FATAL("'rules' list not found in %s", path);
 		config_destroy(&cfg);
 		return -1;
 	}
@@ -1587,13 +1588,13 @@ static int parse_rules_from_config(const char *path)
 		const char *name = NULL, *regex = NULL;
 		if (!config_setting_lookup_string(entry, "name", &name) ||
 		    !config_setting_lookup_string(entry, "regex", &regex)) {
-			fprintf(stderr, "WARN: rules[%d]: missing 'name' or 'regex'\n", i);
+			LOG_WARN("rules[%d]: missing 'name' or 'regex'", i);
 			continue;
 		}
 
 		if (regcomp(&rules[num_rules].regex, regex,
 			    REG_EXTENDED | REG_NOSUB) != 0) {
-			fprintf(stderr, "WARN: rules[%d]: bad regex: %s\n", i, regex);
+			LOG_WARN("rules[%d]: bad regex: %s", i, regex);
 			continue;
 		}
 		snprintf(rules[num_rules].name, sizeof(rules[0].name), "%s", name);
@@ -1606,7 +1607,7 @@ static int parse_rules_from_config(const char *path)
 	}
 
 	config_destroy(&cfg);
-	fprintf(stderr, "INFO: loaded %d rules from %s\n", num_rules, path);
+	LOG_INFO("loaded %d rules from %s", num_rules, path);
 	return num_rules;
 }
 
@@ -1618,10 +1619,10 @@ static int load_config(const char *path)
 	config_init(&cfg);
 
 	if (!config_read_file(&cfg, path)) {
-		fprintf(stderr, "FATAL: %s:%d - %s\n",
-			config_error_file(&cfg) ? config_error_file(&cfg) : path,
-			config_error_line(&cfg),
-			config_error_text(&cfg));
+		LOG_FATAL("%s:%d - %s",
+		       config_error_file(&cfg) ? config_error_file(&cfg) : path,
+		       config_error_line(&cfg),
+		       config_error_text(&cfg));
 		config_destroy(&cfg);
 		return -1;
 	}
@@ -1658,11 +1659,16 @@ static int load_config(const char *path)
 		cfg_log_level = int_val;
 	if (config_lookup_int(&cfg, "heartbeat_interval", &int_val))
 		cfg_heartbeat_interval = int_val;
+	if (config_lookup_bool(&cfg, "log_snapshot", &bool_val))
+		cfg_log_snapshot = bool_val;
+	if (config_lookup_bool(&cfg, "log_refresh", &bool_val))
+		cfg_log_refresh = bool_val;
 
 	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
 	memset(&g_http_cfg, 0, sizeof(g_http_cfg));
 	g_http_cfg.port = HTTP_DEFAULT_PORT;
 	g_http_cfg.max_connections = HTTP_DEFAULT_MAX_CONNS;
+	g_http_cfg.log_requests = 1;
 	snprintf(g_http_cfg.bind, sizeof(g_http_cfg.bind), HTTP_DEFAULT_BIND);
 
 	config_setting_t *hs = config_lookup(&cfg, "http_server");
@@ -1676,15 +1682,16 @@ static int load_config(const char *path)
 				 "%s", str_val);
 		if (config_setting_lookup_int(hs, "max_connections", &int_val))
 			g_http_cfg.max_connections = int_val;
+		if (config_setting_lookup_bool(hs, "log_requests", &bool_val))
+			g_http_cfg.log_requests = bool_val;
 
 		/* allow = ("10.0.0.0/8", "192.168.1.0/24", "127.0.0.1"); */
 		config_setting_t *allow = config_setting_get_member(hs, "allow");
 		if (allow) {
 			int cnt = config_setting_length(allow);
 			if (cnt > HTTP_MAX_ALLOW) {
-				fprintf(stderr,
-					"WARN: http_server: allow list truncated to %d entries\n",
-					HTTP_MAX_ALLOW);
+				LOG_WARN("http_server: allow list truncated to %d entries",
+				       HTTP_MAX_ALLOW);
 				cnt = HTTP_MAX_ALLOW;
 			}
 			for (int i = 0; i < cnt; i++) {
@@ -1700,9 +1707,8 @@ static int load_config(const char *path)
 					*slash = '\0';
 					prefix = atoi(slash + 1);
 					if (prefix < 0 || prefix > 32) {
-						fprintf(stderr,
-							"ERROR: http_server: invalid prefix /%d in '%s'\n",
-							prefix, cidr);
+						LOG_ERROR("http_server: invalid prefix /%d in '%s'",
+						       prefix, cidr);
 						config_destroy(&cfg);
 						return 1;
 					}
@@ -1710,9 +1716,8 @@ static int load_config(const char *path)
 
 				struct in_addr parsed;
 				if (inet_pton(AF_INET, ip_buf, &parsed) != 1) {
-					fprintf(stderr,
-						"ERROR: http_server: invalid IP in '%s'\n",
-						cidr);
+					LOG_ERROR("http_server: invalid IP in '%s'",
+					       cidr);
 					config_destroy(&cfg);
 					return 1;
 				}
@@ -2057,28 +2062,9 @@ static inline void fast_strcpy(char *dst, int cap, const char *src)
 	dst[i] = '\0';
 }
 
-static void log_ts(const char *level, const char *fmt, ...)
-{
-	fprintf(stderr, "[%s] ", level);
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fprintf(stderr, "\n");
-}
+/* log_ts — см. log.h */
 
-/* Отладочный лог — выводится только при log_level >= 2 */
-static void log_debug(const char *fmt, ...)
-{
-	if (cfg_log_level < 2)
-		return;
-	fprintf(stderr, "[DEBUG] ");
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fprintf(stderr, "\n");
-}
+/* log_debug заменён макросом LOG_DEBUG(cfg_log_level, ...) из log.h */
 
 /* ── построитель событий ──────────────────────────────────────────── */
 
@@ -2459,7 +2445,7 @@ static void seed_sock_map(void)
 	}
 
 	if (seeded == 0) {
-		log_ts("INFO", "seed_sock_map: no socket inodes found");
+		LOG_INFO("seed_sock_map: no socket inodes found");
 		return;
 	}
 
@@ -2468,14 +2454,14 @@ static void seed_sock_map(void)
 		struct bpf_link *link = bpf_program__attach_iter(
 			skel->progs.seed_sock_map_iter, NULL);
 		if (!link) {
-			log_ts("WARN", "seed_sock_map: attach_iter failed: %s",
+			LOG_WARN("seed_sock_map: attach_iter failed: %s",
 			       strerror(errno));
 			break;
 		}
 
 		int iter_fd = bpf_iter_create(bpf_link__fd(link));
 		if (iter_fd < 0) {
-			log_ts("WARN", "seed_sock_map: iter_create failed: %s",
+			LOG_WARN("seed_sock_map: iter_create failed: %s",
 			       strerror(errno));
 			bpf_link__destroy(link);
 			break;
@@ -2489,7 +2475,7 @@ static void seed_sock_map(void)
 		close(iter_fd);
 		bpf_link__destroy(link);
 
-		log_ts("INFO", "seed_sock_map: scanned %d socket inodes", seeded);
+		LOG_INFO("seed_sock_map: scanned %d socket inodes", seeded);
 	} while (0);
 
 	/* Очищаем seed_inode_map */
@@ -2503,11 +2489,11 @@ static void seed_sock_map(void)
 
 static void initial_scan(void)
 {
-	log_ts("INFO", "initial scan: reading /proc...");
+	LOG_INFO("initial scan: reading /proc...");
 
 	DIR *pd = opendir("/proc");
 	if (!pd) {
-		log_ts("WARN", "cannot open /proc, skipping initial scan");
+		LOG_WARN("cannot open /proc, skipping initial scan");
 		return;
 	}
 
@@ -2569,7 +2555,7 @@ static void initial_scan(void)
 			track_pid_from_proc(pid, first, pid, 1);
 			tags_store_ts(pid, tags_buf);
 			tracked++;
-			log_debug("SCAN: pid=%u rule=%s tags=%s cmdline=%.60s",
+			LOG_DEBUG(cfg_log_level, "SCAN: pid=%u rule=%s tags=%s cmdline=%.60s",
 				  pid, rules[first].name, tags_buf,
 				  cmdline_str);
 
@@ -2579,7 +2565,7 @@ static void initial_scan(void)
 		}
 	}
 
-	log_ts("INFO", "initial scan: %d processes scanned, %d tracked",
+	LOG_INFO("initial scan: %d processes scanned, %d tracked",
 	       count, tracked);
 }
 
@@ -2638,7 +2624,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const char *rname = (ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
-		log_debug("FILE_CLOSE: pid=%u rule=%s path=%.60s "
+		LOG_DEBUG(cfg_log_level, "FILE_CLOSE: pid=%u rule=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
 			  fe->tgid, rname, fe->path,
 			  (unsigned long long)fe->read_bytes,
@@ -2823,7 +2809,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		case EVENT_NET_ACCEPT:  net_evt = "net_accept";  break;
 		default:                net_evt = "net_close";   break;
 		}
-		log_debug("%s: pid=%u rule=%s port=%u→%u "
+		LOG_DEBUG(cfg_log_level, "%s: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
 			  net_evt,
 			  ne->tgid, rname, ne->local_port, ne->remote_port,
@@ -2934,7 +2920,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		}
 
-		log_debug("SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
+		LOG_DEBUG(cfg_log_level, "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
 			  "rule=%s comm=%.16s",
 			  se->sender_tgid, se->target_pid, se->sig,
 			  se->sig_code, se->sig_result, rname,
@@ -3025,7 +3011,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct retransmit_event *re = data;
 
-		log_debug("TCP_RETRANSMIT: pid=%u port=%u→%u state=%u",
+		LOG_DEBUG(cfg_log_level, "TCP_RETRANSMIT: pid=%u port=%u→%u state=%u",
 			  re->tgid, re->local_port, re->remote_port,
 			  re->state);
 
@@ -3109,7 +3095,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct syn_event *se_syn = data;
 
-		log_debug("SYN_RECV: pid=%u port=%u←%u",
+		LOG_DEBUG(cfg_log_level, "SYN_RECV: pid=%u port=%u←%u",
 			  se_syn->tgid, se_syn->local_port,
 			  se_syn->remote_port);
 
@@ -3187,7 +3173,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct rst_event *rste = data;
 
-		log_debug("RST: pid=%u port=%u↔%u dir=%s",
+		LOG_DEBUG(cfg_log_level, "RST: pid=%u port=%u↔%u dir=%s",
 			  rste->tgid, rste->local_port, rste->remote_port,
 			  rste->direction ? "recv" : "sent");
 
@@ -3310,7 +3296,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			pi.cmdline_len = e->cmdline_len;
 			bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
 
-			log_debug("TRACK: pid=%u rule=%s tags=%s comm=%.16s",
+			LOG_DEBUG(cfg_log_level, "TRACK: pid=%u rule=%s tags=%s comm=%.16s",
 				  e->tgid, rules[first].name, tags_buf,
 				  e->comm);
 
@@ -3418,7 +3404,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		int sig = e->exit_code & EXIT_SIG_MASK;
 		int status = (e->exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
 
-		log_debug("EXIT: pid=%u rule=%s exit_code=%d "
+		LOG_DEBUG(cfg_log_level, "EXIT: pid=%u rule=%s exit_code=%d "
 			  "signal=%d cpu=%.2fs rss_max=%lluMB%s",
 			  e->tgid, rname, status, sig,
 			  (double)e->cpu_ns / 1e9,
@@ -3469,7 +3455,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				rname = (ti.rule_id < num_rules)
 					? rules[ti.rule_id].name : RULE_NOT_MATCH;
 		}
-		log_ts("WARN", "OOM_KILL: pid=%u rule=%s comm=%.16s "
+		LOG_WARN("OOM_KILL: pid=%u rule=%s comm=%.16s "
 		       "rss=%lluMB",
 		       e->tgid, rname, e->comm,
 		       (unsigned long long)(e->rss_pages * 4 / 1024));
@@ -3779,8 +3765,7 @@ static void refresh_processes(void)
 				int rule = try_track_pid(tgid);
 				if (rule >= 0) {
 					pwd_read_and_store(tgid);
-					log_ts("INFO",
-					       "EXEC_RECOVERY: pid=%u ppid=%u"
+					LOG_INFO("EXEC_RECOVERY: pid=%u ppid=%u"
 					       " rule=%s (ring buffer drop)",
 					       tgid, ppid,
 					       rules[rule].name);
@@ -3929,7 +3914,7 @@ static void refresh_processes(void)
 		{
 			__u32 real_ppid = read_proc_ppid(key);
 			if (real_ppid > 0 && real_ppid != pi.ppid) {
-				log_debug("REPARENT: pid=%u ppid %u→%u",
+				LOG_DEBUG(cfg_log_level, "REPARENT: pid=%u ppid %u→%u",
 					  key, pi.ppid, real_ppid);
 				pi.ppid = real_ppid;
 				bpf_map_update_elem(proc_map_fd, &key,
@@ -3999,7 +3984,7 @@ static void refresh_processes(void)
 	/* Обновляем глобальный счётчик для адаптивного refresh_interval */
 	g_last_map_count = all_keys_count;
 
-	log_debug("refresh: %d alive, %d early cleanup, %d total proc_map entries",
+	LOG_DEBUG(cfg_log_level, "refresh: %d alive, %d early cleanup, %d total proc_map entries",
 		  refresh_count, early_cleanup_count, all_keys_count);
 
 	/* Flush UDP агрегатов → ef_append */
@@ -4080,7 +4065,7 @@ static void refresh_processes(void)
 			bpf_map_delete_elem(udp_fd, &ukey);
 		}
 		if (udp_count > 0)
-			log_debug("UDP flush: %d aggregates", udp_count);
+			LOG_DEBUG(cfg_log_level, "UDP flush: %d aggregates", udp_count);
 	}
 
 	/* Flush ICMP агрегатов → ef_append */
@@ -4138,7 +4123,7 @@ static void refresh_processes(void)
 			bpf_map_delete_elem(icmp_fd, &ikey);
 		}
 		if (icmp_count > 0)
-			log_debug("ICMP flush: %d aggregates", icmp_count);
+			LOG_DEBUG(cfg_log_level, "ICMP flush: %d aggregates", icmp_count);
 	}
 
 	/* Disk usage → ef_append */
@@ -4149,11 +4134,12 @@ static void refresh_processes(void)
 			    + (__u64)now_ts.tv_nsec;
 		int disk_ev = emit_disk_usage_events(ts_ns, cfg_hostname);
 		if (disk_ev > 0)
-			log_debug("disk refresh: %d events", disk_ev);
+			LOG_DEBUG(cfg_log_level, "disk refresh: %d events", disk_ev);
 	}
 
-	log_ts("INFO", "refresh: %d PIDs, %d cgroups",
-	       refresh_count, cg_metrics_count);
+	if (cfg_log_refresh)
+		LOG_INFO("refresh: %d PIDs, %d cgroups",
+		       refresh_count, cg_metrics_count);
 }
 
 /*
@@ -4239,7 +4225,7 @@ static void write_snapshot(void)
 					pidtree_store_ts(key, pi.ppid);
 					tags_inherit_ts(key, pi.ppid);
 					pwd_inherit_ts(key, pi.ppid);
-					log_debug("FORK_RECOVERY: pid=%u ppid=%u"
+					LOG_DEBUG(cfg_log_level, "FORK_RECOVERY: pid=%u ppid=%u"
 						  " (ring buffer drop)",
 						  key, pi.ppid);
 				}
@@ -4711,8 +4697,9 @@ static void write_snapshot(void)
 	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
 	dead_total += flush_dead_keys(dead_keys, dead_count);
 
-	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
-	       pid_count, dead_total, snap_count, conn_count, file_snap_count);
+	if (cfg_log_snapshot)
+		LOG_INFO("snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
+		       pid_count, dead_total, snap_count, conn_count, file_snap_count);
 
 	/* Обновляем глобальные счётчики для heartbeat */
 	g_last_conn_count = conn_count;
@@ -4735,8 +4722,7 @@ static void write_snapshot(void)
 				(rs.drop_cgroup - prev_rs.drop_cgroup) +
 				(rs.drop_missed_exec - prev_rs.drop_missed_exec);
 			if (new_drops > 0) {
-				log_ts("WARN",
-				       "ringbuf drops: proc=%llu/%llu file=%llu/%llu file_ops=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
+				LOG_WARN("ringbuf drops: proc=%llu/%llu file=%llu/%llu file_ops=%llu/%llu net=%llu/%llu sec=%llu/%llu cgroup=%llu/%llu missed_exec_overflow=%llu",
 				       (unsigned long long)rs.drop_proc,
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.drop_file,
@@ -4751,8 +4737,8 @@ static void write_snapshot(void)
 				       (unsigned long long)rs.total_cgroup,
 				       (unsigned long long)rs.drop_missed_exec);
 			} else if (cfg_log_level >= 2) {
-				log_ts("DEBUG",
-				       "ringbuf totals: proc=%llu file=%llu net=%llu sec=%llu cgroup=%llu",
+				LOG_DEBUG(cfg_log_level,
+					  "ringbuf totals: proc=%llu file=%llu net=%llu sec=%llu cgroup=%llu",
 				       (unsigned long long)rs.total_proc,
 				       (unsigned long long)rs.total_file,
 				       (unsigned long long)rs.total_net,
@@ -4803,7 +4789,7 @@ static void write_snapshot(void)
 					pt_generation++;
 				}
 				pthread_rwlock_unlock(&g_pidtree_lock);
-				log_debug("PIDTREE_GC: removed %d dead"
+				LOG_DEBUG(cfg_log_level, "PIDTREE_GC: removed %d dead"
 					  " untracked entries", gc_count);
 			}
 		}
@@ -4854,7 +4840,7 @@ static void *poll_thread_fn(void *arg)
 	sigaddset(&set, SIGHUP);
 	pthread_sigmask(SIG_BLOCK, &set, NULL);
 
-	log_ts("INFO", "poll thread '%s' started", a->name);
+	LOG_INFO("poll thread '%s' started", a->name);
 
 	while (g_running) {
 		int n = ring_buffer__consume(a->rb);
@@ -4863,7 +4849,7 @@ static void *poll_thread_fn(void *arg)
 			continue;  /* есть данные — сразу проверяем ещё */
 		}
 		if (n < 0 && n != -EINTR) {
-			log_ts("ERROR", "poll thread '%s': ring_buffer__consume: %d",
+			LOG_ERROR("poll thread '%s': ring_buffer__consume: %d",
 			       a->name, n);
 			break;
 		}
@@ -4873,13 +4859,13 @@ static void *poll_thread_fn(void *arg)
 		if (err > 0)
 			__atomic_add_fetch(&a->events, (__u64)err, __ATOMIC_RELAXED);
 		if (err < 0 && err != -EINTR) {
-			log_ts("ERROR", "poll thread '%s': ring_buffer__poll: %d",
+			LOG_ERROR("poll thread '%s': ring_buffer__poll: %d",
 			       a->name, err);
 			break;
 		}
 	}
 
-	log_ts("INFO", "poll thread '%s' stopped", a->name);
+	LOG_INFO("poll thread '%s' stopped", a->name);
 	return NULL;
 }
 
@@ -4918,14 +4904,14 @@ int main(int argc, char *argv[])
 	if (parse_rules_from_config(cfg_config_file) < 0)
 		return 1;
 	if (num_rules == 0) {
-		fprintf(stderr, "FATAL: no rules loaded\n");
+		LOG_FATAL("no rules loaded");
 		return 1;
 	}
 
 	/* Инициализация кольцевого буфера событий в памяти */
 	if (g_http_cfg.enabled) {
 		if (ef_init((__u64)cfg_max_data_size) < 0) {
-			fprintf(stderr, "FATAL: event ring buffer init failed\n");
+			LOG_FATAL("event ring buffer init failed");
 			return 1;
 		}
 	}
@@ -4939,7 +4925,7 @@ int main(int argc, char *argv[])
 	/* Открытие BPF-скелета */
 	skel = process_metrics_bpf__open();
 	if (!skel) {
-		fprintf(stderr, "FATAL: failed to open BPF skeleton\n");
+		LOG_FATAL("failed to open BPF skeleton");
 		return 1;
 	}
 
@@ -4960,7 +4946,7 @@ int main(int argc, char *argv[])
 			sz++;                                           \
 			if (sz < BPF_MIN_RINGBUF_SIZE) sz = BPF_MIN_RINGBUF_SIZE; \
 			bpf_map__set_max_entries(skel->maps.map, sz);   \
-			log_ts("INFO", "ring_buffers.%s = %u bytes",    \
+			LOG_INFO("ring_buffers.%s = %u bytes",    \
 			       #map, sz);                               \
 		}                                                       \
 	} while (0)
@@ -5121,7 +5107,7 @@ int main(int argc, char *argv[])
 
 	/* Загрузка BPF-программ */
 	if (process_metrics_bpf__load(skel)) {
-		fprintf(stderr, "FATAL: failed to load BPF programs\n");
+		LOG_FATAL("failed to load BPF programs");
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
@@ -5184,7 +5170,7 @@ int main(int argc, char *argv[])
 	}
 
 	if (process_metrics_bpf__attach(skel)) {
-		fprintf(stderr, "FATAL: failed to attach BPF programs\n");
+		LOG_FATAL("failed to attach BPF programs");
 		process_metrics_bpf__destroy(skel);
 		return 1;
 	}
@@ -5210,7 +5196,7 @@ int main(int argc, char *argv[])
 		bpf_map__fd(skel->maps.events_cgroup), handle_cgroup_event,
 		NULL, NULL);
 	if (!rb_proc || !rb_file || !rb_file_ops || !rb_net || !rb_sec || !rb_cgroup) {
-		fprintf(stderr, "FATAL: failed to create ring buffers\n");
+		LOG_FATAL("failed to create ring buffers");
 		if (rb_proc)   ring_buffer__free(rb_proc);
 		if (rb_file)   ring_buffer__free(rb_file);
 		if (rb_file_ops)  ring_buffer__free(rb_file_ops);
@@ -5240,7 +5226,7 @@ int main(int argc, char *argv[])
 			cleaned++;
 		}
 		if (cleaned > 0)
-			log_ts("INFO", "startup cleanup: removed %d stale entries from maps", cleaned);
+			LOG_INFO("startup cleanup: removed %d stale entries from maps", cleaned);
 	}
 
 	/* ── Потоки poll: запускаем ДО initial_scan, чтобы drain'ить
@@ -5258,8 +5244,8 @@ int main(int argc, char *argv[])
 
 	for (int i = 0; i < NUM_POLL_THREADS; i++) {
 		if (pthread_create(&poll_threads[i], NULL, poll_thread_fn, &args[i])) {
-			fprintf(stderr, "FATAL: failed to create poll thread '%s'\n",
-				args[i].name);
+			LOG_FATAL("failed to create poll thread '%s'",
+			       args[i].name);
 			g_running = 0;
 			break;
 		}
@@ -5275,7 +5261,7 @@ int main(int argc, char *argv[])
 	/* Запуск HTTP-сервера, если включён */
 	if (g_http_cfg.enabled) {
 		if (http_server_start(&g_http_cfg) < 0) {
-			fprintf(stderr, "FATAL: HTTP server start failed\n");
+			LOG_FATAL("HTTP server start failed");
 			g_running = 0;
 			for (int i = 0; i < NUM_POLL_THREADS; i++)
 				pthread_join(poll_threads[i], NULL);
@@ -5283,7 +5269,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	log_ts("INFO", "started: %d rules, snapshot every %ds, refresh every %ds, "
+	LOG_INFO("started: %d rules, snapshot every %ds, refresh every %ds, "
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net=[enabled=%s tcp_bytes=%s tcp_retransmit=%s tcp_syn=%s tcp_rst=%s "
@@ -5320,7 +5306,7 @@ int main(int argc, char *argv[])
 		/* Перезагрузка конфигурации по SIGHUP */
 		if (g_reload) {
 			g_reload = 0;
-			log_ts("INFO", "SIGHUP: reloading rules...");
+			LOG_INFO("SIGHUP: reloading rules...");
 
 			/* Очистка всего отслеживания — удаляем с начала каждый раз */
 			__u32 del_key;
@@ -5399,8 +5385,7 @@ int main(int argc, char *argv[])
 				po[i] = __atomic_load_n(&args[i].polls,
 							__ATOMIC_RELAXED);
 			}
-			log_ts("INFO",
-			       "heartbeat: %d refreshes, %d snapshots | "
+			LOG_INFO("heartbeat: %d refreshes, %d snapshots | "
 			       "maps: tracked=%d conns=%d fds=%d | "
 			       "events/%ds: proc=%llu file=%llu file_ops=%llu "
 			       "net=%llu sec=%llu cgroup=%llu",
@@ -5425,24 +5410,24 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	log_ts("INFO", "shutting down...");
+	LOG_INFO("shutting down...");
 
 	/* Остановка HTTP-сервера — прерываем активные соединения */
-	log_ts("INFO", "shutdown: stopping http server...");
+	LOG_INFO("shutdown: stopping http server...");
 	http_server_stop();
-	log_ts("INFO", "shutdown: http server stopped");
+	LOG_INFO("shutdown: http server stopped");
 
 	/* Ждём завершения потоков poll */
-	log_ts("INFO", "shutdown: joining poll threads...");
+	LOG_INFO("shutdown: joining poll threads...");
 	for (int i = 0; i < NUM_POLL_THREADS; i++)
 		pthread_join(poll_threads[i], NULL);
-	log_ts("INFO", "shutdown: poll threads joined");
+	LOG_INFO("shutdown: poll threads joined");
 
 	/* Очистка файла событий */
-	log_ts("INFO", "shutdown: cleaning up...");
+	LOG_INFO("shutdown: cleaning up...");
 	ef_cleanup();
 
-	log_ts("INFO", "shutdown: userspace cleanup done");
+	LOG_INFO("shutdown: userspace cleanup done");
 
 	free_rules();
 
@@ -5455,6 +5440,6 @@ int main(int argc, char *argv[])
 	 * в фоновом потоке, а главный поток завершает процесс через _exit()
 	 * после того как основная cleanup-работа сделана. Ядро дочистит
 	 * оставшиеся BPF ресурсы асинхронно (reference counting). */
-	log_ts("INFO", "stopped");
+	LOG_INFO("stopped");
 	_exit(0);
 }

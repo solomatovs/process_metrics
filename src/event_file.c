@@ -17,6 +17,7 @@
 #include <pthread.h>
 
 #include "event_file.h"
+#include "log.h"
 
 /* ── состояние ───────────────────────────────────────────────────── */
 
@@ -56,8 +57,8 @@ int ef_init(__u64 max_size_bytes)
 
 	g_ring = calloc((size_t)cap, sizeof(struct ef_record));
 	if (!g_ring) {
-		fprintf(stderr, "ERROR: ef_init: calloc(%llu records) failed\n",
-			(unsigned long long)cap);
+		LOG_ERROR("ef_init: calloc(%llu records) failed",
+		       (unsigned long long)cap);
 		return -1;
 	}
 
