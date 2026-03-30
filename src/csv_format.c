@@ -24,7 +24,7 @@ static const char CSV_HEADER_STR[] =
 	"comm,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
 	"cpu_ns,cpu_usage_ratio,"
 	"rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
-	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,"
+	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,socket_creates,"
 	"maj_flt,min_flt,"
 	"nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
 	"net_tx_bytes,net_rx_bytes,"
@@ -360,6 +360,7 @@ int csv_format_row(char *buf, int buflen,
 	U64(ev->io_syscr);
 	U64(ev->io_syscw);
 	U64(ev->file_opens);
+	U64(ev->socket_creates);
 	U64(ev->maj_flt);
 	U64(ev->min_flt);
 

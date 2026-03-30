@@ -47,6 +47,8 @@ CREATE TABLE _pm_target (
     io_wchar               UInt64                      CODEC(Delta, ZSTD(1)),
     io_syscr               UInt64                      CODEC(Delta, ZSTD(1)),
     io_syscw               UInt64                      CODEC(Delta, ZSTD(1)),
+    file_opens             UInt64                      CODEC(Delta, ZSTD(1)),
+    socket_creates         UInt64                      CODEC(Delta, ZSTD(1)),
     maj_flt                UInt64                      CODEC(Delta, ZSTD(1)),
     min_flt                UInt64                      CODEC(Delta, ZSTD(1)),
     nvcsw                  UInt64                      CODEC(Delta, ZSTD(1)),

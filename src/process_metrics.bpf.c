@@ -3569,4 +3569,21 @@ int seed_sock_map_iter(struct bpf_iter__tcp *ctx)
 	return 0;
 }
 
+/* ── Счётчик socket() вызовов ─────────────────────────────────────── */
+
+SEC("tracepoint/syscalls/sys_enter_socket")
+int handle_socket_enter(struct trace_event_raw_sys_enter *ctx)
+{
+	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
+		return 0;
+
+	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (pi)
+		__sync_fetch_and_add(&pi->socket_creates, 1);
+
+	return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";
