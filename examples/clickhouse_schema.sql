@@ -58,7 +58,7 @@ CREATE TABLE _pm_target (
     oom_killed             UInt8                       CODEC(T64, ZSTD(1)),
     net_tx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
     net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
-    start_time_ns          UInt64                      CODEC(DoubleDelta, ZSTD(1)),
+    start_time_ns          DateTime64(9, 'UTC')        CODEC(Delta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
     mnt_ns                 UInt32                      CODEC(T64, ZSTD(1)),
     pid_ns                 UInt32                      CODEC(T64, ZSTD(1)),
@@ -196,6 +196,7 @@ CROSS JOIN (
     SELECT arrayStringConcat(groupArray(
         name || ' ' || multiIf(
             name = 'timestamp', 'DateTime64(3, ''''UTC'''')',
+            name = 'start_time_ns', 'DateTime64(9, ''''UTC'''')',
             name IN ('tags', 'parent_pids'), 'String',
             type LIKE 'LowCardinality(%)', extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type

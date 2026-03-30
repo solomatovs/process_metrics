@@ -97,7 +97,7 @@
 
 | Поле | Тип | Источник | Syscall / Hook | Как обновляется |
 |------|-----|----------|----------------|-----------------|
-| `start_time_ns` | u64 | BPF `proc_map.start_ns` | `sched_process_fork` → `bpf_ktime_get_boot_ns()` + wall offset | **Фиксированный**. Время рождения, устанавливается один раз |
+| `start_time_ns` | u64 | BPF `proc_map.start_ns` + `g_boot_to_wall_ns` | `sched_process_fork` → `bpf_ktime_get_boot_ns()`; userspace конвертирует в wall-clock | **Фиксированный**. Wall-clock время рождения процесса (ns since epoch) |
 | `uptime_seconds` | u64 | userspace | — (вычисляется) | **Мгновенный**. `monotonic_now - start_ns / 1e9` на момент snapshot'а |
 
 ## Пространства имён

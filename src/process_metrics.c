@@ -2076,7 +2076,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->oom_killed = e->oom_killed;
 	out->net_tx_bytes = e->net_tx_bytes;
 	out->net_rx_bytes = e->net_rx_bytes;
-	out->start_time_ns = e->start_ns;
+	out->start_time_ns = e->start_ns + (__u64)g_boot_to_wall_ns;
 	/* новые поля */
 	out->loginuid      = e->loginuid;
 	out->sessionid     = e->sessionid;
@@ -2590,13 +2590,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct file_event *fe = data;
 
-		/* Единственный lookup — пропускаем, если процесс умер между open и close */
+		/* Lookup tracked_map. Для FILE_CLOSE допускаем отсутствие —
+		 * процесс мог завершиться до обработки close из ring buffer. */
 		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
+		int tracked = bpf_map_lookup_elem(tracked_map_fd,
+						  &fe->tgid, &ti) == 0;
+		if (!tracked && type != EVENT_FILE_CLOSE)
 			return 0;
 
-		/* Имя правила по rule_id из track_info (O(1)) */
-		const char *rname = (ti.rule_id < num_rules)
+		const char *rname = (tracked && ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		LOG_DEBUG(cfg_log_level, "FILE_CLOSE: pid=%u rule=%s path=%.60s "
@@ -2622,8 +2624,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			/* Теги из userspace hash table (O(1)) */
 			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
-			cev.root_pid = ti.root_pid;
-			cev.is_root = ti.is_root;
+			cev.root_pid = tracked ? ti.root_pid : 0;
+			cev.is_root = tracked ? ti.is_root : 0;
 			cev.pid = fe->tgid;
 			cev.ppid = fe->ppid;
 			cev.uid = fe->uid;
@@ -2760,13 +2762,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct net_event *ne = data;
 
-		/* Единственный lookup — пропускаем неотслеживаемые процессы */
+		/* Lookup tracked_map. Для NET_CLOSE допускаем отсутствие —
+		 * процесс мог завершиться (handle_exit удалил tracked_map)
+		 * до обработки net_close из ring buffer. */
 		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &ne->tgid, &ti) != 0)
+		int tracked = bpf_map_lookup_elem(tracked_map_fd,
+						  &ne->tgid, &ti) == 0;
+		if (!tracked && type != EVENT_NET_CLOSE)
 			return 0;
 
-		/* Имя правила по rule_id (O(1)) */
-		const char *rname = (ti.rule_id < num_rules)
+		const char *rname = (tracked && ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		const char *net_evt;
@@ -2794,8 +2799,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 			tags_lookup_ts(ne->tgid, cev.tags, sizeof(cev.tags));
-			cev.root_pid = ti.root_pid;
-			cev.is_root = ti.is_root;
+			cev.root_pid = tracked ? ti.root_pid : 0;
+			cev.is_root = tracked ? ti.is_root : 0;
 			cev.pid = ne->tgid;
 			cev.ppid = ne->ppid;
 			cev.uid = ne->uid;
@@ -4379,7 +4384,7 @@ static void write_snapshot(void)
 			cev.oom_killed = pi.oom_killed;
 			cev.net_tx_bytes = pi.net_tx_bytes;
 			cev.net_rx_bytes = pi.net_rx_bytes;
-			cev.start_time_ns = pi.start_ns;
+			cev.start_time_ns = pi.start_ns + (__u64)g_boot_to_wall_ns;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
 
 			cev.loginuid       = pi.loginuid;
