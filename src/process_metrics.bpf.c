@@ -1488,6 +1488,14 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
+	/* Кумулятивный счётчик file_opens — считаем ВСЕ openat
+	 * tracked-процесса, до фильтров (характеристика нагрузки). */
+	{
+		struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
+		if (pi)
+			__sync_fetch_and_add(&pi->file_opens, 1);
+	}
+
 	/* Используем per-CPU scratch для чтения пути (> 512 стека) */
 	__u32 zero = 0;
 	struct file_path_scratch *sc = bpf_map_lookup_elem(&scratch_fpath, &zero);
@@ -1553,11 +1561,6 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 
 	bpf_map_update_elem(&fd_map, &fk, fi, BPF_ANY);
 	bpf_map_delete_elem(&openat_args_map, &pid_tgid);
-
-	/* Кумулятивный счётчик file_opens в proc_info */
-	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (pi)
-		__sync_fetch_and_add(&pi->file_opens, 1);
 
 	/* file_open → events_file (общий буфер с close/rename) */
 	RB_STAT_TOTAL_FILE();
@@ -1823,6 +1826,7 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 	if (!fi)
 		return 0;
 
+
 	/* Отправляем событие закрытия файла через кольцевой буфер */
 	RB_STAT_TOTAL_FILE();
 	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
@@ -1850,13 +1854,6 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		bpf_ringbuf_submit(fe, 0);
 	} else {
 		RB_STAT_DROP_FILE();
-	}
-
-	/* Кумулятивный счётчик file_closes в proc_info */
-	{
-		struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
-		if (pi)
-			__sync_fetch_and_add(&pi->file_closes, 1);
 	}
 
 	bpf_map_delete_elem(&fd_map, &fk);

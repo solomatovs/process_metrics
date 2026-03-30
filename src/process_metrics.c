@@ -4431,7 +4431,6 @@ static void write_snapshot(void)
 			cev.io_syscr       = pi.io_syscr;
 			cev.io_syscw       = pi.io_syscw;
 			cev.file_opens     = pi.file_opens;
-			cev.file_closes    = pi.file_closes;
 			cev.mnt_ns_inum    = pi.mnt_ns_inum;
 			cev.pid_ns_inum    = pi.pid_ns_inum;
 			cev.net_ns_inum    = pi.net_ns_inum;

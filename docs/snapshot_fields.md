@@ -65,8 +65,7 @@
 | `io_wchar` | u64 | BPF `proc_map.io_wchar` | `sched_switch` → `task->ioac.wchar` | **Кумулятивный**. **Все** записанные байты: `write()`, `pwrite()`, `writev()` включая page cache. Всегда `>= io_write_bytes` |
 | `io_syscr` | u64 | BPF `proc_map.io_syscr` | `sched_switch` → `task->ioac.syscr` | **Кумулятивный**. Количество syscall чтения: `read()`, `pread64()`, `readv()`, `preadv()` |
 | `io_syscw` | u64 | BPF `proc_map.io_syscw` | `sched_switch` → `task->ioac.syscw` | **Кумулятивный**. Количество syscall записи: `write()`, `pwrite64()`, `writev()`, `pwritev()` |
-| `file_opens` | u64 | BPF `proc_map.file_opens` | `sys_exit_openat` → `__sync_fetch_and_add` | **Кумулятивный**. Только tracked файлы (прошедшие include/exclude фильтры и `absolute_paths_only`) |
-| `file_closes` | u64 | BPF `proc_map.file_closes` | `sys_enter_close` → `__sync_fetch_and_add` | **Кумулятивный**. Только tracked файлы (имеющие запись в fd_map) |
+| `file_opens` | u64 | BPF `proc_map.file_opens` | `sys_enter_openat` → `__sync_fetch_and_add` | **Кумулятивный**. Все `openat()` tracked-процесса, до include/exclude фильтров. Только файлы (openat не создаёт сокеты/пайпы) |
 
 ## Page faults
 
