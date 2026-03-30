@@ -160,9 +160,11 @@ static int cfg_emit_udp_agg        = 1;
 /* cgroup */
 static int cfg_emit_cgroup         = 1;
 
-/* Последнее известное количество записей в proc_map (обновляется refresh_processes).
- * Используется для адаптивного refresh_interval при высокой заполненности карт. */
-static int g_last_map_count    = 0;
+/* Последние известные размеры BPF map'ов (обновляются refresh/snapshot).
+ * Используется для адаптивного refresh_interval и heartbeat диагностики. */
+static int g_last_map_count    = 0;   /* proc_map (refresh_processes) */
+static int g_last_conn_count   = 0;   /* sock_map (write_snapshot) */
+static int g_last_fd_count     = 0;   /* fd_map (write_snapshot) */
 
 static struct file_prefix cfg_file_include[FILE_MAX_PREFIXES];
 static int cfg_file_include_count           = 0;
@@ -4712,6 +4714,10 @@ static void write_snapshot(void)
 	log_ts("INFO", "snapshot: %d PIDs (%d exited), %d events, %d conns, %d files",
 	       pid_count, dead_total, snap_count, conn_count, file_snap_count);
 
+	/* Обновляем глобальные счётчики для heartbeat */
+	g_last_conn_count = conn_count;
+	g_last_fd_count = file_snap_count;
+
 	/* Статистика ring buffer'ов — логируем только НОВЫЕ drops */
 	{
 		static struct ringbuf_stats prev_rs;
@@ -5395,23 +5401,20 @@ int main(int argc, char *argv[])
 			}
 			log_ts("INFO",
 			       "heartbeat: %d refreshes, %d snapshots | "
+			       "maps: tracked=%d conns=%d fds=%d | "
 			       "events/%ds: proc=%llu file=%llu file_ops=%llu "
-			       "net=%llu sec=%llu cgroup=%llu | "
-			       "polls: %llu %llu %llu %llu %llu %llu",
+			       "net=%llu sec=%llu cgroup=%llu",
 			       hb_refreshes, hb_snapshots,
+			       g_last_map_count,
+			       g_last_conn_count,
+			       g_last_fd_count,
 			       cfg_heartbeat_interval,
 			       (unsigned long long)(ev[0] - prev_ev[0]),
 			       (unsigned long long)(ev[1] - prev_ev[1]),
 			       (unsigned long long)(ev[2] - prev_ev[2]),
 			       (unsigned long long)(ev[3] - prev_ev[3]),
 			       (unsigned long long)(ev[4] - prev_ev[4]),
-			       (unsigned long long)(ev[5] - prev_ev[5]),
-			       (unsigned long long)(po[0] - prev_po[0]),
-			       (unsigned long long)(po[1] - prev_po[1]),
-			       (unsigned long long)(po[2] - prev_po[2]),
-			       (unsigned long long)(po[3] - prev_po[3]),
-			       (unsigned long long)(po[4] - prev_po[4]),
-			       (unsigned long long)(po[5] - prev_po[5]));
+			       (unsigned long long)(ev[5] - prev_ev[5]));
 			for (int i = 0; i < NUM_POLL_THREADS; i++) {
 				prev_ev[i] = ev[i];
 				prev_po[i] = po[i];

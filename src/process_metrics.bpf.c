@@ -1671,10 +1671,10 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 	if (path_matches_exclude(sc->path))
 		return 0;
 
-	RB_STAT_TOTAL_FILE_OPS();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_UNLINK;
@@ -1735,10 +1735,10 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	if (path_matches_exclude(sc->path))
 		return 0;
 
-	RB_STAT_TOTAL_FILE_OPS();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;
@@ -1779,10 +1779,10 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 	if (!fi || fi->path[0] == '\0')
 		return 0;
 
-	RB_STAT_TOTAL_FILE_OPS();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file_ops,
+	RB_STAT_TOTAL_FILE();
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
 						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE_OPS(); return 0; }
+	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;

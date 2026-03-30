@@ -40,8 +40,9 @@
 #
 #   RAM:  Userspace RSS ≈ 375 МБ (HTTP buffer 256 МБ + хеш-таблицы + stacks).
 #       BPF карты ядра (НЕ в cgroup): proc_map 280 МБ, fd_map 71 МБ,
-#       ring buffers 42 МБ, sock_map/tracked/tid 26 МБ = ~420 МБ.
-#       MemoryMax=896M — достаточно с запасом для userspace RSS.
+#       ring buffers 390 МБ (proc 128 + file 128 + net 128 + остальные 6),
+#       sock_map/tracked/tid 26 МБ = ~770 МБ.
+#       MemoryMax=1792M — достаточно с запасом для userspace RSS.
 #
 #   Disk: 0 (все данные в RAM, disk I/O отсутствует).
 
@@ -95,7 +96,7 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-MemoryMax=896M
+MemoryMax=1792M
 CPUQuota=25%
 
 # --- Hardening ---
