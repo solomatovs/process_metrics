@@ -187,7 +187,7 @@ SELECT 'ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;';
 -- Генерирует DROP+CREATE с прежним URL и актуальной структурой.
 -- Выполните если менялся набор колонок в CSV.
 
-SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (\n    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n    if(process_chain = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', process_chain))) AS process_chain\n)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
+SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (\n    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n    if(process_chain = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', process_chain))) AS process_chain,\n    if(file_flags = '''', [], splitByChar(''|'', file_flags)) AS file_flags\n)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
     mv.name,
     currentDatabase(),
     extractAll(mv.create_table_query, 'url\\(''([^'']+)''')[1],
@@ -199,7 +199,7 @@ CROSS JOIN (
         name || ' ' || multiIf(
             name = 'timestamp', 'DateTime64(3, ''''UTC'''')',
             name = 'start_time_ns', 'DateTime64(9, ''''UTC'''')',
-            name IN ('tags', 'process_chain'), 'String',
+            name IN ('tags', 'process_chain', 'file_flags'), 'String',
             type LIKE 'LowCardinality(%)', extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type
         )
@@ -217,3 +217,41 @@ WHERE mv.database = currentDatabase()
 -- Выполните после проверки.
 
 SELECT 'DROP TABLE IF EXISTS _pm_target;';
+
+
+-- ── Шаг 7: создание нового MV ──────────────────────────────────────
+-- Генерирует CREATE MATERIALIZED VIEW на основе текущих колонок
+-- таблицы process_metrics.  Подставьте URL вашего process_metrics.
+--
+-- Использование:
+--   1. Замените <URL> на реальный адрес (http://host:port/metrics?clear=1)
+--   2. Выполните сгенерированный запрос.
+
+SELECT format(
+    'CREATE MATERIALIZED VIEW mv_process_metrics\n'
+    'REFRESH EVERY 3 SECOND APPEND\n'
+    'TO {0}.process_metrics\n'
+    'AS\n'
+    'SELECT * REPLACE (\n'
+    '    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n'
+    '    if(process_chain = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', process_chain))) AS process_chain,\n'
+    '    if(file_flags = '''', [], splitByChar(''|'', file_flags)) AS file_flags\n'
+    ')\n'
+    'FROM url(''<URL>'', ''CSVWithNames'', ''{1}'');',
+    currentDatabase(),
+    url_cols.cols
+)
+FROM (
+    SELECT arrayStringConcat(groupArray(
+        name || ' ' || multiIf(
+            name = 'timestamp', 'DateTime64(3, ''UTC'')',
+            name = 'start_time_ns', 'DateTime64(9, ''UTC'')',
+            name IN ('tags', 'process_chain', 'file_flags'), 'String',
+            type LIKE 'LowCardinality(%)', extractAll(type, 'LowCardinality\\((.+)\\)')[1],
+            type
+        )
+    ), ', ') AS cols
+    FROM (SELECT name, type FROM system.columns
+          WHERE database = currentDatabase() AND table = 'process_metrics'
+          ORDER BY position)
+) AS url_cols;
