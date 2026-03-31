@@ -738,59 +738,45 @@ static int event_emit_enabled(enum event_type type)
 }
 
 /*
- * Классификация событий по группам.
- * Используется вместо цепочек if (type == X || type == Y || ...).
+ * Классификаторы типов событий.
+ * Каждая функция — одна группа, используется вместо цепочек if (type == X || ...).
  */
-enum event_group {
-	EVG_FILE_DATA,     /* file_open, file_close */
-	EVG_FILE_OP,       /* file_rename, file_unlink, file_truncate, file_chmod, file_chown */
-	EVG_NET,           /* net_listen, net_connect, net_accept, net_close */
-	EVG_PROC,          /* fork, exec, exit, oom_kill */
-	EVG_SIGNAL,        /* signal */
-	EVG_SEC,           /* tcp_retrans, syn_recv, rst */
-	EVG_CGROUP,        /* cgroup_mkdir/rmdir/rename/... */
-	EVG_OTHER,         /* chdir и прочее */
-};
-
-/*
- * Определяет группу события.
- * Без default — clang -Wswitch предупредит при добавлении нового enum.
- */
-static enum event_group event_classify(enum event_type type)
+static int is_file_data_event(enum event_type t)
 {
-	switch (type) {
-	case EVENT_FILE_CLOSE:
-	case EVENT_FILE_OPEN:              return EVG_FILE_DATA;
-	case EVENT_FILE_RENAME:
-	case EVENT_FILE_UNLINK:
-	case EVENT_FILE_TRUNCATE:
-	case EVENT_FILE_CHMOD:
-	case EVENT_FILE_CHOWN:             return EVG_FILE_OP;
-	case EVENT_NET_CLOSE:
-	case EVENT_NET_LISTEN:
-	case EVENT_NET_CONNECT:
-	case EVENT_NET_ACCEPT:             return EVG_NET;
-	case EVENT_FORK:
-	case EVENT_EXEC:
-	case EVENT_EXIT:
-	case EVENT_OOM_KILL:               return EVG_PROC;
-	case EVENT_SIGNAL:                 return EVG_SIGNAL;
-	case EVENT_TCP_RETRANSMIT:
-	case EVENT_SYN_RECV:
-	case EVENT_RST:                    return EVG_SEC;
-	case EVENT_CHDIR:                  return EVG_OTHER;
-	case EVENT_CGROUP_MKDIR:
-	case EVENT_CGROUP_RMDIR:
-	case EVENT_CGROUP_RENAME:
-	case EVENT_CGROUP_RELEASE:
-	case EVENT_CGROUP_ATTACH_TASK:
-	case EVENT_CGROUP_TRANSFER_TASKS:
-	case EVENT_CGROUP_POPULATED:
-	case EVENT_CGROUP_FREEZE:
-	case EVENT_CGROUP_UNFREEZE:
-	case EVENT_CGROUP_FROZEN:          return EVG_CGROUP;
-	}
-	return EVG_OTHER;
+	return t == EVENT_FILE_CLOSE || t == EVENT_FILE_OPEN;
+}
+
+static int is_file_op_event(enum event_type t)
+{
+	return t == EVENT_FILE_RENAME  || t == EVENT_FILE_UNLINK  ||
+	       t == EVENT_FILE_TRUNCATE || t == EVENT_FILE_CHMOD ||
+	       t == EVENT_FILE_CHOWN;
+}
+
+static int is_net_event(enum event_type t)
+{
+	return t == EVENT_NET_CLOSE  || t == EVENT_NET_LISTEN ||
+	       t == EVENT_NET_CONNECT || t == EVENT_NET_ACCEPT;
+}
+
+static int is_signal_event(enum event_type t)
+{
+	return t == EVENT_SIGNAL;
+}
+
+static int is_retransmit_event(enum event_type t)
+{
+	return t == EVENT_TCP_RETRANSMIT;
+}
+
+static int is_syn_event(enum event_type t)
+{
+	return t == EVENT_SYN_RECV;
+}
+
+static int is_rst_event(enum event_type t)
+{
+	return t == EVENT_RST;
 }
 
 static const char *event_type_name(enum event_type type)
@@ -3161,6 +3147,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	__u32 type = *(const __u32 *)data;
 
+	/* Единая проверка: отправка этого типа события разрешена в конфиге? */
+	if (!event_emit_enabled((enum event_type)type))
+		return 0;
+
 	/* ── FILE_CLOSE — закрытие отслеживаемого файла ──────────────────
 	 *
 	 * Самое частое событие (~115/сек). Оптимизирован для минимума syscall:
@@ -3173,7 +3163,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * без вызова clock_gettime.
 	 * Cgroup резолвится из кэша (resolve_cgroup_fast), без обхода /sys.
 	 */
-	if (event_classify(type) == EVG_FILE_DATA) {
+	if (is_file_data_event(type)) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -3195,7 +3185,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  fe->open_count);
 
 		/* emit guard: проверяем нужно ли отправлять это событие в CSV */
-		if (!event_emit_enabled(type)) return 0;
 
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
@@ -3227,9 +3216,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE / FILE_CHMOD / FILE_CHOWN */
-	if (event_classify(type) == EVG_FILE_OP) {
+	if (is_file_op_event(type)) {
 		/* emit guard */
-		if (!event_emit_enabled(type)) return 0;
 
 		if (size < sizeof(struct file_event))
 			return 0;
@@ -3292,9 +3280,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * события приходят для ВСЕХ процессов на хосте. Фильтрация выполняется
 	 * здесь одним bpf_map_lookup_elem: если PID не в tracked_map — пропускаем.
 	 */
-	if (event_classify(type) == EVG_NET) {
+	if (is_net_event(type)) {
 		/* emit guard */
-		if (!event_emit_enabled(type)) return 0;
 
 		if (size < sizeof(struct net_event))
 			return 0;
@@ -3366,8 +3353,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Правило определяется сначала по отправителю, затем по получателю.
 	 * Имя процесса-получателя читается из /proc/<pid>/comm.
 	 */
-	if (event_classify(type) == EVG_SIGNAL) {
-		if (!event_emit_enabled(EVENT_SIGNAL)) return 0;
+	if (is_signal_event(type)) {
 		if (size < sizeof(struct signal_event))
 			return 0;
 		const struct signal_event *se = data;
@@ -3454,8 +3440,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Редкое событие. Симптом потери пакетов, перегрузки сети или DDoS.
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ соединения на хосте.
 	 */
-	if (type == EVENT_TCP_RETRANSMIT) { /* EVG_SEC: retransmit */
-		if (!event_emit_enabled(EVENT_TCP_RETRANSMIT)) return 0;
+	if (is_retransmit_event(type)) {
 		if (size < sizeof(struct retransmit_event))
 			return 0;
 		const struct retransmit_event *re = data;
@@ -3501,8 +3486,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Редкое событие. Полезно для обнаружения SYN flood атак.
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ входящие SYN.
 	 */
-	if (type == EVENT_SYN_RECV) { /* EVG_SEC: syn_recv */
-		if (!event_emit_enabled(EVENT_SYN_RECV)) return 0;
+	if (is_syn_event(type)) {
 		if (size < sizeof(struct syn_event))
 			return 0;
 		const struct syn_event *se_syn = data;
@@ -3549,8 +3533,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ RST на хосте.
 	 * Поле direction: 0 = отправлен (sent), 1 = получен (recv).
 	 */
-	if (type == EVENT_RST) { /* EVG_SEC: rst */
-		if (!event_emit_enabled(EVENT_RST)) return 0;
+	if (is_rst_event(type)) {
 		if (size < sizeof(struct rst_event))
 			return 0;
 		const struct rst_event *rste = data;
