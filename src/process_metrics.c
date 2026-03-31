@@ -828,6 +828,34 @@ static const char *rst_event_name(__u8 direction)
 }
 
 /*
+ * Заполняет proc_info из BPF struct event (exec/fork).
+ * Используется при позднем трекинге — когда процесс не был в proc_map
+ * и мы создаём запись из данных BPF-события.
+ */
+static void fill_proc_info_from_event(struct proc_info *pi,
+				      const struct event *e)
+{
+	pi->tgid       = e->tgid;
+	pi->ppid       = e->ppid;
+	pi->uid        = e->uid;
+	pi->start_ns   = e->start_ns;
+	pi->cgroup_id  = e->cgroup_id;
+	memcpy(pi->comm, e->comm, COMM_LEN);
+	memcpy(pi->thread_name, e->thread_name, COMM_LEN);
+	memcpy(pi->cmdline, e->cmdline, CMDLINE_MAX);
+	pi->cmdline_len = e->cmdline_len;
+	pi->loginuid   = e->loginuid;
+	pi->sessionid  = e->sessionid;
+	pi->euid       = e->euid;
+	pi->tty_nr     = e->tty_nr;
+	pi->sched_policy = e->sched_policy;
+	pi->mnt_ns_inum   = e->mnt_ns_inum;
+	pi->pid_ns_inum   = e->pid_ns_inum;
+	pi->net_ns_inum   = e->net_ns_inum;
+	pi->cgroup_ns_inum = e->cgroup_ns_inum;
+}
+
+/*
  * Заполняет metric_event всеми доступными полями из proc_info.
  * Единая точка копирования — вызывается из ВСЕХ обработчиков событий.
  *
@@ -3620,14 +3648,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			/* Сохраняем метаданные процесса в proc_map */
 			struct proc_info pi = {0};
-			pi.tgid      = e->tgid;
-			pi.ppid      = e->ppid;
-			pi.start_ns  = e->start_ns;
-			pi.cgroup_id = e->cgroup_id;
-			memcpy(pi.comm, e->comm, COMM_LEN);
-			memcpy(pi.thread_name, e->thread_name, COMM_LEN);
-			memcpy(pi.cmdline, e->cmdline, CMDLINE_MAX);
-			pi.cmdline_len = e->cmdline_len;
+			fill_proc_info_from_event(&pi, e);
 			bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
 
 			LOG_DEBUG(cfg_log_level, "TRACK: pid=%u rule=%s tags=%s comm=%.16s",
