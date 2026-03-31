@@ -762,14 +762,34 @@ static int should_include_conn(int tracked, __u8 sock_status)
 	return tracked || sock_status == SOCK_STATUS_CLOSED;
 }
 
-static int is_file_data_event(enum event_type t)
+/*
+ * Close-события допускают неотслеживаемые процессы — процесс мог
+ * завершиться до обработки close из ring buffer.
+ */
+static int is_close_event(enum event_type t)
 {
-	return t == EVENT_FILE_CLOSE || t == EVENT_FILE_OPEN;
+	return t == EVENT_FILE_CLOSE || t == EVENT_NET_CLOSE;
 }
 
-static int is_file_op_event(enum event_type t)
+/*
+ * Проверяет, нужно ли пропустить событие от неотслеживаемого процесса.
+ * Возвращает 1 (пропустить) если процесс не tracked и это не close-событие.
+ */
+static int should_skip_untracked(enum event_type type, int tracked)
 {
-	return t == EVENT_FILE_RENAME  || t == EVENT_FILE_UNLINK  ||
+	return !tracked && !is_close_event(type);
+}
+
+static int is_exec_event(enum event_type t) { return t == EVENT_EXEC; }
+static int is_fork_event(enum event_type t) { return t == EVENT_FORK; }
+static int is_exit_event(enum event_type t) { return t == EVENT_EXIT; }
+static int is_chdir_event(enum event_type t) { return t == EVENT_CHDIR; }
+static int is_oom_event(enum event_type t) { return t == EVENT_OOM_KILL; }
+
+static int is_file_event(enum event_type t)
+{
+	return t == EVENT_FILE_CLOSE || t == EVENT_FILE_OPEN ||
+	       t == EVENT_FILE_RENAME  || t == EVENT_FILE_UNLINK  ||
 	       t == EVENT_FILE_TRUNCATE || t == EVENT_FILE_CHMOD ||
 	       t == EVENT_FILE_CHOWN;
 }
@@ -2569,20 +2589,6 @@ static void fill_from_file_event(struct metric_event *cev,
 	cev->file_fsync_count = fe->fsync_count;
 }
 
-/* ── fill_from_file_op_event: rename/unlink/truncate/chmod/chown ──── */
-static void fill_from_file_op_event(struct metric_event *cev,
-				    const struct file_event *fe)
-{
-	cev->timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = fe->tgid;
-	cev->uid = fe->uid;
-	memcpy(cev->comm, fe->comm, COMM_LEN);
-	memcpy(cev->thread_name, fe->thread_name, COMM_LEN);
-
-	fast_strcpy(cev->file_path, sizeof(cev->file_path), fe->path);
-	cev->file_flags = (__u32)fe->flags;
-}
-
 /* ── fill_from_net_event: NET_LISTEN/CONNECT/ACCEPT/CLOSE ─────────── */
 static void fill_from_net_event(struct metric_event *cev,
 				const struct net_event *ne)
@@ -3197,19 +3203,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	__u32 type = *(const __u32 *)data;
 
 
-	/* ── FILE_CLOSE — закрытие отслеживаемого файла ──────────────────
-	 *
-	 * Самое частое событие (~115/сек). Оптимизирован для минимума syscall:
-	 *   1× bpf_map_lookup_elem — проверка, что процесс всё ещё отслеживается
-	 *   1× write()            — запись в буферный файл (ef_append)
-	 *
-	 * BPF-сторона (openat) уже фильтрует по tracked_map, поэтому сюда
-	 * приходят только события от отслеживаемых процессов.
-	 * Временная метка берётся из BPF (boot_ns) + g_boot_to_wall_ns,
-	 * без вызова clock_gettime.
-	 * Cgroup резолвится из кэша (resolve_cgroup_fast), без обхода /sys.
-	 */
-	if (is_file_data_event(type)) {
+	/* ── FILE events — file_open/close/rename/unlink/truncate/chmod/chown ── */
+	if (is_file_event(type)) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -3218,19 +3213,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 		 * процесс мог завершиться до обработки close из ring buffer. */
 		struct track_info ti;
 		int tracked = bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) == 0;
-		if (!tracked && type != EVENT_FILE_CLOSE)
+		if (should_skip_untracked(type, tracked))
 			return 0;
 
-		const char *rname = (tracked && ti.rule_id < num_rules) ? rules[ti.rule_id].name : RULE_NOT_MATCH;
-
-		LOG_DEBUG(cfg_log_level, "FILE_CLOSE: pid=%u rule=%s path=%.60s "
+		LOG_DEBUG(cfg_log_level, "FILE: pid=%u type=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
-			  fe->tgid, rname, fe->path,
+			  fe->tgid, event_type_name(type), fe->path,
 			  (unsigned long long)fe->read_bytes,
 			  (unsigned long long)fe->write_bytes,
 			  fe->open_count);
-
-		/* emit guard: проверяем нужно ли отправлять это событие в CSV */
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
@@ -3240,67 +3231,19 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fill_from_track_info(&cev, &ti, tracked);
 			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
 
-			/* proc_info enrichment, then BPF event overrides */
-			{
-				struct proc_info pi_file;
-				if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0)
-					fill_from_proc_info(&cev, &pi_file);
-			}
+			struct proc_info pi_file;
+			if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0)
+				fill_from_proc_info(&cev, &pi_file);
 			fill_from_file_event(&cev, fe);
 
-			fill_cgroup(&cev, fe->cgroup_id);
-
-			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
-			if (!cev.pwd[0])
-				pwd_read_and_store(fe->tgid);
-			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
-
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
-		}
-		return 0;
-	}
-
-	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE / FILE_CHMOD / FILE_CHOWN */
-	if (is_file_op_event(type)) {
-		/* emit guard */
-
-		if (size < sizeof(struct file_event))
-			return 0;
-		const struct file_event *fe = data;
-
-		struct track_info ti;
-		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
-			return 0;
-
-		if (should_emit_event(type)) {
-			struct metric_event cev;
-			memset(&cev, 0, sizeof(cev));
-
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    event_type_name(type));
-			fill_from_track_info(&cev, &ti, 1);
-			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-
-			/* proc_info enrichment, then BPF event overrides */
-			{
-				struct proc_info pi_mut;
-				if (bpf_map_lookup_elem(proc_map_fd,
-							&fe->tgid, &pi_mut) == 0)
-					fill_from_proc_info(&cev, &pi_mut);
-			}
-			fill_from_file_op_event(&cev, fe);
-
-			/* Conditional fields depend on event subtype */
-			if (type == EVENT_FILE_RENAME) {
-				fast_strcpy(cev.file_new_path,
-					    sizeof(cev.file_new_path),
-					    fe->path2);
-			} else if (type == EVENT_FILE_TRUNCATE) {
+			/* Conditional fields for file_op subtypes */
+			if (type == EVENT_FILE_RENAME)
+				fast_strcpy(cev.file_new_path, sizeof(cev.file_new_path), fe->path2);
+			else if (type == EVENT_FILE_TRUNCATE)
 				cev.file_write_bytes = fe->truncate_size;
-			} else if (type == EVENT_FILE_CHMOD) {
+			else if (type == EVENT_FILE_CHMOD)
 				cev.file_chmod_mode = fe->chmod_mode;
-			} else if (type == EVENT_FILE_CHOWN) {
+			else if (type == EVENT_FILE_CHOWN) {
 				cev.file_chown_uid = fe->chown_uid;
 				cev.file_chown_gid = fe->chown_gid;
 			}
@@ -3339,7 +3282,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		struct track_info ti;
 		int tracked = bpf_map_lookup_elem(tracked_map_fd,
 						  &ne->tgid, &ti) == 0;
-		if (!tracked && type != EVENT_NET_CLOSE)
+		if (should_skip_untracked(type, tracked))
 			return 0;
 
 		const char *rname = (tracked && ti.rule_id < num_rules)
@@ -3628,10 +3571,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (size < sizeof(*e))
 		return 0;
 
-	switch (e->type) {
-
 	/* ── EXEC — вызов exec (запуск нового процесса) ──────────────── */
-	case EVENT_EXEC: {
+	if (is_exec_event(e->type)) {
 		/* Обновляем глобальное дерево pid (exec может быть первым появлением) */
 		pidtree_store_ts(e->tgid, e->ppid);
 
@@ -3692,7 +3633,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── FORK — создание дочернего процесса ──────────────────────── */
-	case EVENT_FORK: {
+	if (is_fork_event(e->type)) {
 		/* Обновляем глобальное дерево pid (покрывает ВСЕ процессы) */
 		pidtree_store_ts(e->tgid, e->ppid);
 
@@ -3740,7 +3681,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── EXIT — завершение процесса ──────────────────────────────── */
-	case EVENT_EXIT: {
+	if (is_exit_event(e->type)) {
 		/* Определяем rule_id — BPF передаёт его в event, но может быть невалидным */
 		__u32 exit_rule_id = e->rule_id;
 		if (exit_rule_id >= num_rules) {
@@ -3791,7 +3732,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── CHDIR — смена рабочего каталога ─────────────────────────── */
-	case EVENT_CHDIR: {
+	if (is_chdir_event(e->type)) {
 		char cwd_path[PROC_PATH_LEN], pwd_buf[EV_PWD_LEN];
 		snprintf(cwd_path, sizeof(cwd_path), "/proc/%u/cwd", e->tgid);
 		ssize_t len = readlink(cwd_path, pwd_buf, sizeof(pwd_buf) - 1);
@@ -3803,7 +3744,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── OOM_KILL — убийство процесса OOM killer ─────────────────── */
-	case EVENT_OOM_KILL: {
+	if (is_oom_event(e->type)) {
 		/* Пробуем определить правило: сначала по PID, потом по родителю */
 		struct track_info ti;
 		if (bpf_map_lookup_elem(tracked_map_fd, &e->tgid, &ti) != 0)
@@ -3837,10 +3778,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
-		return 0;
-	}
-
-	default:
 		return 0;
 	}
 
