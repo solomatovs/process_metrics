@@ -1567,6 +1567,44 @@ static void resolve_cgroup_fs_ts(__u64 cgroup_id, char *buf, int buflen)
 	pthread_rwlock_unlock(&g_cgroup_lock);
 }
 
+/*
+ * Резолвит cgroup_id → путь и заполняет cev->cgroup.
+ */
+static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id)
+{
+	resolve_cgroup_fast_ts(cgroup_id, cev->cgroup, sizeof(cev->cgroup));
+}
+
+/*
+ * Заполняет cgroup-метрики из кэша cg_metrics[] (заполняется в refresh).
+ * Ищет по имени cgroup (cev->cgroup должен быть уже заполнен через fill_cgroup).
+ * Используется только в snapshot — метрики читаются из /sys/fs/cgroup периодически.
+ */
+static void fill_cgroup_metrics(struct metric_event *cev)
+{
+	if (!cev->cgroup[0])
+		return;
+
+	for (int i = 0; i < cg_metrics_count; i++) {
+		if (strcmp(cg_metrics[i].path, cev->cgroup) != 0)
+			continue;
+		if (!cg_metrics[i].valid)
+			break;
+
+		cev->cgroup_memory_max       = cg_metrics[i].mem_max;
+		cev->cgroup_memory_current   = cg_metrics[i].mem_cur;
+		cev->cgroup_swap_current     = cg_metrics[i].swap_cur;
+		cev->cgroup_cpu_weight       = cg_metrics[i].cpu_weight;
+		cev->cgroup_cpu_max          = cg_metrics[i].cpu_max;
+		cev->cgroup_cpu_max_period   = cg_metrics[i].cpu_max_period;
+		cev->cgroup_cpu_nr_periods   = cg_metrics[i].cpu_nr_periods;
+		cev->cgroup_cpu_nr_throttled = cg_metrics[i].cpu_nr_throttled;
+		cev->cgroup_cpu_throttled_usec = cg_metrics[i].cpu_throttled_usec;
+		cev->cgroup_pids_current     = cg_metrics[i].pids_cur;
+		break;
+	}
+}
+
 static void build_cgroup_cache_ts(void)
 {
 	pthread_rwlock_wrlock(&g_cgroup_lock);
@@ -2453,6 +2491,46 @@ static void fill_from_rst_event(struct metric_event *cev,
 	cev->sec_direction = re->direction;
 }
 
+/* ── fill_from_sock_info: conn_snapshot ───────────────────────────── */
+static void fill_from_sock_info(struct metric_event *cev,
+				const struct sock_info *si,
+				__u64 boot_ns)
+{
+	cev->pid = si->tgid;
+	cev->uid = si->uid;
+
+	/* IP-адреса */
+	if (si->af == 2) {
+		snprintf(cev->net_local_addr, sizeof(cev->net_local_addr),
+			 "%u.%u.%u.%u",
+			 si->local_addr[0], si->local_addr[1],
+			 si->local_addr[2], si->local_addr[3]);
+		snprintf(cev->net_remote_addr, sizeof(cev->net_remote_addr),
+			 "%u.%u.%u.%u",
+			 si->remote_addr[0], si->remote_addr[1],
+			 si->remote_addr[2], si->remote_addr[3]);
+	} else if (si->af == 10) {
+		inet_ntop(AF_INET6, si->local_addr,
+			  cev->net_local_addr, sizeof(cev->net_local_addr));
+		inet_ntop(AF_INET6, si->remote_addr,
+			  cev->net_remote_addr, sizeof(cev->net_remote_addr));
+	}
+
+	cev->net_local_port    = si->local_port;
+	cev->net_remote_port   = si->remote_port;
+	cev->net_conn_tx_bytes = si->tx_bytes;
+	cev->net_conn_rx_bytes = si->rx_bytes;
+	cev->net_conn_tx_calls = si->tx_calls;
+	cev->net_conn_rx_calls = si->rx_calls;
+
+	/* Длительность соединения */
+	if (si->start_ns > 0 && boot_ns > si->start_ns)
+		cev->net_duration_ms = (boot_ns - si->start_ns) / NS_PER_MS;
+
+	/* is_listener → state: 'L'=listener, 'E'=established */
+	cev->state = si->is_listener ? 'L' : 'E';
+}
+
 /* ── начальное сканирование процессов (однократное чтение /proc при старте) ── */
 
 /*
@@ -2990,7 +3068,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_file_event(&cev, fe);
 
-			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
+			fill_cgroup(&cev, fe->cgroup_id);
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 			if (!cev.pwd[0])
@@ -3061,7 +3139,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cev.file_chown_gid = fe->chown_gid;
 			}
 
-			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
+			fill_cgroup(&cev, fe->cgroup_id);
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 			if (!cev.pwd[0])
@@ -3138,8 +3216,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_net_event(&cev, ne);
 
-			resolve_cgroup_fast_ts(ne->cgroup_id,
-					       cev.cgroup, sizeof(cev.cgroup));
+			fill_cgroup(&cev, ne->cgroup_id);
 
 			/* TCP state на момент close */
 			if (type == EVENT_NET_CLOSE && ne->tcp_state) {
@@ -3222,7 +3299,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_signal_event(&cev, se);
 
-			resolve_cgroup_fast_ts(se->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
+			fill_cgroup(&cev, se->cgroup_id);
 
 			/* Чтение имени процесса-получателя из /proc/<pid>/comm */
 			{
@@ -3289,8 +3366,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_retransmit_event(&cev, re);
 
-			resolve_cgroup_fast_ts(re->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
+			fill_cgroup(&cev, re->cgroup_id);
 			pwd_lookup_ts(re->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3336,8 +3412,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_syn_event(&cev, se_syn);
 
-			resolve_cgroup_fast_ts(se_syn->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
+			fill_cgroup(&cev, se_syn->cgroup_id);
 			pwd_lookup_ts(se_syn->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3384,8 +3459,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 			fill_from_rst_event(&cev, rste);
 
-			resolve_cgroup_fast_ts(rste->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
+			fill_cgroup(&cev, rste->cgroup_id);
 			pwd_lookup_ts(rste->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -4427,10 +4501,6 @@ static void write_snapshot(void)
 		const char *rule_name = (tracked && ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
-		/* Разрешение cgroup из кэша */
-		char cg_path[PATH_MAX_LEN];
-		resolve_cgroup_ts(pi.cgroup_id, cg_path, sizeof(cg_path));
-
 		/* Вычисление времён */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
 		if (uptime_sec < 0) uptime_sec = 0;
@@ -4441,17 +4511,6 @@ static void write_snapshot(void)
 				? (double)(pi.cpu_ns - prev_ns) / elapsed_ns : 0;
 		}
 		cpu_prev_update(key, pi.cpu_ns);
-
-		/* Lookup cgroup-метрик из кэша (заполнен refresh) */
-		int cg_idx = -1;
-		if (cg_path[0]) {
-			for (int i = 0; i < cg_metrics_count; i++) {
-				if (strcmp(cg_metrics[i].path, cg_path) == 0) {
-					cg_idx = i;
-					break;
-				}
-			}
-		}
 
 		/* Формирование события snapshot */
 		if (g_http_cfg.enabled) {
@@ -4472,25 +4531,12 @@ static void write_snapshot(void)
 #endif
 			fill_from_track_info(&cev, &ti, tracked);
 			fill_from_proc_info(&cev, &pi);
-			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
+			fill_cgroup(&cev, pi.cgroup_id);
+			fill_cgroup_metrics(&cev);
 			cev.cpu_usage_ratio = cpu_ratio;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
 
 			pwd_lookup_ts(pi.tgid, cev.pwd, sizeof(cev.pwd));
-
-			/* cgroup-метрики из кэша (заполнен refresh) */
-			if (cg_idx >= 0 && cg_metrics[cg_idx].valid) {
-				cev.cgroup_memory_max = cg_metrics[cg_idx].mem_max;
-				cev.cgroup_memory_current = cg_metrics[cg_idx].mem_cur;
-				cev.cgroup_swap_current = cg_metrics[cg_idx].swap_cur;
-				cev.cgroup_cpu_weight = cg_metrics[cg_idx].cpu_weight;
-				cev.cgroup_cpu_max = cg_metrics[cg_idx].cpu_max;
-				cev.cgroup_cpu_max_period = cg_metrics[cg_idx].cpu_max_period;
-				cev.cgroup_cpu_nr_periods = cg_metrics[cg_idx].cpu_nr_periods;
-				cev.cgroup_cpu_nr_throttled = cg_metrics[cg_idx].cpu_nr_throttled;
-				cev.cgroup_cpu_throttled_usec = cg_metrics[cg_idx].cpu_throttled_usec;
-				cev.cgroup_pids_current = cg_metrics[cg_idx].pids_cur;
-			}
 
 			/* open_conn_map — BPF map lookup, не файловый I/O */
 			if (cfg_tcp_open_conns) {
@@ -4562,63 +4608,13 @@ static void write_snapshot(void)
 							ensure_tags(si.tgid, cev.tags, sizeof(cev.tags));
 					}
 #endif
-					cev.pid = si.tgid;
-					cev.uid = si.uid;
-
-					/* comm, ppid, identity из proc_map */
 					struct proc_info cpi;
 					if (bpf_map_lookup_elem(
 						proc_map_fd,
-						&si.tgid, &cpi) == 0) {
+						&si.tgid, &cpi) == 0)
 						fill_from_proc_info(&cev, &cpi);
-						cev.state = 0;  /* state set to L/E below */
-					}
-					cev.pid = si.tgid;
-					cev.uid = si.uid;
 
-					/* IP-адреса */
-					if (si.af == 2) {
-						snprintf(cev.net_local_addr,
-							 sizeof(cev.net_local_addr),
-							 "%u.%u.%u.%u",
-							 si.local_addr[0],
-							 si.local_addr[1],
-							 si.local_addr[2],
-							 si.local_addr[3]);
-						snprintf(cev.net_remote_addr,
-							 sizeof(cev.net_remote_addr),
-							 "%u.%u.%u.%u",
-							 si.remote_addr[0],
-							 si.remote_addr[1],
-							 si.remote_addr[2],
-							 si.remote_addr[3]);
-					} else if (si.af == 10) {
-						inet_ntop(AF_INET6,
-							  si.local_addr,
-							  cev.net_local_addr,
-							  sizeof(cev.net_local_addr));
-						inet_ntop(AF_INET6,
-							  si.remote_addr,
-							  cev.net_remote_addr,
-							  sizeof(cev.net_remote_addr));
-					}
-
-					cev.net_local_port = si.local_port;
-					cev.net_remote_port = si.remote_port;
-					cev.net_conn_tx_bytes = si.tx_bytes;
-					cev.net_conn_rx_bytes = si.rx_bytes;
-					cev.net_conn_tx_calls = si.tx_calls;
-					cev.net_conn_rx_calls = si.rx_calls;
-
-					/* Длительность соединения */
-					if (si.start_ns > 0 &&
-					    boot_ns > si.start_ns)
-						cev.net_duration_ms =
-							(boot_ns - si.start_ns)
-							/ NS_PER_MS;
-
-					/* is_listener → state: 'L'=listener, 'E'=established */
-					cev.state = si.is_listener ? 'L' : 'E';
+					fill_from_sock_info(&cev, &si, boot_ns);
 
 					pidtree_get_chain_copy(
 						snap_pt_pid, snap_pt_ppid,
