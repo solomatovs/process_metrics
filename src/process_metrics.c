@@ -208,6 +208,9 @@ struct poll_thread_arg {
 /* Предварительные объявления */
 static void write_snapshot(void);
 static void build_cgroup_cache(void);
+static void cmdline_split(const char *raw, __u16 len,
+			   char *exec_out, int exec_len,
+			   char *args_out, int args_len);
 /* log_ts определён в log.h */
 
 /* Смещение от boot-time к wall-clock (вычисляется однократно при старте,
@@ -690,15 +693,110 @@ static void fill_parent_pids(struct metric_event *cev)
 }
 
 /*
- * Копирует per-process сетевые счётчики из proc_info в metric_event.
- * Вызывается из обработчиков всех типов событий, где доступен proc_info.
+ * Заполняет metric_event всеми доступными полями из proc_info.
+ * Единая точка копирования — вызывается из ВСЕХ обработчиков событий.
+ *
+ * Поля, которые НЕ заполняются (специфичны для типа события):
+ *   - timestamp_ns, event_type, rule, tags — заполняются обработчиком
+ *   - pid, root_pid — заполняются из BPF-события или tracked_map
+ *   - cgroup — резолвится отдельно через resolve_cgroup_*
+ *   - file_*, net_local/remote_*, sig_*, sec_* — специфичны для типа
+ *   - pwd, parent_pids — заполняются отдельными вызовами
+ *   - exit_code — только при exit
  */
-static void fill_net_bytes(struct metric_event *cev, const struct proc_info *pi)
+static void fill_from_proc_info(struct metric_event *cev,
+				const struct proc_info *pi)
 {
+	static long cached_page_size = 0;
+	if (!cached_page_size) {
+		cached_page_size = sysconf(_SC_PAGESIZE);
+		if (cached_page_size <= 0) cached_page_size = FALLBACK_PAGE_SIZE;
+	}
+
+	/* ── идентификация ────────────────────────────────────── */
+	cev->ppid      = pi->ppid;
+	cev->uid       = pi->uid;
+	memcpy(cev->comm, pi->comm, COMM_LEN);
+	memcpy(cev->thread_name, pi->thread_name, COMM_LEN);
+	cmdline_split(pi->cmdline, pi->cmdline_len,
+		      cev->exec_path, sizeof(cev->exec_path),
+		      cev->args, sizeof(cev->args));
+	cev->is_root   = (pi->uid == 0) ? 1 : 0;
+	cev->state     = pi->state;
+	cev->loginuid  = pi->loginuid;
+	cev->sessionid = pi->sessionid;
+	cev->euid      = pi->euid;
+	cev->tty_nr    = pi->tty_nr;
+	cev->sched_policy = pi->sched_policy;
+
+	/* ── время ────────────────────────────────────────────── */
+	cev->start_time_ns = pi->start_ns
+		? pi->start_ns + (__u64)g_boot_to_wall_ns : 0;
+
+	/* ── CPU ──────────────────────────────────────────────── */
+	cev->cpu_ns = pi->cpu_ns;
+
+	/* ── память ───────────────────────────────────────────── */
+	cev->rss_bytes     = pi->rss_pages * cached_page_size;
+	cev->rss_min_bytes = pi->rss_min_pages * cached_page_size;
+	cev->rss_max_bytes = pi->rss_max_pages * cached_page_size;
+	cev->shmem_bytes   = pi->shmem_pages * cached_page_size;
+	cev->swap_bytes    = pi->swap_pages * cached_page_size;
+	cev->vsize_bytes   = pi->vsize_pages * cached_page_size;
+
+	/* ── I/O (диск) ───────────────────────────────────────── */
+	cev->io_read_bytes  = pi->io_read_bytes;
+	cev->io_write_bytes = pi->io_write_bytes;
+	cev->io_rchar       = pi->io_rchar;
+	cev->io_wchar       = pi->io_wchar;
+	cev->io_syscr       = pi->io_syscr;
+	cev->io_syscw       = pi->io_syscw;
+	cev->file_opens     = pi->file_opens;
+	cev->socket_creates = pi->socket_creates;
+
+	/* ── страничные отказы / переключения ─────────────────── */
+	cev->maj_flt = pi->maj_flt;
+	cev->min_flt = pi->min_flt;
+	cev->nvcsw   = pi->nvcsw;
+	cev->nivcsw  = pi->nivcsw;
+
+	/* ── потоки / OOM ─────────────────────────────────────── */
+	cev->threads       = pi->threads;
+	cev->oom_score_adj = pi->oom_score_adj;
+	cev->oom_killed    = pi->oom_killed;
+
+	/* ── сеть (per-process) ───────────────────────────────── */
 	cev->net_tcp_tx_bytes = pi->net_tcp_tx_bytes;
 	cev->net_tcp_rx_bytes = pi->net_tcp_rx_bytes;
 	cev->net_udp_tx_bytes = pi->net_udp_tx_bytes;
 	cev->net_udp_rx_bytes = pi->net_udp_rx_bytes;
+
+	/* ── пространства имён ────────────────────────────────── */
+	cev->mnt_ns_inum    = pi->mnt_ns_inum;
+	cev->pid_ns_inum    = pi->pid_ns_inum;
+	cev->net_ns_inum    = pi->net_ns_inum;
+	cev->cgroup_ns_inum = pi->cgroup_ns_inum;
+
+	/* ── вытеснение ───────────────────────────────────────── */
+	cev->preempted_by_pid = pi->preempted_by_pid;
+	memcpy(cev->preempted_by_comm, pi->preempted_by_comm, COMM_LEN);
+}
+
+/*
+ * Заполняет metric_event из track_info (tracked_map).
+ * Устанавливает rule, root_pid, is_root.
+ * tracked=0 означает процесс не в tracked_map — rule остаётся RULE_NOT_MATCH.
+ */
+static void fill_from_track_info(struct metric_event *cev,
+				 const struct track_info *ti, int tracked)
+{
+	if (tracked && ti) {
+		cev->root_pid = ti->root_pid;
+		cev->is_root  = ti->is_root;
+		if (ti->rule_id < num_rules)
+			snprintf(cev->rule, sizeof(cev->rule), "%s",
+				 rules[ti->rule_id].name);
+	}
 }
 
 /* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
@@ -2195,6 +2293,166 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->cgroup_ns_inum = e->cgroup_ns_inum;
 }
 
+/* ── fill-функции для типизированных BPF-событий ────────────────────
+ *
+ * Каждая функция копирует общие поля (timestamp, pid, uid, comm,
+ * thread_name) и специфичные для типа события поля из BPF-структуры
+ * в metric_event.
+ *
+ * ВАЖНО: pid/uid/comm/thread_name устанавливаются из BPF-события и
+ * ПЕРЕЗАПИСЫВАЮТ значения, которые мог установить fill_from_proc_info.
+ * Поэтому fill_from_proc_info вызывается ДО этих функций.
+ */
+
+/* ── fill_sec_addrs: общий хелпер для sec_* адресов ───────────────── */
+static void fill_sec_addrs(struct metric_event *cev, __u8 af,
+			    const void *local_addr, const void *remote_addr,
+			    __u16 local_port, __u16 remote_port)
+{
+	cev->sec_af = af;
+	cev->sec_local_port = local_port;
+	cev->sec_remote_port = remote_port;
+	if (af == 2) {
+		fmt_ipv4(cev->sec_local_addr,
+			 sizeof(cev->sec_local_addr),
+			 (const __u8 *)local_addr);
+		fmt_ipv4(cev->sec_remote_addr,
+			 sizeof(cev->sec_remote_addr),
+			 (const __u8 *)remote_addr);
+	} else if (af == 10) {
+		inet_ntop(AF_INET6, local_addr,
+			  cev->sec_local_addr,
+			  sizeof(cev->sec_local_addr));
+		inet_ntop(AF_INET6, remote_addr,
+			  cev->sec_remote_addr,
+			  sizeof(cev->sec_remote_addr));
+	}
+}
+
+/* ── fill_from_file_event: FILE_CLOSE / FILE_OPEN ─────────────────── */
+static void fill_from_file_event(struct metric_event *cev,
+				 const struct file_event *fe)
+{
+	cev->timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = fe->tgid;
+	cev->uid = fe->uid;
+	memcpy(cev->comm, fe->comm, COMM_LEN);
+	memcpy(cev->thread_name, fe->thread_name, COMM_LEN);
+
+	fast_strcpy(cev->file_path, sizeof(cev->file_path), fe->path);
+	cev->file_flags = (__u32)fe->flags;
+	cev->file_read_bytes = fe->read_bytes;
+	cev->file_write_bytes = fe->write_bytes;
+	cev->file_open_count = fe->open_count;
+	cev->file_fsync_count = fe->fsync_count;
+}
+
+/* ── fill_from_file_op_event: rename/unlink/truncate/chmod/chown ──── */
+static void fill_from_file_op_event(struct metric_event *cev,
+				    const struct file_event *fe)
+{
+	cev->timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = fe->tgid;
+	cev->uid = fe->uid;
+	memcpy(cev->comm, fe->comm, COMM_LEN);
+	memcpy(cev->thread_name, fe->thread_name, COMM_LEN);
+
+	fast_strcpy(cev->file_path, sizeof(cev->file_path), fe->path);
+	cev->file_flags = (__u32)fe->flags;
+}
+
+/* ── fill_from_net_event: NET_LISTEN/CONNECT/ACCEPT/CLOSE ─────────── */
+static void fill_from_net_event(struct metric_event *cev,
+				const struct net_event *ne)
+{
+	cev->timestamp_ns = ne->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = ne->tgid;
+	cev->uid = ne->uid;
+	memcpy(cev->comm, ne->comm, COMM_LEN);
+	memcpy(cev->thread_name, ne->thread_name, COMM_LEN);
+
+	if (ne->af == 2) {
+		fmt_ipv4(cev->net_local_addr,
+			 sizeof(cev->net_local_addr),
+			 ne->local_addr);
+		fmt_ipv4(cev->net_remote_addr,
+			 sizeof(cev->net_remote_addr),
+			 ne->remote_addr);
+	} else if (ne->af == 10) {
+		inet_ntop(AF_INET6, ne->local_addr,
+			  cev->net_local_addr,
+			  sizeof(cev->net_local_addr));
+		inet_ntop(AF_INET6, ne->remote_addr,
+			  cev->net_remote_addr,
+			  sizeof(cev->net_remote_addr));
+	}
+
+	cev->net_local_port = ne->local_port;
+	cev->net_remote_port = ne->remote_port;
+	cev->net_conn_tx_bytes = ne->tx_bytes;
+	cev->net_conn_rx_bytes = ne->rx_bytes;
+	cev->net_conn_tx_calls = ne->tx_calls;
+	cev->net_conn_rx_calls = ne->rx_calls;
+	cev->net_duration_ms = ne->duration_ns / NS_PER_MS;
+}
+
+/* ── fill_from_signal_event: SIGNAL ───────────────────────────────── */
+static void fill_from_signal_event(struct metric_event *cev,
+				   const struct signal_event *se)
+{
+	cev->timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = se->sender_tgid;
+	cev->uid = se->sender_uid;
+	memcpy(cev->comm, se->sender_comm, COMM_LEN);
+	memcpy(cev->thread_name, se->sender_thread_name, COMM_LEN);
+
+	cev->sig_num = (__u32)se->sig;
+	cev->sig_target_pid = se->target_pid;
+	cev->sig_code = se->sig_code;
+	cev->sig_result = se->sig_result;
+}
+
+/* ── fill_from_retransmit_event: TCP_RETRANSMIT ───────────────────── */
+static void fill_from_retransmit_event(struct metric_event *cev,
+				       const struct retransmit_event *re)
+{
+	cev->timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = re->tgid;
+	cev->uid = re->uid;
+	memcpy(cev->comm, re->comm, COMM_LEN);
+
+	fill_sec_addrs(cev, re->af, re->local_addr, re->remote_addr,
+		       re->local_port, re->remote_port);
+	cev->sec_tcp_state = re->state;
+}
+
+/* ── fill_from_syn_event: SYN_RECV ────────────────────────────────── */
+static void fill_from_syn_event(struct metric_event *cev,
+				const struct syn_event *se)
+{
+	cev->timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = se->tgid;
+	cev->uid = se->uid;
+	memcpy(cev->comm, se->comm, COMM_LEN);
+
+	fill_sec_addrs(cev, se->af, se->local_addr, se->remote_addr,
+		       se->local_port, se->remote_port);
+}
+
+/* ── fill_from_rst_event: RST ─────────────────────────────────────── */
+static void fill_from_rst_event(struct metric_event *cev,
+				const struct rst_event *re)
+{
+	cev->timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	cev->pid = re->tgid;
+	cev->uid = re->uid;
+	memcpy(cev->comm, re->comm, COMM_LEN);
+
+	fill_sec_addrs(cev, re->af, re->local_addr, re->remote_addr,
+		       re->local_port, re->remote_port);
+	cev->sec_direction = re->direction;
+}
+
 /* ── начальное сканирование процессов (однократное чтение /proc при старте) ── */
 
 /*
@@ -2716,60 +2974,29 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (type == EVENT_FILE_CLOSE && !cfg_emit_file_close) return 0;
 
 		if (g_http_cfg.enabled) {
-			/* Формирование metric_event для записи в буфер */
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-
-			/* Время: BPF boot_ns → wall clock через предвычисленное смещение */
-			cev.timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type), type == EVENT_FILE_OPEN ? "file_open" : "file_close");
-			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
-
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    type == EVENT_FILE_OPEN ? "file_open" : "file_close");
+			fill_from_track_info(&cev, &ti, tracked);
 			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-			cev.root_pid = tracked ? ti.root_pid : 0;
-			cev.is_root = tracked ? ti.is_root : 0;
-			cev.pid = fe->tgid;
 			cev.ppid = fe->ppid;
-			cev.uid = fe->uid;
-			memcpy(cev.comm, fe->comm, COMM_LEN);
-			memcpy(cev.thread_name, fe->thread_name, COMM_LEN);
 
-			/* Identity + exec/args + start_time + ppid из proc_map */
+			/* proc_info enrichment, then BPF event overrides */
 			{
 				struct proc_info pi_file;
-				if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0) {
-					cev.ppid      = pi_file.ppid;
-					cev.state = pi_file.state;
-					cev.loginuid  = pi_file.loginuid;
-					cev.sessionid = pi_file.sessionid;
-					cev.euid      = pi_file.euid;
-					cev.tty_nr    = pi_file.tty_nr;
-					cev.start_time_ns = pi_file.start_ns
-						? pi_file.start_ns + (__u64)g_boot_to_wall_ns : 0;
-					cmdline_split(pi_file.cmdline, pi_file.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					fill_net_bytes(&cev, &pi_file);
-				}
+				if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0)
+					fill_from_proc_info(&cev, &pi_file);
 			}
+			fill_from_file_event(&cev, fe);
 
-			/* Cgroup из кэша — линейный поиск по ~50 записям, без syscall */
 			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
-
-			/* Файловые метрики: путь, флаги, прочитано/записано, кол-во открытий */
-			fast_strcpy(cev.file_path, sizeof(cev.file_path), fe->path);
-			cev.file_flags = (__u32)fe->flags;
-			cev.file_read_bytes = fe->read_bytes;
-			cev.file_write_bytes = fe->write_bytes;
-			cev.file_open_count = fe->open_count;
-			cev.file_fsync_count = fe->fsync_count;
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 			if (!cev.pwd[0])
 				pwd_read_and_store(fe->tgid);
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 
-			/* Запись в буферный файл (1× write syscall) */
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -2795,14 +3022,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
 			return 0;
 
-		const char *rname = (ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : RULE_NOT_MATCH;
-
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-
-			cev.timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
 
 			const char *etype =
 				type == EVENT_FILE_RENAME   ? "file_rename"   :
@@ -2812,38 +3034,20 @@ static int handle_event(void *ctx, void *data, size_t size)
 				type == EVENT_FILE_CHOWN    ? "file_chown"    :
 				                              "file_unknown";
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), etype);
-			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
+			fill_from_track_info(&cev, &ti, 1);
 			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-
-			cev.root_pid = ti.root_pid;
-			cev.is_root  = ti.is_root;
-			cev.pid  = fe->tgid;
 			cev.ppid = fe->ppid;
-			cev.uid  = fe->uid;
-			memcpy(cev.comm, fe->comm, COMM_LEN);
-			memcpy(cev.thread_name, fe->thread_name, COMM_LEN);
 
-			struct proc_info pi_mut;
-			if (bpf_map_lookup_elem(proc_map_fd,
-						&fe->tgid, &pi_mut) == 0) {
-				cev.ppid      = pi_mut.ppid;
-				cev.state = pi_mut.state;
-				cev.loginuid  = pi_mut.loginuid;
-				cev.sessionid = pi_mut.sessionid;
-				cev.euid      = pi_mut.euid;
-				cev.tty_nr    = pi_mut.tty_nr;
-				cev.start_time_ns = pi_mut.start_ns ? pi_mut.start_ns + (__u64)g_boot_to_wall_ns : 0;
-				cmdline_split(pi_mut.cmdline, pi_mut.cmdline_len,
-					      cev.exec_path, sizeof(cev.exec_path),
-					      cev.args, sizeof(cev.args));
-				fill_net_bytes(&cev, &pi_mut);
+			/* proc_info enrichment, then BPF event overrides */
+			{
+				struct proc_info pi_mut;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&fe->tgid, &pi_mut) == 0)
+					fill_from_proc_info(&cev, &pi_mut);
 			}
+			fill_from_file_op_event(&cev, fe);
 
-			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
-
-			fast_strcpy(cev.file_path, sizeof(cev.file_path), fe->path);
-			cev.file_flags = (__u32)fe->flags;
-
+			/* Conditional fields depend on event subtype */
 			if (type == EVENT_FILE_RENAME) {
 				fast_strcpy(cev.file_new_path,
 					    sizeof(cev.file_new_path),
@@ -2856,6 +3060,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cev.file_chown_uid = fe->chown_uid;
 				cev.file_chown_gid = fe->chown_gid;
 			}
+
+			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 			if (!cev.pwd[0])
@@ -2918,83 +3124,29 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-
-			/* Время: BPF boot_ns → wall clock */
-			cev.timestamp_ns = ne->timestamp_ns
-					 + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
-			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
+			fill_from_track_info(&cev, &ti, tracked);
 			ensure_tags(ne->tgid, cev.tags, sizeof(cev.tags));
-			cev.root_pid = tracked ? ti.root_pid : 0;
-			cev.is_root = tracked ? ti.is_root : 0;
-			cev.pid = ne->tgid;
 			cev.ppid = ne->ppid;
-			cev.uid = ne->uid;
-			memcpy(cev.comm, ne->comm, COMM_LEN);
-			memcpy(cev.thread_name, ne->thread_name, COMM_LEN);
 
-			/* Identity + exec/args + start_time + ppid из proc_map.
-			 * ppid из BPF (real_parent->tgid) может быть некорректным
-			 * для потоков — равен tgid вместо реального родительского PID.
-			 * proc_map.ppid заполняется при fork — всегда корректен. */
+			/* proc_info enrichment, then BPF event overrides */
 			{
 				struct proc_info pi_net;
 				if (bpf_map_lookup_elem(proc_map_fd,
-							&ne->tgid, &pi_net) == 0) {
-					cev.ppid      = pi_net.ppid;
-					cev.state = pi_net.state;
-					cev.loginuid  = pi_net.loginuid;
-					cev.sessionid = pi_net.sessionid;
-					cev.euid      = pi_net.euid;
-					cev.tty_nr    = pi_net.tty_nr;
-					cev.start_time_ns = pi_net.start_ns
-						? pi_net.start_ns + (__u64)g_boot_to_wall_ns : 0;
-					cmdline_split(pi_net.cmdline, pi_net.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					fill_net_bytes(&cev, &pi_net);
-				}
+							&ne->tgid, &pi_net) == 0)
+					fill_from_proc_info(&cev, &pi_net);
 			}
+			fill_from_net_event(&cev, ne);
 
-			/* Cgroup из кэша */
 			resolve_cgroup_fast_ts(ne->cgroup_id,
 					       cev.cgroup, sizeof(cev.cgroup));
 
-			/* Форматирование IP-адресов */
-			if (ne->af == 2) { /* AF_INET — IPv4 */
-				fmt_ipv4(cev.net_local_addr,
-					 sizeof(cev.net_local_addr),
-					 ne->local_addr);
-				fmt_ipv4(cev.net_remote_addr,
-					 sizeof(cev.net_remote_addr),
-					 ne->remote_addr);
-			} else if (ne->af == 10) { /* AF_INET6 — IPv6 */
-				inet_ntop(AF_INET6, ne->local_addr,
-					  cev.net_local_addr,
-					  sizeof(cev.net_local_addr));
-				inet_ntop(AF_INET6, ne->remote_addr,
-					  cev.net_remote_addr,
-					  sizeof(cev.net_remote_addr));
-			}
-
-			/* Сетевые метрики: порты, байты, длительность */
-			cev.net_local_port = ne->local_port;
-			cev.net_remote_port = ne->remote_port;
-			cev.net_conn_tx_bytes = ne->tx_bytes;
-			cev.net_conn_rx_bytes = ne->rx_bytes;
-			cev.net_conn_tx_calls = ne->tx_calls;
-			cev.net_conn_rx_calls = ne->rx_calls;
-			cev.net_duration_ms = ne->duration_ns / NS_PER_MS;
-
-			/* TCP state на момент close для net_close.
-			 * Кодируем как символ для CSV:
-			 * ESTABLISHED(1)→'I' (initiator), CLOSE_WAIT(8)→'R' (responder),
-			 * остальные→числовой код */
+			/* TCP state на момент close */
 			if (type == EVENT_NET_CLOSE && ne->tcp_state) {
-				if (ne->tcp_state == 1) /* ESTABLISHED */
-					cev.state = 'I'; /* initiator */
-				else if (ne->tcp_state == 8) /* CLOSE_WAIT */
-					cev.state = 'R'; /* responder */
+				if (ne->tcp_state == 1)
+					cev.state = 'I';
+				else if (ne->tcp_state == 8)
+					cev.state = 'R';
 				else
 					cev.state = '0' + (ne->tcp_state % 10);
 			}
@@ -3042,14 +3194,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  se->sender_comm);
 
 		if (g_http_cfg.enabled) {
-			char cg_buf[PATH_MAX_LEN];
-			resolve_cgroup_fast_ts(se->cgroup_id, cg_buf, sizeof(cg_buf));
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-
-			cev.timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    "signal");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), "signal");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги: сначала отправителя, потом получателя */
@@ -3062,54 +3209,36 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Данные отправителя из tracked_map */
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&se->sender_tgid, &ti) == 0) {
-				cev.root_pid = ti.root_pid;
-				cev.is_root = ti.is_root;
-			}
-			cev.pid = se->sender_tgid;
-			cev.uid = se->sender_uid;
-			memcpy(cev.comm, se->sender_comm, COMM_LEN);
-			memcpy(cev.thread_name, se->sender_thread_name, COMM_LEN);
-			if (cg_buf[0])
-				fast_strcpy(cev.cgroup, sizeof(cev.cgroup),
-					    cg_buf);
-
-			/* Идентификация отправителя из proc_info */
-			struct proc_info sender_pi;
-			if (bpf_map_lookup_elem(proc_map_fd,
-						&se->sender_tgid,
-						&sender_pi) == 0) {
-				cev.ppid = sender_pi.ppid;
-				cev.loginuid = sender_pi.loginuid;
-				cev.sessionid = sender_pi.sessionid;
-				cev.euid = sender_pi.euid;
-				cev.tty_nr = sender_pi.tty_nr;
-				cev.state = sender_pi.state;
-				cev.start_time_ns = sender_pi.start_ns ? sender_pi.start_ns + (__u64)g_boot_to_wall_ns : 0;
-				cmdline_split(sender_pi.cmdline, sender_pi.cmdline_len,
-					      cev.exec_path, sizeof(cev.exec_path),
-					      cev.args, sizeof(cev.args));
-				fill_net_bytes(&cev, &sender_pi);
+				fill_from_track_info(&cev, &ti, 1);
 			}
 
-			/* Поля сигнала: номер, PID получателя, код, результат */
-			cev.sig_num = (__u32)se->sig;
-			cev.sig_target_pid = se->target_pid;
-			cev.sig_code = se->sig_code;
-			cev.sig_result = se->sig_result;
+			/* proc_info enrichment, then BPF event overrides */
+			{
+				struct proc_info sender_pi;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&se->sender_tgid,
+							&sender_pi) == 0)
+					fill_from_proc_info(&cev, &sender_pi);
+			}
+			fill_from_signal_event(&cev, se);
+
+			resolve_cgroup_fast_ts(se->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
 
 			/* Чтение имени процесса-получателя из /proc/<pid>/comm */
-			char tcomm_path[PROC_PATH_LEN], tcomm_buf[COMM_LEN + 2];
-			snprintf(tcomm_path, sizeof(tcomm_path),
-				 "/proc/%u/comm", se->target_pid);
-			FILE *tcf = fopen(tcomm_path, "r");
-			if (tcf) {
-				if (fgets(tcomm_buf, sizeof(tcomm_buf), tcf)) {
-					tcomm_buf[strcspn(tcomm_buf, "\n")] = 0;
-					fast_strcpy(cev.sig_target_comm,
-						    sizeof(cev.sig_target_comm),
-						    tcomm_buf);
+			{
+				char tcomm_path[PROC_PATH_LEN], tcomm_buf[COMM_LEN + 2];
+				snprintf(tcomm_path, sizeof(tcomm_path),
+					 "/proc/%u/comm", se->target_pid);
+				FILE *tcf = fopen(tcomm_path, "r");
+				if (tcf) {
+					if (fgets(tcomm_buf, sizeof(tcomm_buf), tcf)) {
+						tcomm_buf[strcspn(tcomm_buf, "\n")] = 0;
+						fast_strcpy(cev.sig_target_comm,
+							    sizeof(cev.sig_target_comm),
+							    tcomm_buf);
+					}
+					fclose(tcf);
 				}
-				fclose(tcf);
 			}
 
 			pwd_lookup_ts(se->sender_tgid, cev.pwd, sizeof(cev.pwd));
@@ -3140,73 +3269,28 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+			fast_strcpy(cev.event_type, sizeof(cev.event_type), "tcp_retrans");
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-			cev.timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				 "tcp_retrans");
-			cev.pid = re->tgid;
-			cev.uid = re->uid;
-			memcpy(cev.comm, re->comm, COMM_LEN);
-			resolve_cgroup_fast_ts(re->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
 
 			/* Определяем правило, если процесс отслеживается */
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&re->tgid, &ti) == 0) {
-				if (ti.rule_id < num_rules)
-					fast_strcpy(cev.rule, sizeof(cev.rule),
-						    rules[ti.rule_id].name);
-				cev.root_pid = ti.root_pid;
-				ensure_tags(re->tgid, cev.tags,
-					       sizeof(cev.tags));
-			}
-			/* exec/args + net bytes из proc_map */
-			{
-				struct proc_info pi_sec;
-				if (bpf_map_lookup_elem(proc_map_fd,
-							&re->tgid, &pi_sec) == 0) {
-					cmdline_split(pi_sec.cmdline, pi_sec.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					fill_net_bytes(&cev, &pi_sec);
-				}
+				fill_from_track_info(&cev, &ti, 1);
+				ensure_tags(re->tgid, cev.tags, sizeof(cev.tags));
 			}
 
-			/* Identity из proc_map */
+			/* proc_info enrichment, then BPF event overrides */
 			{
 				struct proc_info pi_ret;
 				if (bpf_map_lookup_elem(proc_map_fd,
-							&re->tgid, &pi_ret) == 0) {
-					cev.loginuid  = pi_ret.loginuid;
-					cev.sessionid = pi_ret.sessionid;
-					cev.euid      = pi_ret.euid;
-					cev.tty_nr    = pi_ret.tty_nr;
-					cev.state = pi_ret.state;
-					cev.start_time_ns = pi_ret.start_ns ? pi_ret.start_ns + (__u64)g_boot_to_wall_ns : 0;
-				}
+							&re->tgid, &pi_ret) == 0)
+					fill_from_proc_info(&cev, &pi_ret);
 			}
+			fill_from_retransmit_event(&cev, re);
 
-			/* Адреса и порты TCP-соединения */
-			cev.sec_af = re->af;
-			cev.sec_local_port = re->local_port;
-			cev.sec_remote_port = re->remote_port;
-			cev.sec_tcp_state = re->state;
-			if (re->af == 2) {
-				fmt_ipv4(cev.sec_local_addr,
-					 sizeof(cev.sec_local_addr),
-					 re->local_addr);
-				fmt_ipv4(cev.sec_remote_addr,
-					 sizeof(cev.sec_remote_addr),
-					 re->remote_addr);
-			} else if (re->af == 10) {
-				inet_ntop(AF_INET6, re->local_addr,
-					  cev.sec_local_addr,
-					  sizeof(cev.sec_local_addr));
-				inet_ntop(AF_INET6, re->remote_addr,
-					  cev.sec_remote_addr,
-					  sizeof(cev.sec_remote_addr));
-			}
+			resolve_cgroup_fast_ts(re->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 			pwd_lookup_ts(re->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3232,60 +3316,28 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-			cev.timestamp_ns = se_syn->timestamp_ns + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), "syn_recv");
-			cev.pid = se_syn->tgid;
-			cev.uid = se_syn->uid;
-			memcpy(cev.comm, se_syn->comm, COMM_LEN);
-			resolve_cgroup_fast_ts(se_syn->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
+			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
+
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd,
 						&se_syn->tgid, &ti) == 0) {
-				if (ti.rule_id < num_rules)
-					fast_strcpy(cev.rule, sizeof(cev.rule),
-						    rules[ti.rule_id].name);
-				cev.root_pid = ti.root_pid;
-				ensure_tags(se_syn->tgid, cev.tags,
-					       sizeof(cev.tags));
+				fill_from_track_info(&cev, &ti, 1);
+				ensure_tags(se_syn->tgid, cev.tags, sizeof(cev.tags));
 			}
-			/* Identity из proc_map */
+
+			/* proc_info enrichment, then BPF event overrides */
 			{
 				struct proc_info pi_syn;
 				if (bpf_map_lookup_elem(proc_map_fd,
 							&se_syn->tgid,
-							&pi_syn) == 0) {
-					cev.loginuid  = pi_syn.loginuid;
-					cev.sessionid = pi_syn.sessionid;
-					cev.euid      = pi_syn.euid;
-					cev.tty_nr    = pi_syn.tty_nr;
-					cev.state = pi_syn.state;
-					cev.start_time_ns = pi_syn.start_ns ? pi_syn.start_ns + (__u64)g_boot_to_wall_ns : 0;
-					cmdline_split(pi_syn.cmdline, pi_syn.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					fill_net_bytes(&cev, &pi_syn);
-				}
+							&pi_syn) == 0)
+					fill_from_proc_info(&cev, &pi_syn);
 			}
-			cev.sec_af = se_syn->af;
-			cev.sec_local_port = se_syn->local_port;
-			cev.sec_remote_port = se_syn->remote_port;
-			if (se_syn->af == 2) {
-				fmt_ipv4(cev.sec_local_addr,
-					 sizeof(cev.sec_local_addr),
-					 se_syn->local_addr);
-				fmt_ipv4(cev.sec_remote_addr,
-					 sizeof(cev.sec_remote_addr),
-					 se_syn->remote_addr);
-			} else if (se_syn->af == 10) {
-				inet_ntop(AF_INET6, se_syn->local_addr,
-					  cev.sec_local_addr,
-					  sizeof(cev.sec_local_addr));
-				inet_ntop(AF_INET6, se_syn->remote_addr,
-					  cev.sec_remote_addr,
-					  sizeof(cev.sec_remote_addr));
-			}
+			fill_from_syn_event(&cev, se_syn);
+
+			resolve_cgroup_fast_ts(se_syn->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 			pwd_lookup_ts(se_syn->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3312,60 +3364,28 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    rste->direction ? "rst_recv" : "rst_sent");
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-			cev.timestamp_ns = rste->timestamp_ns + (__u64)g_boot_to_wall_ns;
-			fast_strcpy(cev.event_type, sizeof(cev.event_type), rste->direction ? "rst_recv" : "rst_sent");
-			cev.pid = rste->tgid;
-			cev.uid = rste->uid;
-			memcpy(cev.comm, rste->comm, COMM_LEN);
-			resolve_cgroup_fast_ts(rste->cgroup_id, cev.cgroup,
-					       sizeof(cev.cgroup));
+
 			struct track_info ti;
 			if (bpf_map_lookup_elem(tracked_map_fd, &rste->tgid, &ti) == 0) {
-				if (ti.rule_id < num_rules)
-					fast_strcpy(cev.rule, sizeof(cev.rule),
-						    rules[ti.rule_id].name);
-				cev.root_pid = ti.root_pid;
-				ensure_tags(rste->tgid, cev.tags,
-					       sizeof(cev.tags));
+				fill_from_track_info(&cev, &ti, 1);
+				ensure_tags(rste->tgid, cev.tags, sizeof(cev.tags));
 			}
-			/* Identity из proc_map */
+
+			/* proc_info enrichment, then BPF event overrides */
 			{
 				struct proc_info pi_rst;
 				if (bpf_map_lookup_elem(proc_map_fd,
 							&rste->tgid,
-							&pi_rst) == 0) {
-					cev.loginuid  = pi_rst.loginuid;
-					cev.sessionid = pi_rst.sessionid;
-					cev.euid      = pi_rst.euid;
-					cev.tty_nr    = pi_rst.tty_nr;
-					cev.state = pi_rst.state;
-					cev.start_time_ns = pi_rst.start_ns ? pi_rst.start_ns + (__u64)g_boot_to_wall_ns : 0;
-					cmdline_split(pi_rst.cmdline, pi_rst.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					fill_net_bytes(&cev, &pi_rst);
-				}
+							&pi_rst) == 0)
+					fill_from_proc_info(&cev, &pi_rst);
 			}
-			cev.sec_af = rste->af;
-			cev.sec_local_port = rste->local_port;
-			cev.sec_remote_port = rste->remote_port;
-			cev.sec_direction = rste->direction;
-			if (rste->af == 2) {
-				fmt_ipv4(cev.sec_local_addr,
-					 sizeof(cev.sec_local_addr),
-					 rste->local_addr);
-				fmt_ipv4(cev.sec_remote_addr,
-					 sizeof(cev.sec_remote_addr),
-					 rste->remote_addr);
-			} else if (rste->af == 10) {
-				inet_ntop(AF_INET6, rste->local_addr,
-					  cev.sec_local_addr,
-					  sizeof(cev.sec_local_addr));
-				inet_ntop(AF_INET6, rste->remote_addr,
-					  cev.sec_remote_addr,
-					  sizeof(cev.sec_remote_addr));
-			}
+			fill_from_rst_event(&cev, rste);
+
+			resolve_cgroup_fast_ts(rste->cgroup_id, cev.cgroup,
+					       sizeof(cev.cgroup));
 			pwd_lookup_ts(rste->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -4450,59 +4470,11 @@ static void write_snapshot(void)
 					ensure_tags(key, cev.tags, sizeof(cev.tags));
 			}
 #endif
-			cev.root_pid = tracked ? ti.root_pid : 0;
-			cev.pid = pi.tgid;
-			cev.ppid = pi.ppid;
-			cev.uid = pi.uid;
-			memcpy(cev.comm, pi.comm, COMM_LEN);
-			memcpy(cev.thread_name, pi.thread_name, COMM_LEN);
-			cmdline_split(pi.cmdline, pi.cmdline_len, cev.exec_path, sizeof(cev.exec_path), cev.args, sizeof(cev.args));
+			fill_from_track_info(&cev, &ti, tracked);
+			fill_from_proc_info(&cev, &pi);
 			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
-			cev.is_root = tracked ? ti.is_root : 0;
-			cev.state = pi.state;
-			cev.cpu_ns = pi.cpu_ns;
 			cev.cpu_usage_ratio = cpu_ratio;
-			cev.rss_bytes = pi.rss_pages * page_size;
-			cev.rss_min_bytes = pi.rss_min_pages * page_size;
-			cev.rss_max_bytes = pi.rss_max_pages * page_size;
-			cev.shmem_bytes = pi.shmem_pages * page_size;
-			cev.swap_bytes = pi.swap_pages * page_size;
-			cev.vsize_bytes = pi.vsize_pages * page_size;
-			cev.io_read_bytes = pi.io_read_bytes;
-			cev.io_write_bytes = pi.io_write_bytes;
-			cev.maj_flt = pi.maj_flt;
-			cev.min_flt = pi.min_flt;
-			cev.nvcsw = pi.nvcsw;
-			cev.nivcsw = pi.nivcsw;
-			cev.threads = pi.threads;
-			cev.oom_score_adj = pi.oom_score_adj;
-			cev.oom_killed = pi.oom_killed;
-			cev.net_tcp_tx_bytes = pi.net_tcp_tx_bytes;
-			cev.net_tcp_rx_bytes = pi.net_tcp_rx_bytes;
-			cev.net_udp_tx_bytes = pi.net_udp_tx_bytes;
-			cev.net_udp_rx_bytes = pi.net_udp_rx_bytes;
-			cev.start_time_ns = pi.start_ns + (__u64)g_boot_to_wall_ns;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
-
-			cev.loginuid       = pi.loginuid;
-			cev.sessionid      = pi.sessionid;
-			cev.euid           = pi.euid;
-			cev.tty_nr         = pi.tty_nr;
-			cev.sched_policy   = pi.sched_policy;
-			cev.io_rchar       = pi.io_rchar;
-			cev.io_wchar       = pi.io_wchar;
-			cev.io_syscr       = pi.io_syscr;
-			cev.io_syscw       = pi.io_syscw;
-			cev.file_opens     = pi.file_opens;
-			cev.socket_creates = pi.socket_creates;
-			cev.mnt_ns_inum    = pi.mnt_ns_inum;
-			cev.pid_ns_inum    = pi.pid_ns_inum;
-			cev.net_ns_inum    = pi.net_ns_inum;
-			cev.cgroup_ns_inum = pi.cgroup_ns_inum;
-
-			cev.preempted_by_pid = pi.preempted_by_pid;
-			memcpy(cev.preempted_by_comm,
-			       pi.preempted_by_comm, COMM_LEN);
 
 			pwd_lookup_ts(pi.tgid, cev.pwd, sizeof(cev.pwd));
 
@@ -4573,20 +4545,13 @@ static void write_snapshot(void)
 				 * уже не в tracked_map (короткоживущий). */
 				if (tracked || si.status == SOCK_STATUS_CLOSED)
 				{
-					const char *rname =
-						(tracked && ti.rule_id < num_rules)
-						? rules[ti.rule_id].name
-						: RULE_NOT_MATCH;
-
 					struct metric_event cev;
 					memset(&cev, 0, sizeof(cev));
 					cev.timestamp_ns = snap_timestamp_ns;
 					fast_strcpy(cev.event_type,
 						    sizeof(cev.event_type),
 						    "conn_snapshot");
-					fast_strcpy(cev.rule,
-						    sizeof(cev.rule),
-						    rname);
+					fill_from_track_info(&cev, &ti, tracked);
 #ifndef NO_TAGS
 					{
 						const char *cs_tags = tags_lookup_copy(
@@ -4597,33 +4562,19 @@ static void write_snapshot(void)
 							ensure_tags(si.tgid, cev.tags, sizeof(cev.tags));
 					}
 #endif
-					cev.root_pid = tracked ? ti.root_pid : 0;
 					cev.pid = si.tgid;
 					cev.uid = si.uid;
-					cev.is_root = tracked ? ti.is_root : 0;
 
 					/* comm, ppid, identity из proc_map */
 					struct proc_info cpi;
 					if (bpf_map_lookup_elem(
 						proc_map_fd,
 						&si.tgid, &cpi) == 0) {
-						cev.ppid = cpi.ppid;
+						fill_from_proc_info(&cev, &cpi);
 						cev.state = 0;  /* state set to L/E below */
-						memcpy(cev.comm, cpi.comm,
-						       COMM_LEN);
-						memcpy(cev.thread_name,
-						       cpi.thread_name,
-						       COMM_LEN);
-						cev.loginuid  = cpi.loginuid;
-						cev.sessionid = cpi.sessionid;
-						cev.euid      = cpi.euid;
-						cev.tty_nr    = cpi.tty_nr;
-						cev.start_time_ns = cpi.start_ns ? cpi.start_ns + (__u64)g_boot_to_wall_ns : 0;
-						cmdline_split(cpi.cmdline, cpi.cmdline_len,
-							      cev.exec_path, sizeof(cev.exec_path),
-							      cev.args, sizeof(cev.args));
-						fill_net_bytes(&cev, &cpi);
 					}
+					cev.pid = si.tgid;
+					cev.uid = si.uid;
 
 					/* IP-адреса */
 					if (si.af == 2) {
