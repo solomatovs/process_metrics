@@ -908,18 +908,18 @@ static int try_track_pid(__u32 pid)
  * Если tags_ht пуст (fork event ещё не обработан) — читает cmdline,
  * матчит правила и сохраняет в tags_ht + копирует в buf.
  */
-static void ensure_tags(__u32 tgid, char *buf, int buflen)
+/*
+ * ensure_tags_from_cmdline — матчит теги по готовому cmdline (raw, NUL-separated).
+ * Общая логика для ensure_tags и ensure_tags_bpf_event.
+ */
+static void ensure_tags_from_cmdline(__u32 tgid, char *buf, int buflen,
+				     const char *cmdline_raw, int cmdline_len)
 {
-	tags_lookup_ts(tgid, buf, buflen);
-	if (buf[0])
-		return;
-
-	char cmdline_raw[CMDLINE_MAX];
-	int clen = read_proc_cmdline(tgid, cmdline_raw, sizeof(cmdline_raw));
-	if (clen <= 0)
+	if (cmdline_len <= 0)
 		return;
 
 	char cmdline_str[CMDLINE_MAX + 1];
+	int clen = cmdline_len < CMDLINE_MAX ? cmdline_len : CMDLINE_MAX - 1;
 	cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str, sizeof(cmdline_str));
 
 	char tags_buf[TAGS_MAX_LEN];
@@ -927,6 +927,55 @@ static void ensure_tags(__u32 tgid, char *buf, int buflen)
 		tags_store_ts(tgid, tags_buf);
 		snprintf(buf, buflen, "%s", tags_buf);
 	}
+}
+
+/*
+ * ensure_tags — гарантирует наличие тегов для процесса.
+ * Источник cmdline: proc_map BPF-карта (O(1) hash lookup).
+ * Используется для событий без встроенного cmdline (file, net, signal, snapshot).
+ */
+static void ensure_tags(__u32 tgid, char *buf, int buflen)
+{
+	tags_lookup_ts(tgid, buf, buflen);
+	if (buf[0])
+		return;
+
+	if (proc_map_fd < 0)
+		return;
+
+	struct proc_info pi;
+	if (bpf_map_lookup_elem(proc_map_fd, &tgid, &pi) != 0 ||
+	    pi.cmdline_len == 0)
+		return;
+
+	ensure_tags_from_cmdline(tgid, buf, buflen, pi.cmdline, pi.cmdline_len);
+}
+
+/*
+ * ensure_tags_event — гарантирует наличие тегов для proc-события (fork/exit/oom).
+ * Использует cmdline из struct event (всегда доступен), с fallback на proc_map.
+ */
+static void ensure_tags_event(__u32 tgid, char *buf, int buflen,
+			      const char *ev_cmdline, __u16 ev_cmdline_len)
+{
+	tags_lookup_ts(tgid, buf, buflen);
+	if (buf[0])
+		return;
+
+	/* Сначала proc_map (может содержать обновлённый cmdline после refresh) */
+	if (proc_map_fd >= 0) {
+		struct proc_info pi;
+		if (bpf_map_lookup_elem(proc_map_fd, &tgid, &pi) == 0 &&
+		    pi.cmdline_len > 0) {
+			ensure_tags_from_cmdline(tgid, buf, buflen,
+						 pi.cmdline, pi.cmdline_len);
+			if (buf[0])
+				return;
+		}
+	}
+
+	/* Fallback: cmdline из BPF ring buffer события */
+	ensure_tags_from_cmdline(tgid, buf, buflen, ev_cmdline, ev_cmdline_len);
 }
 
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
@@ -3415,7 +3464,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
 			char fork_tags[TAGS_MAX_LEN];
-			ensure_tags(e->tgid, fork_tags, sizeof(fork_tags));
+			ensure_tags_event(e->tgid, fork_tags, sizeof(fork_tags),
+					  e->cmdline, e->cmdline_len);
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "fork", rname,
 				       fork_tags, cg_buf);
@@ -3460,7 +3510,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		 * │  Используем bare-функции (без _ts), т.к. wrlock         │
 		 * │  уже взят вручную.                                       │
 		 * └───────────────────────────────────────────────────────────┘ */
-		ensure_tags(e->tgid, exit_tags, sizeof(exit_tags));
+		ensure_tags_event(e->tgid, exit_tags, sizeof(exit_tags),
+				  e->cmdline, e->cmdline_len);
 #endif
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
@@ -3534,7 +3585,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
 			char oom_tags[TAGS_MAX_LEN];
-			ensure_tags(e->tgid, oom_tags, sizeof(oom_tags));
+			ensure_tags_event(e->tgid, oom_tags, sizeof(oom_tags),
+					  e->cmdline, e->cmdline_len);
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname,
 				       oom_tags, cg_buf);
