@@ -191,9 +191,7 @@ static int tracked_map_fd, proc_map_fd, missed_exec_fd;
  *   wrlock: cgroup_mkdir/rmdir/rename (BPF events), reload (rebuild)
  *   rdlock: FILE_CLOSE, NET_CLOSE, SIGNAL (resolve_cgroup_fast)
  */
-#ifndef NO_TAGS
 static pthread_rwlock_t g_tags_lock    = PTHREAD_RWLOCK_INITIALIZER;
-#endif
 static pthread_rwlock_t g_cgroup_lock  = PTHREAD_RWLOCK_INITIALIZER;
 static pthread_rwlock_t g_pidtree_lock = PTHREAD_RWLOCK_INITIALIZER;
 
@@ -282,22 +280,6 @@ static void refresh_boot_to_wall(void)
 
 #define TAGS_MAX_LEN EV_TAGS_LEN
 
-#ifdef NO_TAGS
-/*
- * NO_TAGS build: все операции с тегами — no-op.
- * Собирается через: make binary NO_TAGS=1
- * Используется для бенчмаркинга — замер overhead тегов.
- */
-static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
-{ (void)tgid; if (buflen > 0) buf[0] = '\0'; }
-static void tags_store_ts(__u32 tgid, const char *tags)
-{ (void)tgid; (void)tags; }
-static void tags_inherit_ts(__u32 child, __u32 parent)
-{ (void)child; (void)parent; }
-static void tags_remove_ts(__u32 tgid) { (void)tgid; }
-static void tags_clear_ts(void) { }
-
-#else /* !NO_TAGS */
 
 static __u32 tags_tgid[TAGS_HT_SIZE];              /*  64 KB — компактный индекс */
 static char  tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
@@ -475,8 +457,6 @@ static void tags_clear_ts(void)
 	tags_clear();
 	pthread_rwlock_unlock(&g_tags_lock);
 }
-
-#endif /* NO_TAGS */
 
 /* ── pid tree: глобальная хеш-таблица pid→ppid для цепочек предков ───
  *
@@ -741,6 +721,47 @@ static int event_emit_enabled(enum event_type type)
  * Классификаторы типов событий.
  * Каждая функция — одна группа, используется вместо цепочек if (type == X || ...).
  */
+/*
+ * Проверяет, нужно ли формировать metric_event и отправлять в CSV.
+ * Объединяет: тип разрешён в конфиге + HTTP-сервер включён.
+ */
+static int should_emit_event(enum event_type type)
+{
+	return g_http_cfg.enabled && event_emit_enabled(type);
+}
+
+/*
+ * Проверяет, нужно ли формировать snapshot событие.
+ */
+static int should_emit_snapshot(void)
+{
+	return g_http_cfg.enabled;
+}
+
+static int should_emit_conn_snapshot(void)
+{
+	return cfg_net_tracking_enabled && g_http_cfg.enabled;
+}
+
+static int should_emit_icmp(void)
+{
+	return cfg_icmp_tracking && g_http_cfg.enabled;
+}
+
+static int should_emit_disk(void)
+{
+	return cfg_disk_tracking_enabled && g_http_cfg.enabled;
+}
+
+/*
+ * Проверяет, нужно ли включать соединение в conn_snapshot.
+ * CLOSED: записываем даже если процесс не в tracked_map (короткоживущий).
+ */
+static int should_include_conn(int tracked, __u8 sock_status)
+{
+	return tracked || sock_status == SOCK_STATUS_CLOSED;
+}
+
 static int is_file_data_event(enum event_type t)
 {
 	return t == EVENT_FILE_CLOSE || t == EVENT_FILE_OPEN;
@@ -3175,9 +3196,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 		return 0;
 	__u32 type = *(const __u32 *)data;
 
-	/* Единая проверка: отправка этого типа события разрешена в конфиге? */
-	if (!event_emit_enabled((enum event_type)type))
-		return 0;
 
 	/* ── FILE_CLOSE — закрытие отслеживаемого файла ──────────────────
 	 *
@@ -3214,7 +3232,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* emit guard: проверяем нужно ли отправлять это событие в CSV */
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
@@ -3255,7 +3273,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) != 0)
 			return 0;
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 
@@ -3336,7 +3354,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  (unsigned long long)ne->rx_bytes,
 			  (unsigned long long)(ne->duration_ns / NS_PER_MS));
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
@@ -3405,7 +3423,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  se->sig_code, se->sig_result, rname,
 			  se->sender_comm);
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), "signal");
@@ -3477,7 +3495,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  re->tgid, re->local_port, re->remote_port,
 			  re->state);
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
@@ -3523,7 +3541,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  se_syn->tgid, se_syn->local_port,
 			  se_syn->remote_port);
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
@@ -3570,7 +3588,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  rste->tgid, rste->local_port, rste->remote_port,
 			  rste->direction ? "recv" : "sent");
 
-		if (g_http_cfg.enabled) {
+		if (should_emit_event(type)) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
@@ -3656,7 +3674,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  e->comm);
 
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
-			if (cfg_emit_exec && g_http_cfg.enabled) {
+			if (should_emit_event(EVENT_EXEC)) {
 				char cg_buf[PATH_MAX_LEN];
 				resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 						       sizeof(cg_buf));
@@ -3695,7 +3713,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		}
 
 		/* Отправляем fork-событие в буферный файл */
-		if (cfg_emit_fork && g_http_cfg.enabled) {
+		if (should_emit_event(EVENT_FORK)) {
 			const char *rname = (parent_ti.rule_id < num_rules)
 				? rules[parent_ti.rule_id].name : RULE_NOT_MATCH;
 			char cg_buf[PATH_MAX_LEN];
@@ -3736,21 +3754,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			? rules[exit_rule_id].name : RULE_NOT_MATCH;
 
 		char exit_tags[TAGS_MAX_LEN];
-#ifdef NO_TAGS
-		exit_tags[0] = '\0';
-#else
-		/* ┌───────────────────────────────────────────────────────────┐
-		 * │  ОПТИМИЗАЦИЯ 3: Объединённый lock для EXIT-обработчика   │
-		 * ├───────────────────────────────────────────────────────────┤
-		 * │  Все tags-операции EXIT (lookup, inherit, remove)        │
-		 * │  выполняются под ОДНИМ wrlock вместо отдельных           │
-		 * │  lock/unlock циклов для каждой операции.                 │
-		 * │  Используем bare-функции (без _ts), т.к. wrlock         │
-		 * │  уже взят вручную.                                       │
-		 * └───────────────────────────────────────────────────────────┘ */
 		ensure_tags_event(e->tgid, exit_tags, sizeof(exit_tags),
 				  e->cmdline, e->cmdline_len);
-#endif
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
 		int sig = e->exit_code & EXIT_SIG_MASK;
@@ -3764,7 +3769,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  e->oom_killed ? " [OOM]" : "");
 
 		/* Отправляем exit-событие в буферный файл */
-		if (cfg_emit_exit && g_http_cfg.enabled) {
+		if (should_emit_event(EVENT_EXIT)) {
 			char cg_buf[PATH_MAX_LEN];
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
@@ -3818,7 +3823,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		       (unsigned long long)(e->rss_pages * 4 / 1024));
 
 		/* Отправляем oom_kill-событие в буферный файл */
-		if (cfg_emit_oom_kill && g_http_cfg.enabled) {
+		if (should_emit_event(EVENT_OOM_KILL)) {
 			char cg_buf[PATH_MAX_LEN];
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
@@ -4063,7 +4068,6 @@ static int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 	return disk_count;
 }
 
-#ifndef NO_TAGS
 /*
  * Поиск тегов в локальной копии (без lock).
  * snap_tgid/snap_data — snapshot, сделанный через memcpy под кратким rdlock
@@ -4084,7 +4088,6 @@ static const char *tags_lookup_copy(const __u32 *snap_tgid,
 	}
 	return "";
 }
-#endif
 
 /*
  * refresh_processes — тяжёлый I/O: обновление /proc, cgroup sysfs, flush агрегатов.
@@ -4347,7 +4350,7 @@ static void refresh_processes(void)
 		  refresh_count, early_cleanup_count, all_keys_count);
 
 	/* Flush ICMP агрегатов → ef_append */
-	if (cfg_icmp_tracking && g_http_cfg.enabled) {
+	if (should_emit_icmp()) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
 		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
@@ -4405,7 +4408,7 @@ static void refresh_processes(void)
 	}
 
 	/* Disk usage → ef_append */
-	if (g_http_cfg.enabled && cfg_disk_tracking_enabled) {
+	if (should_emit_disk()) {
 		struct timespec now_ts;
 		clock_gettime(CLOCK_REALTIME, &now_ts);
 		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
@@ -4513,7 +4516,6 @@ static void write_snapshot(void)
 		}
 	}
 
-#ifndef NO_TAGS
 	/* ОПТИМИЗАЦИЯ 4: копируем tags под кратким rdlock */
 	static __u32 snap_tgid[TAGS_HT_SIZE];
 	static char  snap_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
@@ -4521,7 +4523,6 @@ static void write_snapshot(void)
 	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
 	memcpy(snap_data, tags_data, sizeof(tags_data));
 	pthread_rwlock_unlock(&g_tags_lock);
-#endif
 
 	/* Snapshot pid tree для цепочек предков (512 КБ, ~0.1ms) */
 	static __u32 snap_pt_pid[PIDTREE_HT_SIZE];
@@ -4640,14 +4641,13 @@ static void write_snapshot(void)
 		cpu_prev_update(key, pi.cpu_ns);
 
 		/* Формирование события snapshot */
-		if (g_http_cfg.enabled) {
+		if (should_emit_snapshot()) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			cev.timestamp_ns = snap_timestamp_ns;
 			snprintf(cev.event_type, sizeof(cev.event_type),
 				 "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
-#ifndef NO_TAGS
 			{
 				const char *snap_tags = tags_lookup_copy(snap_tgid, snap_data, key);
 				if (snap_tags[0])
@@ -4655,7 +4655,6 @@ static void write_snapshot(void)
 				else
 					ensure_tags(key, cev.tags, sizeof(cev.tags));
 			}
-#endif
 			fill_from_track_info(&cev, &ti, tracked);
 			fill_from_proc_info(&cev, &pi);
 			fill_cgroup(&cev, pi.cgroup_id);
@@ -4695,7 +4694,7 @@ static void write_snapshot(void)
 
 	/* ── conn_snapshot: метрики живых TCP-соединений ──────────────── */
 	int conn_count = 0;
-	if (cfg_net_tracking_enabled && g_http_cfg.enabled) {
+	if (should_emit_conn_snapshot()) {
 		int sm_fd = bpf_map__fd(skel->maps.sock_map);
 
 		int closed_sock_count = 0;
@@ -4714,9 +4713,7 @@ static void write_snapshot(void)
 				struct track_info ti;
 				int tracked = bpf_map_lookup_elem(tracked_map_fd,
 								  &si.tgid, &ti) == 0;
-				/* CLOSED: записываем snapshot даже если процесс
-				 * уже не в tracked_map (короткоживущий). */
-				if (tracked || si.status == SOCK_STATUS_CLOSED)
+				if (should_include_conn(tracked, si.status))
 				{
 					struct metric_event cev;
 					memset(&cev, 0, sizeof(cev));
@@ -4725,7 +4722,6 @@ static void write_snapshot(void)
 						    sizeof(cev.event_type),
 						    "conn_snapshot");
 					fill_from_track_info(&cev, &ti, tracked);
-#ifndef NO_TAGS
 					{
 						const char *cs_tags = tags_lookup_copy(
 							snap_tgid, snap_data, si.tgid);
@@ -4734,7 +4730,6 @@ static void write_snapshot(void)
 						else
 							ensure_tags(si.tgid, cev.tags, sizeof(cev.tags));
 					}
-#endif
 					struct proc_info cpi;
 					if (bpf_map_lookup_elem(
 						proc_map_fd,
