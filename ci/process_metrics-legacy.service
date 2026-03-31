@@ -75,7 +75,10 @@ RestartSec=5
 
 # --- Ограничение ресурсов ---
 # MemoryLimit — cgroup v1 аналог MemoryMax.
-MemoryLimit=768M
+# Начиная с ядра 5.11 память BPF-карт и ring buffer учитывается
+# в cgroup memcg (а не в RLIMIT_MEMLOCK). Ring buffers (~386 МБ) +
+# hash maps (~110 МБ) + RSS процесса требуют > 768 МБ.
+MemoryLimit=1536M
 CPUQuota=25%
 
 # --- Hardening ---

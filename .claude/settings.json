@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(__NEW_LINE_1f88dc499131d213__ PASS='svnjR$3gj')",
-      "Bash(docker exec clickhouse-01 clickhouse-client --password \"$PASS\" --query \":*)"
-    ]
-  }
-}
