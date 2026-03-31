@@ -27,7 +27,7 @@ static const char CSV_HEADER_STR[] =
 	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,socket_creates,"
 	"maj_flt,min_flt,"
 	"nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
-	"net_tx_bytes,net_rx_bytes,"
+	"net_tcp_tx_bytes,net_tcp_rx_bytes,net_udp_tx_bytes,net_udp_rx_bytes,"
 	"start_time_ns,uptime_seconds,"
 	"mnt_ns,pid_ns,net_ns,cgroup_ns,"
 	"preempted_by_pid,preempted_by_comm,"
@@ -396,8 +396,10 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->oom_killed);
 
 	/* ── сеть процесса ──────────────────────────────────────────── */
-	U64(ev->net_tx_bytes);
-	U64(ev->net_rx_bytes);
+	U64(ev->net_tcp_tx_bytes);
+	U64(ev->net_tcp_rx_bytes);
+	U64(ev->net_udp_tx_bytes);
+	U64(ev->net_udp_rx_bytes);
 
 	/* ── время ───────────────────────────────────────────────────── */
 	U64(ev->start_time_ns);

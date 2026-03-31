@@ -57,7 +57,6 @@
 #define BPF_ARGS_MAP_SIZE    8192   /* временные аргументы syscall (per-CPU inflight) */
 #define BPF_FD_MAP_SIZE      65536  /* отслеживание файловых дескрипторов */
 #define BPF_MISSED_EXEC_SIZE 1024   /* пропущенные exec для восстановления */
-#define BPF_UDP_AGG_SIZE     16384  /* агрегация UDP-трафика */
 #define BPF_ICMP_AGG_SIZE    8192   /* агрегация ICMP-трафика */
 
 /* ── poll-потоки и heartbeat ───────────────────────────────────────── */
@@ -376,8 +375,10 @@ struct proc_info {
 	__s16 oom_score_adj;     /* signal->oom_score_adj */
 	__u64 cgroup_id;         /* inode cgroup v2 */
 	__u8  state;             /* состояние процесса: 'R','S','D','T','Z',... */
-	__u64 net_tx_bytes;      /* TCP+UDP отправлено байт */
-	__u64 net_rx_bytes;      /* TCP+UDP получено байт */
+	__u64 net_tcp_tx_bytes;  /* TCP отправлено байт */
+	__u64 net_tcp_rx_bytes;  /* TCP получено байт */
+	__u64 net_udp_tx_bytes;  /* UDP отправлено байт */
+	__u64 net_udp_rx_bytes;  /* UDP получено байт */
 	char  comm[COMM_LEN];          /* group leader comm */
 	char  thread_name[COMM_LEN];   /* thread-specific comm (может отличаться от comm) */
 	char  cmdline[CMDLINE_MAX];
@@ -462,8 +463,10 @@ struct event {
 	__u32 exit_code;
 	__u64 start_ns;
 	__u8  oom_killed;
-	__u64 net_tx_bytes;
-	__u64 net_rx_bytes;
+	__u64 net_tcp_tx_bytes;
+	__u64 net_tcp_rx_bytes;
+	__u64 net_udp_tx_bytes;
+	__u64 net_udp_rx_bytes;
 
 	/* ── идентификация ──────────────────────────────────────── */
 	__u32 loginuid;
@@ -590,7 +593,6 @@ struct sec_config {
 	__u8 tcp_retransmit;     /* 1 = отслеживать TCP-ретрансмиты */
 	__u8 tcp_syn;            /* 1 = отслеживать SYN-recv события */
 	__u8 tcp_rst;            /* 1 = отслеживать RST-события */
-	__u8 udp_bytes;          /* 1 = учёт UDP байтов/пакетов по (addr, port) */
 	__u8 icmp_tracking;      /* 1 = агрегировать ICMP-пакеты */
 	__u8 tcp_open_conns;     /* 1 = считать открытые TCP-соединения */
 };
@@ -648,22 +650,6 @@ struct rst_event {
 	__u8  direction;      /* 0 = отправлен, 1 = получен */
 };
 
-/*
- * Агрегация UDP (BPF-карта, сбрасывается из userspace при snapshot).
- */
-struct udp_agg_key {
-	__u32 tgid;
-	__u8  af;
-	__u8  remote_addr[16];
-	__u16 remote_port;
-} __attribute__((aligned(8)));
-
-struct udp_agg_val {
-	__u64 tx_packets;
-	__u64 rx_packets;
-	__u64 tx_bytes;
-	__u64 rx_bytes;
-};
 
 /*
  * Агрегация ICMP (BPF-карта, сбрасывается из userspace при snapshot).

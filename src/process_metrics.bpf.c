@@ -1120,8 +1120,10 @@ int handle_exit(void *ctx)
 		e->ppid          = info->ppid;
 		e->cmdline_len   = info->cmdline_len;
 		e->oom_killed    = info->oom_killed;
-		e->net_tx_bytes  = info->net_tx_bytes;
-		e->net_rx_bytes  = info->net_rx_bytes;
+		e->net_tcp_tx_bytes  = info->net_tcp_tx_bytes;
+		e->net_tcp_rx_bytes  = info->net_tcp_rx_bytes;
+		e->net_udp_tx_bytes  = info->net_udp_tx_bytes;
+		e->net_udp_rx_bytes  = info->net_udp_rx_bytes;
 		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
 		e->loginuid      = info->loginuid;
@@ -2776,8 +2778,7 @@ int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
 		return 0;
 
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
-							&pid_tgid);
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map, &pid_tgid);
 	__u64 sk_ptr = args ? args->sock_ptr : 0;
 	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
 
@@ -2785,7 +2786,7 @@ int BPF_KRETPROBE(ret_tcp_sendmsg, int ret)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
-		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
+		__sync_fetch_and_add(&info->net_tcp_tx_bytes, (__u64)ret);
 
 	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
@@ -2823,7 +2824,7 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
-		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
+		__sync_fetch_and_add(&info->net_tcp_rx_bytes, (__u64)ret);
 
 	/* На соединение (если сокет есть в sock_map) */
 	if (sk_ptr) {
@@ -2836,17 +2837,51 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 	return 0;
 }
 
-/* ── UDP: агрегат байт на процесс (без жизненного цикла соединений) ── */
+/* ── udp_sendmsg / udp_recvmsg: байты на соединение + на процесс ─── */
+
+SEC("kprobe/udp_sendmsg")
+int BPF_KPROBE(kp_udp_sendmsg, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
+	return 0;
+}
 
 SEC("kretprobe/udp_sendmsg")
 int BPF_KRETPROBE(ret_udp_sendmsg, int ret)
 {
 	if (ret <= 0)
 		return 0;
-	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map, &pid_tgid);
+	__u64 sk_ptr = args ? args->sock_ptr : 0;
+	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
+
+	/* Агрегат на процесс (всегда, если отслеживается) */
+	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
-		__sync_fetch_and_add(&info->net_tx_bytes, (__u64)ret);
+		__sync_fetch_and_add(&info->net_udp_tx_bytes, (__u64)ret);
+
+	/* На соединение (если сокет есть в sock_map) */
+	if (sk_ptr) {
+		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+		if (si) {
+			__sync_fetch_and_add(&si->tx_bytes, (__u64)ret);
+			__sync_fetch_and_add(&si->tx_calls, 1);
+		}
+	}
+	return 0;
+}
+
+SEC("kprobe/udp_recvmsg")
+int BPF_KPROBE(kp_udp_recvmsg, struct sock *sk)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
 
@@ -2855,10 +2890,27 @@ int BPF_KRETPROBE(ret_udp_recvmsg, int ret)
 {
 	if (ret <= 0)
 		return 0;
-	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
+							&pid_tgid);
+	__u64 sk_ptr = args ? args->sock_ptr : 0;
+	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
+
+	/* Агрегат на процесс (всегда, если отслеживается) */
+	__u32 tgid = (__u32)(pid_tgid >> 32);
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
-		__sync_fetch_and_add(&info->net_rx_bytes, (__u64)ret);
+		__sync_fetch_and_add(&info->net_udp_rx_bytes, (__u64)ret);
+
+	/* На соединение (если сокет есть в sock_map) */
+	if (sk_ptr) {
+		struct sock_info *si = bpf_map_lookup_elem(&sock_map, &sk_ptr);
+		if (si) {
+			__sync_fetch_and_add(&si->rx_bytes, (__u64)ret);
+			__sync_fetch_and_add(&si->rx_calls, 1);
+		}
+	}
 	return 0;
 }
 
@@ -2870,14 +2922,6 @@ struct {
 	__type(key, __u32);
 	__type(value, struct sec_config);
 } sec_cfg SEC(".maps");
-
-/* Карта агрегации UDP — сбрасывается из userspace при snapshot */
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, BPF_UDP_AGG_SIZE);
-	__type(key, struct udp_agg_key);
-	__type(value, struct udp_agg_val);
-} udp_agg_map SEC(".maps");
 
 /* Карта агрегации ICMP — сбрасывается из userspace при snapshot */
 struct {
@@ -2903,9 +2947,8 @@ static __always_inline int sec_enabled(int offset)
 #define SEC_TCP_RETRANSMIT  0
 #define SEC_TCP_SYN         1
 #define SEC_TCP_RST         2
-#define SEC_UDP_BYTES       3
-#define SEC_ICMP_TRACKING   4
-#define SEC_OPEN_CONN_COUNT 5
+#define SEC_ICMP_TRACKING   3
+#define SEC_OPEN_CONN_COUNT 4
 
 /*
  * Вспомогательная функция: читает адреса сокета в плоские поля
@@ -3201,127 +3244,6 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 	return 0;
 }
 
-/* ── UDP flood: kprobe вход + kretprobe агрегация ────────────────── */
-
-/* Сохраняем указатель на sock при входе для извлечения адресов */
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);           /* pid_tgid */
-	__type(value, struct sendmsg_args);
-} udp_sendmsg_args SEC(".maps");
-
-SEC("kprobe/udp_sendmsg")
-int BPF_KPROBE(kp_udp_sendmsg_sec, struct sock *sk)
-{
-	if (!sec_enabled(SEC_UDP_BYTES))
-		return 0;
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 tgid = (__u32)(pid_tgid >> 32);
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
-	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
-	return 0;
-}
-
-SEC("kretprobe/udp_sendmsg")
-int BPF_KRETPROBE(ret_udp_sendmsg_sec, int ret)
-{
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args *args =
-		bpf_map_lookup_elem(&udp_sendmsg_args, &pid_tgid);
-	if (!args)
-		return 0;
-	struct sock *sk = (struct sock *)args->sock_ptr;
-	bpf_map_delete_elem(&udp_sendmsg_args, &pid_tgid);
-
-	if (ret <= 0)
-		return 0;
-
-	struct udp_agg_key key; BPF_ZERO(key);
-	key.tgid = (__u32)(pid_tgid >> 32);
-	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
-	key.af = (__u8)family;
-	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
-	key.remote_port = __bpf_ntohs(dport);
-	if (family == 2) {
-		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-		__builtin_memcpy(key.remote_addr, &daddr, 4);
-	} else if (family == 10) {
-		BPF_CORE_READ_INTO(key.remote_addr, sk,
-				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-	}
-
-	struct udp_agg_val *val = bpf_map_lookup_elem(&udp_agg_map, &key);
-	if (val) {
-		__sync_fetch_and_add(&val->tx_packets, 1);
-		__sync_fetch_and_add(&val->tx_bytes, (__u64)ret);
-	} else {
-		struct udp_agg_val new_val = {
-			.tx_packets = 1, .tx_bytes = (__u64)ret
-		};
-		bpf_map_update_elem(&udp_agg_map, &key, &new_val, BPF_NOEXIST);
-	}
-	return 0;
-}
-
-SEC("kprobe/udp_recvmsg")
-int BPF_KPROBE(kp_udp_recvmsg_sec, struct sock *sk)
-{
-	if (!sec_enabled(SEC_UDP_BYTES))
-		return 0;
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 tgid = (__u32)(pid_tgid >> 32);
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
-	bpf_map_update_elem(&udp_sendmsg_args, &pid_tgid, &args, BPF_ANY);
-	return 0;
-}
-
-SEC("kretprobe/udp_recvmsg")
-int BPF_KRETPROBE(ret_udp_recvmsg_sec, int ret)
-{
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args *args =
-		bpf_map_lookup_elem(&udp_sendmsg_args, &pid_tgid);
-	if (!args)
-		return 0;
-	struct sock *sk = (struct sock *)args->sock_ptr;
-	bpf_map_delete_elem(&udp_sendmsg_args, &pid_tgid);
-
-	if (ret <= 0)
-		return 0;
-
-	struct udp_agg_key key; BPF_ZERO(key);
-	key.tgid = (__u32)(pid_tgid >> 32);
-	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
-	key.af = (__u8)family;
-	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
-	key.remote_port = __bpf_ntohs(dport);
-	if (family == 2) {
-		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-		__builtin_memcpy(key.remote_addr, &daddr, 4);
-	} else if (family == 10) {
-		BPF_CORE_READ_INTO(key.remote_addr, sk,
-				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-	}
-
-	struct udp_agg_val *val = bpf_map_lookup_elem(&udp_agg_map, &key);
-	if (val) {
-		__sync_fetch_and_add(&val->rx_packets, 1);
-		__sync_fetch_and_add(&val->rx_bytes, (__u64)ret);
-	} else {
-		struct udp_agg_val new_val = {
-			.rx_packets = 1, .rx_bytes = (__u64)ret
-		};
-		bpf_map_update_elem(&udp_agg_map, &key, &new_val, BPF_NOEXIST);
-	}
-	return 0;
-}
 
 /* ── ICMP flood: kprobe/icmp_rcv ──────────────────────────────────── */
 

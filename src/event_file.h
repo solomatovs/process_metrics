@@ -70,8 +70,10 @@ struct metric_event {
 	__u32 threads;
 	__s16 oom_score_adj;
 	__u8  oom_killed;
-	__u64 net_tx_bytes;
-	__u64 net_rx_bytes;
+	__u64 net_tcp_tx_bytes;
+	__u64 net_tcp_rx_bytes;
+	__u64 net_udp_tx_bytes;
+	__u64 net_udp_rx_bytes;
 	__u64 start_time_ns;
 	__u64 uptime_seconds;
 

@@ -125,7 +125,7 @@ static int  cfg_disk_fs_types_count        = 0;
 static int cfg_tcp_retransmit  = 0;
 static int cfg_tcp_syn         = 0;
 static int cfg_tcp_rst         = 0;
-static int cfg_udp_bytes       = 0;
+/* cfg_udp_bytes removed — UDP per-process counted in base probes */
 static int cfg_icmp_tracking   = 0;
 static int cfg_tcp_open_conns  = 0;
 
@@ -158,7 +158,7 @@ static int cfg_emit_net_close      = 1;
 static int cfg_emit_tcp_retransmit = 1;
 static int cfg_emit_syn_recv       = 1;
 static int cfg_emit_rst            = 1;
-static int cfg_emit_udp_agg        = 1;
+/* cfg_emit_udp_agg removed — udp_agg events replaced by per-process counters */
 
 /* cgroup */
 static int cfg_emit_cgroup         = 1;
@@ -687,6 +687,18 @@ static void fill_parent_pids(struct metric_event *cev)
 {
 	pidtree_get_chain_ts(cev->pid, cev->parent_pids,
 			     &cev->parent_pids_len);
+}
+
+/*
+ * Копирует per-process сетевые счётчики из proc_info в metric_event.
+ * Вызывается из обработчиков всех типов событий, где доступен proc_info.
+ */
+static void fill_net_bytes(struct metric_event *cev, const struct proc_info *pi)
+{
+	cev->net_tcp_tx_bytes = pi->net_tcp_tx_bytes;
+	cev->net_tcp_rx_bytes = pi->net_tcp_rx_bytes;
+	cev->net_udp_tx_bytes = pi->net_udp_tx_bytes;
+	cev->net_udp_rx_bytes = pi->net_udp_rx_bytes;
 }
 
 /* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
@@ -1838,8 +1850,6 @@ static int load_config(const char *path)
 			cfg_tcp_syn = bool_val;
 		if (config_setting_lookup_bool(nt, "tcp_rst", &bool_val))
 			cfg_tcp_rst = bool_val;
-		if (config_setting_lookup_bool(nt, "udp_bytes", &bool_val))
-			cfg_udp_bytes = bool_val;
 		if (config_setting_lookup_bool(nt, "tcp_open_conns", &bool_val))
 			cfg_tcp_open_conns = bool_val;
 
@@ -1858,8 +1868,6 @@ static int load_config(const char *path)
 			cfg_emit_syn_recv = bool_val;
 		if (config_setting_lookup_bool(nt, "emit_rst", &bool_val))
 			cfg_emit_rst = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_udp_agg", &bool_val))
-			cfg_emit_udp_agg = bool_val;
 	}
 
 	/* Настройки отслеживания файлов */
@@ -2026,7 +2034,6 @@ static int load_config(const char *path)
 		cfg_tcp_retransmit = 0;
 		cfg_tcp_syn        = 0;
 		cfg_tcp_rst        = 0;
-		cfg_udp_bytes      = 0;
 		cfg_tcp_open_conns = 0;
 		cfg_icmp_tracking  = 0;
 		cfg_net_track_bytes = 0;
@@ -2167,8 +2174,10 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
 	out->rss_min_bytes = e->rss_min_pages * (unsigned long)sysconf(_SC_PAGESIZE);
 	out->oom_killed = e->oom_killed;
-	out->net_tx_bytes = e->net_tx_bytes;
-	out->net_rx_bytes = e->net_rx_bytes;
+	out->net_tcp_tx_bytes = e->net_tcp_tx_bytes;
+	out->net_tcp_rx_bytes = e->net_tcp_rx_bytes;
+	out->net_udp_tx_bytes = e->net_udp_tx_bytes;
+	out->net_udp_rx_bytes = e->net_udp_rx_bytes;
 	out->start_time_ns = e->start_ns + (__u64)g_boot_to_wall_ns;
 	/* новые поля */
 	out->loginuid      = e->loginuid;
@@ -2740,6 +2749,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cmdline_split(pi_file.cmdline, pi_file.cmdline_len,
 						      cev.exec_path, sizeof(cev.exec_path),
 						      cev.args, sizeof(cev.args));
+					fill_net_bytes(&cev, &pi_file);
 				}
 			}
 
@@ -2826,6 +2836,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cmdline_split(pi_mut.cmdline, pi_mut.cmdline_len,
 					      cev.exec_path, sizeof(cev.exec_path),
 					      cev.args, sizeof(cev.args));
+				fill_net_bytes(&cev, &pi_mut);
 			}
 
 			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
@@ -2941,6 +2952,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cmdline_split(pi_net.cmdline, pi_net.cmdline_len,
 						      cev.exec_path, sizeof(cev.exec_path),
 						      cev.args, sizeof(cev.args));
+					fill_net_bytes(&cev, &pi_net);
 				}
 			}
 
@@ -3076,6 +3088,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				cmdline_split(sender_pi.cmdline, sender_pi.cmdline_len,
 					      cev.exec_path, sizeof(cev.exec_path),
 					      cev.args, sizeof(cev.args));
+				fill_net_bytes(&cev, &sender_pi);
 			}
 
 			/* Поля сигнала: номер, PID получателя, код, результат */
@@ -3148,14 +3161,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 				ensure_tags(re->tgid, cev.tags,
 					       sizeof(cev.tags));
 			}
-			/* exec/args из proc_map */
+			/* exec/args + net bytes из proc_map */
 			{
 				struct proc_info pi_sec;
 				if (bpf_map_lookup_elem(proc_map_fd,
-							&re->tgid, &pi_sec) == 0)
+							&re->tgid, &pi_sec) == 0) {
 					cmdline_split(pi_sec.cmdline, pi_sec.cmdline_len,
 						      cev.exec_path, sizeof(cev.exec_path),
 						      cev.args, sizeof(cev.args));
+					fill_net_bytes(&cev, &pi_sec);
+				}
 			}
 
 			/* Identity из proc_map */
@@ -3250,6 +3265,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cmdline_split(pi_syn.cmdline, pi_syn.cmdline_len,
 						      cev.exec_path, sizeof(cev.exec_path),
 						      cev.args, sizeof(cev.args));
+					fill_net_bytes(&cev, &pi_syn);
 				}
 			}
 			cev.sec_af = se_syn->af;
@@ -3328,6 +3344,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cmdline_split(pi_rst.cmdline, pi_rst.cmdline_len,
 						      cev.exec_path, sizeof(cev.exec_path),
 						      cev.args, sizeof(cev.args));
+					fill_net_bytes(&cev, &pi_rst);
 				}
 			}
 			cev.sec_af = rste->af;
@@ -4108,93 +4125,6 @@ static void refresh_processes(void)
 	LOG_DEBUG(cfg_log_level, "refresh: %d alive, %d early cleanup, %d total proc_map entries",
 		  refresh_count, early_cleanup_count, all_keys_count);
 
-	/* Flush UDP агрегатов → ef_append */
-	if (cfg_udp_bytes && cfg_emit_udp_agg && g_http_cfg.enabled) {
-		struct timespec now_ts;
-		clock_gettime(CLOCK_REALTIME, &now_ts);
-		__u64 ts_ns = (__u64)now_ts.tv_sec * NS_PER_SEC
-			    + (__u64)now_ts.tv_nsec;
-
-		int udp_fd = bpf_map__fd(skel->maps.udp_agg_map);
-		struct udp_agg_key ukey;
-		struct udp_agg_val uval;
-		int udp_count = 0;
-
-		while (bpf_map_get_next_key(udp_fd, NULL, &ukey) == 0) {
-			if (bpf_map_lookup_elem(udp_fd, &ukey, &uval) == 0
-			    && (uval.tx_packets || uval.rx_packets)) {
-				struct metric_event cev;
-				memset(&cev, 0, sizeof(cev));
-				snprintf(cev.rule, sizeof(cev.rule), "%s",
-					 RULE_NOT_MATCH);
-				cev.timestamp_ns = ts_ns;
-				snprintf(cev.event_type, sizeof(cev.event_type),
-					 "udp_agg");
-				cev.pid = ukey.tgid;
-				cev.sec_af = ukey.af;
-				cev.sec_remote_port = ukey.remote_port;
-				if (ukey.af == 2) {
-					snprintf(cev.sec_remote_addr,
-						 sizeof(cev.sec_remote_addr),
-						 "%u.%u.%u.%u",
-						 ukey.remote_addr[0],
-						 ukey.remote_addr[1],
-						 ukey.remote_addr[2],
-						 ukey.remote_addr[3]);
-				} else if (ukey.af == 10) {
-					inet_ntop(AF_INET6,
-						  ukey.remote_addr,
-						  cev.sec_remote_addr,
-						  sizeof(cev.sec_remote_addr));
-				}
-				cev.net_tx_bytes = uval.tx_bytes;
-				cev.net_rx_bytes = uval.rx_bytes;
-				cev.file_read_bytes = uval.rx_packets;
-				cev.file_write_bytes = uval.tx_packets;
-
-				struct proc_info upi;
-				if (bpf_map_lookup_elem(proc_map_fd,
-							&ukey.tgid,
-							&upi) == 0) {
-					memcpy(cev.comm, upi.comm, COMM_LEN);
-					memcpy(cev.thread_name, upi.thread_name, COMM_LEN);
-					cev.uid       = upi.uid;
-					cev.loginuid  = upi.loginuid;
-					cev.sessionid = upi.sessionid;
-					cev.euid      = upi.euid;
-					cev.tty_nr    = upi.tty_nr;
-					cev.state = upi.state;
-					cev.start_time_ns = upi.start_ns ? upi.start_ns + (__u64)g_boot_to_wall_ns : 0;
-					cmdline_split(upi.cmdline, upi.cmdline_len,
-						      cev.exec_path, sizeof(cev.exec_path),
-						      cev.args, sizeof(cev.args));
-					resolve_cgroup_ts(upi.cgroup_id,
-							  cev.cgroup,
-							  sizeof(cev.cgroup));
-				}
-				struct track_info uti;
-				if (bpf_map_lookup_elem(tracked_map_fd,
-							&ukey.tgid,
-							&uti) == 0) {
-					if (uti.rule_id < num_rules)
-						snprintf(cev.rule,
-							 sizeof(cev.rule),
-							 "%s",
-							 rules[uti.rule_id].name);
-					cev.root_pid = uti.root_pid;
-				}
-				pwd_lookup_ts(ukey.tgid, cev.pwd,
-					      sizeof(cev.pwd));
-				fill_parent_pids(&cev);
-				ef_append(&cev, cfg_hostname);
-				udp_count++;
-			}
-			bpf_map_delete_elem(udp_fd, &ukey);
-		}
-		if (udp_count > 0)
-			LOG_DEBUG(cfg_log_level, "UDP flush: %d aggregates", udp_count);
-	}
-
 	/* Flush ICMP агрегатов → ef_append */
 	if (cfg_icmp_tracking && g_http_cfg.enabled) {
 		struct timespec now_ts;
@@ -4547,8 +4477,10 @@ static void write_snapshot(void)
 			cev.threads = pi.threads;
 			cev.oom_score_adj = pi.oom_score_adj;
 			cev.oom_killed = pi.oom_killed;
-			cev.net_tx_bytes = pi.net_tx_bytes;
-			cev.net_rx_bytes = pi.net_rx_bytes;
+			cev.net_tcp_tx_bytes = pi.net_tcp_tx_bytes;
+			cev.net_tcp_rx_bytes = pi.net_tcp_rx_bytes;
+			cev.net_udp_tx_bytes = pi.net_udp_tx_bytes;
+			cev.net_udp_rx_bytes = pi.net_udp_rx_bytes;
 			cev.start_time_ns = pi.start_ns + (__u64)g_boot_to_wall_ns;
 			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
 
@@ -4690,6 +4622,7 @@ static void write_snapshot(void)
 						cmdline_split(cpi.cmdline, cpi.cmdline_len,
 							      cev.exec_path, sizeof(cev.exec_path),
 							      cev.args, sizeof(cev.args));
+						fill_net_bytes(&cev, &cpi);
 					}
 
 					/* IP-адреса */
@@ -5170,12 +5103,6 @@ int main(int argc, char *argv[])
 		BPF_PROG_DISABLE(skel->progs.kp_tcp_send_active_reset);
 		BPF_PROG_DISABLE(skel->progs.handle_tcp_receive_reset);
 	}
-	if (!cfg_udp_bytes) {
-		BPF_PROG_DISABLE(skel->progs.kp_udp_sendmsg_sec);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg_sec);
-		BPF_PROG_DISABLE(skel->progs.kp_udp_recvmsg_sec);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg_sec);
-	}
 	if (!cfg_icmp_tracking)
 		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
 
@@ -5243,7 +5170,6 @@ int main(int argc, char *argv[])
 			.tcp_retransmit  = (__u8)cfg_tcp_retransmit,
 			.tcp_syn         = (__u8)cfg_tcp_syn,
 			.tcp_rst         = (__u8)cfg_tcp_rst,
-			.udp_bytes       = (__u8)cfg_udp_bytes,
 			.icmp_tracking   = (__u8)cfg_icmp_tracking,
 			.tcp_open_conns  = (__u8)cfg_tcp_open_conns,
 		};
@@ -5354,7 +5280,7 @@ int main(int argc, char *argv[])
 	       "exec_rate_limit=%d/s, http_server=%s, "
 	       "cgroup_metrics=%s, refresh_proc=%s, "
 	       "net=[enabled=%s tcp_bytes=%s tcp_retransmit=%s tcp_syn=%s tcp_rst=%s "
-	       "udp_bytes=%s tcp_open_conns=%s], "
+	       "tcp_open_conns=%s], "
 	       "file=%s%s, icmp=%s, disk=%s, ring_buffer=%lld",
 	       num_rules, cfg_snapshot_interval, cfg_refresh_interval,
 	       cfg_exec_rate_limit,
@@ -5366,7 +5292,6 @@ int main(int argc, char *argv[])
 	       cfg_tcp_retransmit ? "on" : "off",
 	       cfg_tcp_syn ? "on" : "off",
 	       cfg_tcp_rst ? "on" : "off",
-	       cfg_udp_bytes ? "on" : "off",
 	       cfg_tcp_open_conns ? "on" : "off",
 	       cfg_file_tracking_enabled ? "on" : "off",
 	       cfg_file_track_bytes ? "+bytes" : "",

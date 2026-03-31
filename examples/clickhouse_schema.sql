@@ -59,8 +59,10 @@ CREATE TABLE _pm_target (
     threads                UInt32                      CODEC(T64, ZSTD(1)),
     oom_score_adj          Int16                       CODEC(T64, ZSTD(1)),
     oom_killed             UInt8                       CODEC(T64, ZSTD(1)),
-    net_tx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
-    net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
+    net_tcp_tx_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
+    net_tcp_rx_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
+    net_udp_tx_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
+    net_udp_rx_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
     start_time_ns          UInt64                      CODEC(DoubleDelta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
     mnt_ns                 UInt32                      CODEC(T64, ZSTD(1)),
@@ -147,18 +149,47 @@ WHERE database = currentDatabase()
   AND engine = 'MaterializedView'
   AND create_table_query LIKE concat('%TO ', currentDatabase(), '.process_metrics%');
 
+-- Генерирует INSERT с пересечением колонок + маппинг переименованных.
+-- net_tx_bytes → net_tcp_tx_bytes, net_rx_bytes → net_tcp_rx_bytes
+-- (старые данные не разделяли TCP/UDP, весь трафик был преимущественно TCP).
 SELECT format(
-    'INSERT INTO _pm_target ({0}) SELECT {0} FROM process_metrics SETTINGS max_insert_threads=4, max_execution_time=0;',
-    cols
+    'INSERT INTO _pm_target ({0}) SELECT {1} FROM process_metrics SETTINGS max_insert_threads=4, max_execution_time=0;',
+    dst_cols, src_cols
 )
 FROM (
-    SELECT arrayStringConcat(groupArray(name), ', ') AS cols
+    SELECT
+        arrayStringConcat(groupArray(dst_name), ', ') AS dst_cols,
+        arrayStringConcat(groupArray(src_expr), ', ') AS src_cols
     FROM (
-        SELECT name FROM system.columns
-        WHERE database = currentDatabase() AND table = 'process_metrics'
-          AND name IN (SELECT name FROM system.columns
-                       WHERE database = currentDatabase() AND table = '_pm_target')
-        ORDER BY position
+        SELECT dst_name, src_expr FROM (
+            SELECT name AS dst_name, name AS src_expr
+            FROM system.columns
+            WHERE database = currentDatabase() AND table = 'process_metrics'
+              AND name IN (SELECT name FROM system.columns
+                           WHERE database = currentDatabase() AND table = '_pm_target')
+
+            UNION ALL
+
+            -- Маппинг: net_tx_bytes → net_tcp_tx_bytes (если старая колонка есть)
+            SELECT 'net_tcp_tx_bytes', 'net_tx_bytes'
+            WHERE (SELECT count() FROM system.columns
+                   WHERE database = currentDatabase() AND table = 'process_metrics'
+                     AND name = 'net_tx_bytes') > 0
+              AND (SELECT count() FROM system.columns
+                   WHERE database = currentDatabase() AND table = 'process_metrics'
+                     AND name = 'net_tcp_tx_bytes') = 0
+
+            UNION ALL
+
+            SELECT 'net_tcp_rx_bytes', 'net_rx_bytes'
+            WHERE (SELECT count() FROM system.columns
+                   WHERE database = currentDatabase() AND table = 'process_metrics'
+                     AND name = 'net_rx_bytes') > 0
+              AND (SELECT count() FROM system.columns
+                   WHERE database = currentDatabase() AND table = 'process_metrics'
+                     AND name = 'net_tcp_rx_bytes') = 0
+        )
+        ORDER BY dst_name
     )
 )
 WHERE (SELECT count() FROM system.tables
@@ -300,8 +331,10 @@ FROM url('<URL>', 'CSVWithNames', $$
     threads                UInt32,
     oom_score_adj          Int16,
     oom_killed             UInt8,
-    net_tx_bytes           UInt64,
-    net_rx_bytes           UInt64,
+    net_tcp_tx_bytes       UInt64,
+    net_tcp_rx_bytes       UInt64,
+    net_udp_tx_bytes       UInt64,
+    net_udp_rx_bytes       UInt64,
     start_time_ns          DateTime64(9, 'UTC'),
     uptime_seconds         UInt64,
     mnt_ns                 UInt32,
