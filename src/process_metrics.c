@@ -693,6 +693,155 @@ static void fill_parent_pids(struct metric_event *cev)
 }
 
 /*
+ * Преобразует enum event_type в строковое имя для CSV/ClickHouse.
+ */
+/*
+ * Проверяет, разрешена ли отправка события данного типа в CSV.
+ * Возвращает 1 если разрешена, 0 если отключена в конфиге.
+ * Без default — clang -Wswitch предупредит при добавлении нового enum.
+ */
+static int event_emit_enabled(enum event_type type)
+{
+	switch (type) {
+	case EVENT_FORK:           return cfg_emit_fork;
+	case EVENT_EXEC:           return cfg_emit_exec;
+	case EVENT_EXIT:           return cfg_emit_exit;
+	case EVENT_OOM_KILL:       return cfg_emit_oom_kill;
+	case EVENT_FILE_CLOSE:     return cfg_emit_file_close;
+	case EVENT_FILE_OPEN:      return cfg_emit_file_open;
+	case EVENT_FILE_RENAME:    return cfg_emit_file_rename;
+	case EVENT_FILE_UNLINK:    return cfg_emit_file_unlink;
+	case EVENT_FILE_TRUNCATE:  return cfg_emit_file_truncate;
+	case EVENT_FILE_CHMOD:     return cfg_emit_file_chmod;
+	case EVENT_FILE_CHOWN:     return cfg_emit_file_chown;
+	case EVENT_NET_CLOSE:      return cfg_emit_net_close;
+	case EVENT_NET_LISTEN:     return cfg_emit_net_listen;
+	case EVENT_NET_CONNECT:    return cfg_emit_net_connect;
+	case EVENT_NET_ACCEPT:     return cfg_emit_net_accept;
+	case EVENT_SIGNAL:         return cfg_emit_signal;
+	case EVENT_TCP_RETRANSMIT: return cfg_emit_tcp_retransmit;
+	case EVENT_SYN_RECV:       return cfg_emit_syn_recv;
+	case EVENT_RST:            return cfg_emit_rst;
+	case EVENT_CHDIR:          return cfg_emit_chdir;
+	case EVENT_CGROUP_MKDIR:
+	case EVENT_CGROUP_RMDIR:
+	case EVENT_CGROUP_RENAME:
+	case EVENT_CGROUP_RELEASE:
+	case EVENT_CGROUP_ATTACH_TASK:
+	case EVENT_CGROUP_TRANSFER_TASKS:
+	case EVENT_CGROUP_POPULATED:
+	case EVENT_CGROUP_FREEZE:
+	case EVENT_CGROUP_UNFREEZE:
+	case EVENT_CGROUP_FROZEN:  return cfg_emit_cgroup;
+	}
+	return 0;
+}
+
+/*
+ * Классификация событий по группам.
+ * Используется вместо цепочек if (type == X || type == Y || ...).
+ */
+enum event_group {
+	EVG_FILE_DATA,     /* file_open, file_close */
+	EVG_FILE_OP,       /* file_rename, file_unlink, file_truncate, file_chmod, file_chown */
+	EVG_NET,           /* net_listen, net_connect, net_accept, net_close */
+	EVG_PROC,          /* fork, exec, exit, oom_kill */
+	EVG_SIGNAL,        /* signal */
+	EVG_SEC,           /* tcp_retrans, syn_recv, rst */
+	EVG_CGROUP,        /* cgroup_mkdir/rmdir/rename/... */
+	EVG_OTHER,         /* chdir и прочее */
+};
+
+/*
+ * Определяет группу события.
+ * Без default — clang -Wswitch предупредит при добавлении нового enum.
+ */
+static enum event_group event_classify(enum event_type type)
+{
+	switch (type) {
+	case EVENT_FILE_CLOSE:
+	case EVENT_FILE_OPEN:              return EVG_FILE_DATA;
+	case EVENT_FILE_RENAME:
+	case EVENT_FILE_UNLINK:
+	case EVENT_FILE_TRUNCATE:
+	case EVENT_FILE_CHMOD:
+	case EVENT_FILE_CHOWN:             return EVG_FILE_OP;
+	case EVENT_NET_CLOSE:
+	case EVENT_NET_LISTEN:
+	case EVENT_NET_CONNECT:
+	case EVENT_NET_ACCEPT:             return EVG_NET;
+	case EVENT_FORK:
+	case EVENT_EXEC:
+	case EVENT_EXIT:
+	case EVENT_OOM_KILL:               return EVG_PROC;
+	case EVENT_SIGNAL:                 return EVG_SIGNAL;
+	case EVENT_TCP_RETRANSMIT:
+	case EVENT_SYN_RECV:
+	case EVENT_RST:                    return EVG_SEC;
+	case EVENT_CHDIR:                  return EVG_OTHER;
+	case EVENT_CGROUP_MKDIR:
+	case EVENT_CGROUP_RMDIR:
+	case EVENT_CGROUP_RENAME:
+	case EVENT_CGROUP_RELEASE:
+	case EVENT_CGROUP_ATTACH_TASK:
+	case EVENT_CGROUP_TRANSFER_TASKS:
+	case EVENT_CGROUP_POPULATED:
+	case EVENT_CGROUP_FREEZE:
+	case EVENT_CGROUP_UNFREEZE:
+	case EVENT_CGROUP_FROZEN:          return EVG_CGROUP;
+	}
+	return EVG_OTHER;
+}
+
+static const char *event_type_name(enum event_type type)
+{
+	switch (type) {
+	case EVENT_FORK:           return "fork";
+	case EVENT_EXEC:           return "exec";
+	case EVENT_EXIT:           return "exit";
+	case EVENT_OOM_KILL:       return "oom_kill";
+	case EVENT_FILE_CLOSE:     return "file_close";
+	case EVENT_FILE_OPEN:      return "file_open";
+	case EVENT_FILE_RENAME:    return "file_rename";
+	case EVENT_FILE_UNLINK:    return "file_unlink";
+	case EVENT_FILE_TRUNCATE:  return "file_truncate";
+	case EVENT_FILE_CHMOD:     return "file_chmod";
+	case EVENT_FILE_CHOWN:     return "file_chown";
+	case EVENT_NET_CLOSE:      return "net_close";
+	case EVENT_NET_LISTEN:     return "net_listen";
+	case EVENT_NET_CONNECT:    return "net_connect";
+	case EVENT_NET_ACCEPT:     return "net_accept";
+	case EVENT_SIGNAL:         return "signal";
+	case EVENT_TCP_RETRANSMIT: return "tcp_retrans";
+	case EVENT_SYN_RECV:       return "syn_recv";
+	case EVENT_RST:            return "rst";
+	case EVENT_CHDIR:          return "chdir";
+	/* cgroup events — не используются в CSV, но покрываем для -Wswitch */
+	case EVENT_CGROUP_MKDIR:          return "cgroup_mkdir";
+	case EVENT_CGROUP_RMDIR:          return "cgroup_rmdir";
+	case EVENT_CGROUP_RENAME:         return "cgroup_rename";
+	case EVENT_CGROUP_RELEASE:        return "cgroup_release";
+	case EVENT_CGROUP_ATTACH_TASK:    return "cgroup_attach";
+	case EVENT_CGROUP_TRANSFER_TASKS: return "cgroup_transfer";
+	case EVENT_CGROUP_POPULATED:      return "cgroup_populated";
+	case EVENT_CGROUP_FREEZE:         return "cgroup_freeze";
+	case EVENT_CGROUP_UNFREEZE:       return "cgroup_unfreeze";
+	case EVENT_CGROUP_FROZEN:         return "cgroup_frozen";
+	}
+	/* unreachable если enum покрыт полностью;
+	 * clang -Wswitch предупредит при добавлении нового enum */
+	return "unknown";
+}
+
+/*
+ * Преобразует RST direction (0=sent, 1=recv) в имя события.
+ */
+static const char *rst_event_name(__u8 direction)
+{
+	return direction ? "rst_recv" : "rst_sent";
+}
+
+/*
  * Заполняет metric_event всеми доступными полями из proc_info.
  * Единая точка копирования — вызывается из ВСЕХ обработчиков событий.
  *
@@ -3024,7 +3173,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * без вызова clock_gettime.
 	 * Cgroup резолвится из кэша (resolve_cgroup_fast), без обхода /sys.
 	 */
-	if (type == EVENT_FILE_CLOSE || type == EVENT_FILE_OPEN) {
+	if (event_classify(type) == EVG_FILE_DATA) {
 		if (size < sizeof(struct file_event))
 			return 0;
 		const struct file_event *fe = data;
@@ -3032,13 +3181,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Lookup tracked_map. Для FILE_CLOSE допускаем отсутствие —
 		 * процесс мог завершиться до обработки close из ring buffer. */
 		struct track_info ti;
-		int tracked = bpf_map_lookup_elem(tracked_map_fd,
-						  &fe->tgid, &ti) == 0;
+		int tracked = bpf_map_lookup_elem(tracked_map_fd, &fe->tgid, &ti) == 0;
 		if (!tracked && type != EVENT_FILE_CLOSE)
 			return 0;
 
-		const char *rname = (tracked && ti.rule_id < num_rules)
-			? rules[ti.rule_id].name : RULE_NOT_MATCH;
+		const char *rname = (tracked && ti.rule_id < num_rules) ? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
 		LOG_DEBUG(cfg_log_level, "FILE_CLOSE: pid=%u rule=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
@@ -3048,17 +3195,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 			  fe->open_count);
 
 		/* emit guard: проверяем нужно ли отправлять это событие в CSV */
-		if (type == EVENT_FILE_OPEN  && !cfg_emit_file_open)  return 0;
-		if (type == EVENT_FILE_CLOSE && !cfg_emit_file_close) return 0;
+		if (!event_emit_enabled(type)) return 0;
 
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    type == EVENT_FILE_OPEN ? "file_open" : "file_close");
+				    event_type_name(type));
 			fill_from_track_info(&cev, &ti, tracked);
 			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-			cev.ppid = fe->ppid;
 
 			/* proc_info enrichment, then BPF event overrides */
 			{
@@ -3082,15 +3227,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 	}
 
 	/* ── FILE_RENAME / FILE_UNLINK / FILE_TRUNCATE / FILE_CHMOD / FILE_CHOWN */
-	if (type == EVENT_FILE_RENAME || type == EVENT_FILE_UNLINK
-	    || type == EVENT_FILE_TRUNCATE
-	    || type == EVENT_FILE_CHMOD || type == EVENT_FILE_CHOWN) {
+	if (event_classify(type) == EVG_FILE_OP) {
 		/* emit guard */
-		if (type == EVENT_FILE_RENAME   && !cfg_emit_file_rename)   return 0;
-		if (type == EVENT_FILE_UNLINK   && !cfg_emit_file_unlink)   return 0;
-		if (type == EVENT_FILE_TRUNCATE && !cfg_emit_file_truncate) return 0;
-		if (type == EVENT_FILE_CHMOD    && !cfg_emit_file_chmod)    return 0;
-		if (type == EVENT_FILE_CHOWN    && !cfg_emit_file_chown)    return 0;
+		if (!event_emit_enabled(type)) return 0;
 
 		if (size < sizeof(struct file_event))
 			return 0;
@@ -3104,17 +3243,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 
-			const char *etype =
-				type == EVENT_FILE_RENAME   ? "file_rename"   :
-				type == EVENT_FILE_UNLINK   ? "file_unlink"   :
-				type == EVENT_FILE_TRUNCATE ? "file_truncate" :
-				type == EVENT_FILE_CHMOD    ? "file_chmod"    :
-				type == EVENT_FILE_CHOWN    ? "file_chown"    :
-				                              "file_unknown";
-			fast_strcpy(cev.event_type, sizeof(cev.event_type), etype);
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    event_type_name(type));
 			fill_from_track_info(&cev, &ti, 1);
 			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-			cev.ppid = fe->ppid;
 
 			/* proc_info enrichment, then BPF event overrides */
 			{
@@ -3160,13 +3292,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * события приходят для ВСЕХ процессов на хосте. Фильтрация выполняется
 	 * здесь одним bpf_map_lookup_elem: если PID не в tracked_map — пропускаем.
 	 */
-	if (type == EVENT_NET_LISTEN || type == EVENT_NET_CONNECT
-	    || type == EVENT_NET_ACCEPT || type == EVENT_NET_CLOSE) {
+	if (event_classify(type) == EVG_NET) {
 		/* emit guard */
-		if (type == EVENT_NET_LISTEN  && !cfg_emit_net_listen)  return 0;
-		if (type == EVENT_NET_CONNECT && !cfg_emit_net_connect) return 0;
-		if (type == EVENT_NET_ACCEPT  && !cfg_emit_net_accept)  return 0;
-		if (type == EVENT_NET_CLOSE   && !cfg_emit_net_close)   return 0;
+		if (!event_emit_enabled(type)) return 0;
 
 		if (size < sizeof(struct net_event))
 			return 0;
@@ -3184,13 +3312,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		const char *rname = (tracked && ti.rule_id < num_rules)
 			? rules[ti.rule_id].name : RULE_NOT_MATCH;
 
-		const char *net_evt;
-		switch (type) {
-		case EVENT_NET_LISTEN:  net_evt = "net_listen";  break;
-		case EVENT_NET_CONNECT: net_evt = "net_connect"; break;
-		case EVENT_NET_ACCEPT:  net_evt = "net_accept";  break;
-		default:                net_evt = "net_close";   break;
-		}
+		const char *net_evt = event_type_name(type);
 		LOG_DEBUG(cfg_log_level, "%s: pid=%u rule=%s port=%u→%u "
 			  "tx=%llu rx=%llu dur=%llums",
 			  net_evt,
@@ -3205,7 +3327,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
 			fill_from_track_info(&cev, &ti, tracked);
 			ensure_tags(ne->tgid, cev.tags, sizeof(cev.tags));
-			cev.ppid = ne->ppid;
 
 			/* proc_info enrichment, then BPF event overrides */
 			{
@@ -3245,8 +3366,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Правило определяется сначала по отправителю, затем по получателю.
 	 * Имя процесса-получателя читается из /proc/<pid>/comm.
 	 */
-	if (type == EVENT_SIGNAL) {
-		if (!cfg_emit_signal) return 0;
+	if (event_classify(type) == EVG_SIGNAL) {
+		if (!event_emit_enabled(EVENT_SIGNAL)) return 0;
 		if (size < sizeof(struct signal_event))
 			return 0;
 		const struct signal_event *se = data;
@@ -3333,8 +3454,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Редкое событие. Симптом потери пакетов, перегрузки сети или DDoS.
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ соединения на хосте.
 	 */
-	if (type == EVENT_TCP_RETRANSMIT) {
-		if (!cfg_emit_tcp_retransmit) return 0;
+	if (type == EVENT_TCP_RETRANSMIT) { /* EVG_SEC: retransmit */
+		if (!event_emit_enabled(EVENT_TCP_RETRANSMIT)) return 0;
 		if (size < sizeof(struct retransmit_event))
 			return 0;
 		const struct retransmit_event *re = data;
@@ -3346,7 +3467,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			fast_strcpy(cev.event_type, sizeof(cev.event_type), "tcp_retrans");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    event_type_name(EVENT_TCP_RETRANSMIT));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 
 			/* Определяем правило, если процесс отслеживается */
@@ -3379,8 +3501,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * Редкое событие. Полезно для обнаружения SYN flood атак.
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ входящие SYN.
 	 */
-	if (type == EVENT_SYN_RECV) {
-		if (!cfg_emit_syn_recv) return 0;
+	if (type == EVENT_SYN_RECV) { /* EVG_SEC: syn_recv */
+		if (!event_emit_enabled(EVENT_SYN_RECV)) return 0;
 		if (size < sizeof(struct syn_event))
 			return 0;
 		const struct syn_event *se_syn = data;
@@ -3392,7 +3514,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (g_http_cfg.enabled) {
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
-			fast_strcpy(cev.event_type, sizeof(cev.event_type), "syn_recv");
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    event_type_name(EVENT_SYN_RECV));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 
 			struct track_info ti;
@@ -3426,8 +3549,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 * НЕ фильтруется по tracked_map — захватывает ВСЕ RST на хосте.
 	 * Поле direction: 0 = отправлен (sent), 1 = получен (recv).
 	 */
-	if (type == EVENT_RST) {
-		if (!cfg_emit_rst) return 0;
+	if (type == EVENT_RST) { /* EVG_SEC: rst */
+		if (!event_emit_enabled(EVENT_RST)) return 0;
 		if (size < sizeof(struct rst_event))
 			return 0;
 		const struct rst_event *rste = data;
@@ -3440,7 +3563,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    rste->direction ? "rst_recv" : "rst_sent");
+				    rst_event_name(rste->direction));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
 
 			struct track_info ti;
