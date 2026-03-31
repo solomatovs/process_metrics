@@ -167,7 +167,7 @@ enum event_type {
 	EVENT_OOM_KILL       = 4,
 	EVENT_FILE_CLOSE     = 5,
 	EVENT_FILE_OPEN      = 6,
-	EVENT_NET_CLOSE      = 6,
+	EVENT_NET_CLOSE      = 30,
 	EVENT_NET_LISTEN     = 12,
 	EVENT_NET_CONNECT    = 13,
 	EVENT_NET_ACCEPT     = 14,
@@ -330,6 +330,7 @@ struct file_event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
+	char  thread_name[COMM_LEN];
 	char  path[BPF_FILE_PATH_MAX];
 	int   flags;
 	__u64 read_bytes;
@@ -377,7 +378,8 @@ struct proc_info {
 	__u8  state;             /* состояние процесса: 'R','S','D','T','Z',... */
 	__u64 net_tx_bytes;      /* TCP+UDP отправлено байт */
 	__u64 net_rx_bytes;      /* TCP+UDP получено байт */
-	char  comm[COMM_LEN];
+	char  comm[COMM_LEN];          /* group leader comm */
+	char  thread_name[COMM_LEN];   /* thread-specific comm (может отличаться от comm) */
 	char  cmdline[CMDLINE_MAX];
 	__u16 cmdline_len;
 
@@ -443,6 +445,7 @@ struct event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
+	char  thread_name[COMM_LEN];
 	char  cmdline[CMDLINE_MAX];
 	__u16 cmdline_len;
 	/* информация отслеживания (скопирована из tracked_map перед удалением) */
@@ -546,6 +549,7 @@ struct net_event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  comm[COMM_LEN];
+	char  thread_name[COMM_LEN];
 	__u8  af;             /* AF_INET=2, AF_INET6=10 */
 	__u8  local_addr[16];
 	__u8  remote_addr[16];
@@ -571,6 +575,7 @@ struct signal_event {
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
 	char  sender_comm[COMM_LEN];
+	char  sender_thread_name[COMM_LEN];
 	int   sig;            /* номер сигнала (SIGKILL=9 и т.д.) */
 	int   sig_code;       /* SI_USER=0, SI_KERNEL=0x80 и т.д. */
 	int   sig_result;     /* 0 = успешно доставлен */

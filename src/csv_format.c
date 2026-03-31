@@ -20,8 +20,8 @@
 
 static const char CSV_HEADER_STR[] =
 	"timestamp,hostname,event_type,rule,tags,"
-	"root_pid,pid,ppid,uid,user_name,loginuid,login_name,sessionid,euid,euser_name,tty_nr,"
-	"comm,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
+	"rule_pid,pid,ppid,process_chain,uid,user_name,loginuid,login_name,sessionid,session_name,euid,euser_name,tty_nr,"
+	"comm,thread_name,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
 	"cpu_ns,cpu_usage_ratio,"
 	"rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
 	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,socket_creates,"
@@ -42,8 +42,7 @@ static const char CSV_HEADER_STR[] =
 	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
 	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
 	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
-	"disk_total_bytes,disk_used_bytes,disk_avail_bytes,"
-	"parent_pids\n";
+	"disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
 
 const char *csv_header(int *len)
 {
@@ -281,6 +280,17 @@ int csv_format_row(char *buf, int buflen,
 	U32(ev->root_pid);
 	U32(ev->pid);
 	U32(ev->ppid);
+
+	/* process_chain: pid → ppid → ... → 1 (pipe-separated) */
+	*p++ = '"';
+	p = put_u32(p, ev->pid);
+	for (int i = 0; i < ev->parent_pids_len && i < EV_PARENT_PIDS_MAX; i++) {
+		*p++ = '|';
+		p = put_u32(p, ev->parent_pids[i]);
+	}
+	*p++ = '"';
+	COMMA();
+
 	U32(ev->uid);
 	/* user_name (разрешается из uid) */
 	if (resolvers && resolvers->resolve_uid) {
@@ -302,6 +312,18 @@ int csv_format_row(char *buf, int buflen,
 		*p++ = '"'; *p++ = '"'; COMMA();
 	}
 	U32(ev->sessionid);
+	/* session_name (разрешается из loginuid — владелец audit-сессии) */
+	if (ev->sessionid == AUDIT_UID_UNSET) {
+		STR("AUDIT_SESSION_UNSET", 64);
+	} else if (ev->loginuid == AUDIT_UID_UNSET) {
+		STR("AUDIT_UID_UNSET", 64);
+	} else if (resolvers && resolvers->resolve_uid) {
+		char sname[USERNAME_LEN];
+		resolvers->resolve_uid(ev->loginuid, sname, sizeof(sname));
+		STR(sname, 64);
+	} else {
+		*p++ = '"'; *p++ = '"'; COMMA();
+	}
 	U32(ev->euid);
 	/* euser_name (разрешается из euid) */
 	if (resolvers && resolvers->resolve_uid) {
@@ -315,6 +337,7 @@ int csv_format_row(char *buf, int buflen,
 
 	/* ── метаданные процесса ──────────────────────────────────── */
 	STR(ev->comm, COMM_LEN);
+	STR(ev->thread_name, COMM_LEN);
 	STR(ev->exec_path, CMDLINE_MAX);
 	STR(ev->args, CMDLINE_MAX);
 
@@ -331,9 +354,10 @@ int csv_format_row(char *buf, int buflen,
 	STR(ev->pwd, EV_PWD_LEN);
 	U32(ev->is_root);
 
-	/* state: однобайтовое поле */
+	/* state: однобайтовое поле.
+	 * 0 = процесс ещё не попадал в sched_switch (очень короткоживущий). */
 	{
-		char state_raw[2] = { (char)(ev->state ? ev->state : '\0'), '\0' };
+		char state_raw[2] = { (char)(ev->state ? ev->state : 'N'), '\0' };
 		STR(state_raw, 2);
 	}
 
@@ -404,7 +428,40 @@ int csv_format_row(char *buf, int buflen,
 	/* ── отслеживание файлов ────────────────────────────────────── */
 	STR(ev->file_path, FILE_PATH_MAX);
 	STR(ev->file_new_path, FILE_PATH_MAX);
-	U32(ev->file_flags);
+
+	/* file_flags → pipe-separated строка имён флагов */
+	{
+		__u32 ff = ev->file_flags;
+		*p++ = '"';
+		int first = 1;
+		/* Access mode (bits 0-1) */
+		switch (ff & 3) {
+		case 0: memcpy(p, "O_RDONLY", 8); p += 8; first = 0; break;
+		case 1: memcpy(p, "O_WRONLY", 8); p += 8; first = 0; break;
+		case 2: memcpy(p, "O_RDWR",   6); p += 6; first = 0; break;
+		}
+#define FLAG(bit, name, len) \
+		if (ff & (bit)) { \
+			if (!first) *p++ = '|'; \
+			memcpy(p, name, len); p += len; first = 0; \
+		}
+		FLAG(0100,     "O_CREAT",     7)
+		FLAG(0200,     "O_EXCL",      6)
+		FLAG(01000,    "O_TRUNC",     7)
+		FLAG(02000,    "O_APPEND",    8)
+		FLAG(04000,    "O_NONBLOCK",  10)
+		FLAG(010000,   "O_DSYNC",     7)
+		FLAG(020000,   "O_DIRECT",    8)
+		FLAG(040000,   "O_LARGEFILE", 11)
+		FLAG(0100000,  "O_DIRECTORY", 11)
+		FLAG(0200000,  "O_NOFOLLOW",  10)
+		FLAG(0400000,  "O_NOATIME",   9)
+		FLAG(02000000, "O_CLOEXEC",   9)
+#undef FLAG
+		*p++ = '"';
+		COMMA();
+	}
+
 	U64(ev->file_read_bytes);
 	U64(ev->file_write_bytes);
 	U32(ev->file_open_count);
@@ -444,15 +501,9 @@ int csv_format_row(char *buf, int buflen,
 	/* ── использование диска ────────────────────────────────────── */
 	U64(ev->disk_total_bytes);
 	U64(ev->disk_used_bytes);
-	U64(ev->disk_avail_bytes);
 
-	/* ── parent_pids (последнее поле, разделённое символом |) ───── */
-	*p++ = '"';
-	for (int i = 0; i < ev->parent_pids_len && i < EV_PARENT_PIDS_MAX; i++) {
-		if (i > 0) *p++ = '|';
-		p = put_u32(p, ev->parent_pids[i]);
-	}
-	*p++ = '"';
+	/* Последнее поле — без запятой после */
+	p = put_u64(p, (unsigned long long)(ev->disk_avail_bytes));
 	*p++ = '\n';
 
 	/* Проверяем, что не вышли за пределы буфера */

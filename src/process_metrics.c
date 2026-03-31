@@ -903,6 +903,32 @@ static int try_track_pid(__u32 pid)
 	return first;
 }
 
+/*
+ * Гарантирует заполнение tags для PID.
+ * Если tags_ht пуст (fork event ещё не обработан) — читает cmdline,
+ * матчит правила и сохраняет в tags_ht + копирует в buf.
+ */
+static void ensure_tags(__u32 tgid, char *buf, int buflen)
+{
+	tags_lookup_ts(tgid, buf, buflen);
+	if (buf[0])
+		return;
+
+	char cmdline_raw[CMDLINE_MAX];
+	int clen = read_proc_cmdline(tgid, cmdline_raw, sizeof(cmdline_raw));
+	if (clen <= 0)
+		return;
+
+	char cmdline_str[CMDLINE_MAX + 1];
+	cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str, sizeof(cmdline_str));
+
+	char tags_buf[TAGS_MAX_LEN];
+	if (match_rules_all(cmdline_str, tags_buf, sizeof(tags_buf)) >= 0) {
+		tags_store_ts(tgid, tags_buf);
+		snprintf(buf, buflen, "%s", tags_buf);
+	}
+}
+
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
 
 
@@ -1258,7 +1284,8 @@ void http_resolve_uid(__u32 uid, char *buf, int buflen)
 
 	/* Промах кэша — резолвим через NSS или /etc/passwd */
 	char name[USERNAME_LEN] = "";
-	resolve_uid_to_name(uid, name, sizeof(name));
+	if (!resolve_uid_to_name(uid, name, sizeof(name)))
+		snprintf(name, sizeof(name), "NOT_FOUND");
 
 	/* Сохраняем в кэш (wrlock) */
 	pthread_rwlock_wrlock(&g_uid_cache_lock);
@@ -2063,6 +2090,7 @@ static void event_from_bpf(struct metric_event *out, const struct event *e,
 	out->ppid = e->ppid;
 	out->uid = e->uid;
 	memcpy(out->comm, e->comm, COMM_LEN);
+	memcpy(out->thread_name, e->thread_name, COMM_LEN);
 	cmdline_split(e->cmdline, e->cmdline_len,
 		      out->exec_path, sizeof(out->exec_path),
 		      out->args, sizeof(out->args));
@@ -2117,6 +2145,7 @@ static int read_proc_stat(__u32 pid, struct proc_info *pi)
 	if (clen > COMM_LEN - 1) clen = COMM_LEN - 1;
 	memcpy(pi->comm, lp + 1, clen);
 	pi->comm[clen] = '\0';
+	memcpy(pi->thread_name, pi->comm, COMM_LEN);
 
 	/* поля после ") " :
 	 * state ppid pgrp session tty_nr tpgid flags
@@ -2622,23 +2651,30 @@ static int handle_event(void *ctx, void *data, size_t size)
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), type == EVENT_FILE_OPEN ? "file_open" : "file_close");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
-			/* Теги из userspace hash table (O(1)) */
-			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
+			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
 			cev.root_pid = tracked ? ti.root_pid : 0;
 			cev.is_root = tracked ? ti.is_root : 0;
 			cev.pid = fe->tgid;
 			cev.ppid = fe->ppid;
 			cev.uid = fe->uid;
 			memcpy(cev.comm, fe->comm, COMM_LEN);
+			memcpy(cev.thread_name, fe->thread_name, COMM_LEN);
 
-			/* Identity из proc_map */
+			/* Identity + exec/args + start_time + ppid из proc_map */
 			{
 				struct proc_info pi_file;
 				if (bpf_map_lookup_elem(proc_map_fd, &fe->tgid, &pi_file) == 0) {
+					cev.ppid      = pi_file.ppid;
+					cev.state = pi_file.state;
 					cev.loginuid  = pi_file.loginuid;
 					cev.sessionid = pi_file.sessionid;
 					cev.euid      = pi_file.euid;
 					cev.tty_nr    = pi_file.tty_nr;
+					cev.start_time_ns = pi_file.start_ns
+						? pi_file.start_ns + (__u64)g_boot_to_wall_ns : 0;
+					cmdline_split(pi_file.cmdline, pi_file.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 				}
 			}
 
@@ -2653,6 +2689,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.file_open_count = fe->open_count;
 			cev.file_fsync_count = fe->fsync_count;
 
+			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
+			if (!cev.pwd[0])
+				pwd_read_and_store(fe->tgid);
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
 
 			/* Запись в буферный файл (1× write syscall) */
@@ -2699,7 +2738,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				                              "file_unknown";
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), etype);
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
-			tags_lookup_ts(fe->tgid, cev.tags, sizeof(cev.tags));
+			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
 
 			cev.root_pid = ti.root_pid;
 			cev.is_root  = ti.is_root;
@@ -2707,14 +2746,21 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.ppid = fe->ppid;
 			cev.uid  = fe->uid;
 			memcpy(cev.comm, fe->comm, COMM_LEN);
+			memcpy(cev.thread_name, fe->thread_name, COMM_LEN);
 
 			struct proc_info pi_mut;
 			if (bpf_map_lookup_elem(proc_map_fd,
 						&fe->tgid, &pi_mut) == 0) {
+				cev.ppid      = pi_mut.ppid;
+				cev.state = pi_mut.state;
 				cev.loginuid  = pi_mut.loginuid;
 				cev.sessionid = pi_mut.sessionid;
 				cev.euid      = pi_mut.euid;
 				cev.tty_nr    = pi_mut.tty_nr;
+				cev.start_time_ns = pi_mut.start_ns ? pi_mut.start_ns + (__u64)g_boot_to_wall_ns : 0;
+				cmdline_split(pi_mut.cmdline, pi_mut.cmdline_len,
+					      cev.exec_path, sizeof(cev.exec_path),
+					      cev.args, sizeof(cev.args));
 			}
 
 			resolve_cgroup_fast_ts(fe->cgroup_id, cev.cgroup, sizeof(cev.cgroup));
@@ -2736,6 +2782,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 
 			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
+			if (!cev.pwd[0])
+				pwd_read_and_store(fe->tgid);
+			pwd_lookup_ts(fe->tgid, cev.pwd, sizeof(cev.pwd));
+
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -2798,23 +2848,34 @@ static int handle_event(void *ctx, void *data, size_t size)
 					 + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), net_evt);
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
-			tags_lookup_ts(ne->tgid, cev.tags, sizeof(cev.tags));
+			ensure_tags(ne->tgid, cev.tags, sizeof(cev.tags));
 			cev.root_pid = tracked ? ti.root_pid : 0;
 			cev.is_root = tracked ? ti.is_root : 0;
 			cev.pid = ne->tgid;
 			cev.ppid = ne->ppid;
 			cev.uid = ne->uid;
 			memcpy(cev.comm, ne->comm, COMM_LEN);
+			memcpy(cev.thread_name, ne->thread_name, COMM_LEN);
 
-			/* Identity из proc_map (loginuid, sessionid, euid, tty_nr) */
+			/* Identity + exec/args + start_time + ppid из proc_map.
+			 * ppid из BPF (real_parent->tgid) может быть некорректным
+			 * для потоков — равен tgid вместо реального родительского PID.
+			 * proc_map.ppid заполняется при fork — всегда корректен. */
 			{
 				struct proc_info pi_net;
 				if (bpf_map_lookup_elem(proc_map_fd,
 							&ne->tgid, &pi_net) == 0) {
+					cev.ppid      = pi_net.ppid;
+					cev.state = pi_net.state;
 					cev.loginuid  = pi_net.loginuid;
 					cev.sessionid = pi_net.sessionid;
 					cev.euid      = pi_net.euid;
 					cev.tty_nr    = pi_net.tty_nr;
+					cev.start_time_ns = pi_net.start_ns
+						? pi_net.start_ns + (__u64)g_boot_to_wall_ns : 0;
+					cmdline_split(pi_net.cmdline, pi_net.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 				}
 			}
 
@@ -2862,6 +2923,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			}
 
 			pwd_lookup_ts(ne->tgid, cev.pwd, sizeof(cev.pwd));
+			if (!cev.pwd[0])
+				pwd_read_and_store(ne->tgid);
+			pwd_lookup_ts(ne->tgid, cev.pwd, sizeof(cev.pwd));
+
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -2886,7 +2951,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (bpf_map_lookup_elem(tracked_map_fd, &se->sender_tgid, &ti) == 0)
 			rname = (ti.rule_id < num_rules)
 				? rules[ti.rule_id].name : RULE_NOT_MATCH;
-		if (rname[0] == '?' && rname[1] == '\0') {
+		/* Fallback: если отправитель не tracked — берём rule от получателя */
+		if (strcmp(rname, RULE_NOT_MATCH) == 0) {
 			if (bpf_map_lookup_elem(tracked_map_fd, &se->target_pid, &ti) == 0)
 				rname = (ti.rule_id < num_rules)
 					? rules[ti.rule_id].name : RULE_NOT_MATCH;
@@ -2904,20 +2970,16 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 
-			/* Время: clock_gettime (сигналы редкие, допустим syscall) */
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
-					 + (__u64)ts_now.tv_nsec;
+			cev.timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				    "signal");
 			fast_strcpy(cev.rule, sizeof(cev.rule), rname);
 
 			/* Теги: сначала отправителя, потом получателя */
 			char sig_tags[TAGS_MAX_LEN];
-			tags_lookup_ts(se->sender_tgid, sig_tags, sizeof(sig_tags));
+			ensure_tags(se->sender_tgid, sig_tags, sizeof(sig_tags));
 			if (!sig_tags[0])
-				tags_lookup_ts(se->target_pid, sig_tags, sizeof(sig_tags));
+				ensure_tags(se->target_pid, sig_tags, sizeof(sig_tags));
 			fast_strcpy(cev.tags, sizeof(cev.tags), sig_tags);
 
 			/* Данные отправителя из tracked_map */
@@ -2929,19 +2991,26 @@ static int handle_event(void *ctx, void *data, size_t size)
 			cev.pid = se->sender_tgid;
 			cev.uid = se->sender_uid;
 			memcpy(cev.comm, se->sender_comm, COMM_LEN);
+			memcpy(cev.thread_name, se->sender_thread_name, COMM_LEN);
 			if (cg_buf[0])
 				fast_strcpy(cev.cgroup, sizeof(cev.cgroup),
 					    cg_buf);
 
-			/* Идентификация отправителя из proc_info (loginuid, tty, ...) */
+			/* Идентификация отправителя из proc_info */
 			struct proc_info sender_pi;
 			if (bpf_map_lookup_elem(proc_map_fd,
 						&se->sender_tgid,
 						&sender_pi) == 0) {
+				cev.ppid = sender_pi.ppid;
 				cev.loginuid = sender_pi.loginuid;
 				cev.sessionid = sender_pi.sessionid;
 				cev.euid = sender_pi.euid;
 				cev.tty_nr = sender_pi.tty_nr;
+				cev.state = sender_pi.state;
+				cev.start_time_ns = sender_pi.start_ns ? sender_pi.start_ns + (__u64)g_boot_to_wall_ns : 0;
+				cmdline_split(sender_pi.cmdline, sender_pi.cmdline_len,
+					      cev.exec_path, sizeof(cev.exec_path),
+					      cev.args, sizeof(cev.args));
 			}
 
 			/* Поля сигнала: номер, PID получателя, код, результат */
@@ -2965,6 +3034,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 				fclose(tcf);
 			}
 
+			pwd_lookup_ts(se->sender_tgid, cev.pwd, sizeof(cev.pwd));
+			if (!cev.pwd[0])
+				pwd_read_and_store(se->sender_tgid);
 			pwd_lookup_ts(se->sender_tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -2991,12 +3063,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-
-			/* Время: clock_gettime (ретрансмиты редкие) */
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
-					 + (__u64)ts_now.tv_nsec;
+			cev.timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				 "tcp_retrans");
 			cev.pid = re->tgid;
@@ -3013,8 +3080,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 					fast_strcpy(cev.rule, sizeof(cev.rule),
 						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				tags_lookup_ts(re->tgid, cev.tags,
+				ensure_tags(re->tgid, cev.tags,
 					       sizeof(cev.tags));
+			}
+			/* exec/args из proc_map */
+			{
+				struct proc_info pi_sec;
+				if (bpf_map_lookup_elem(proc_map_fd,
+							&re->tgid, &pi_sec) == 0)
+					cmdline_split(pi_sec.cmdline, pi_sec.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 			}
 
 			/* Identity из proc_map */
@@ -3026,6 +3102,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cev.sessionid = pi_ret.sessionid;
 					cev.euid      = pi_ret.euid;
 					cev.tty_nr    = pi_ret.tty_nr;
+					cev.state = pi_ret.state;
+					cev.start_time_ns = pi_ret.start_ns ? pi_ret.start_ns + (__u64)g_boot_to_wall_ns : 0;
 				}
 			}
 
@@ -3075,10 +3153,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC
-					 + (__u64)ts_now.tv_nsec;
+			cev.timestamp_ns = se_syn->timestamp_ns + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), "syn_recv");
 			cev.pid = se_syn->tgid;
 			cev.uid = se_syn->uid;
@@ -3092,7 +3167,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					fast_strcpy(cev.rule, sizeof(cev.rule),
 						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				tags_lookup_ts(se_syn->tgid, cev.tags,
+				ensure_tags(se_syn->tgid, cev.tags,
 					       sizeof(cev.tags));
 			}
 			/* Identity из proc_map */
@@ -3105,6 +3180,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cev.sessionid = pi_syn.sessionid;
 					cev.euid      = pi_syn.euid;
 					cev.tty_nr    = pi_syn.tty_nr;
+					cev.state = pi_syn.state;
+					cev.start_time_ns = pi_syn.start_ns ? pi_syn.start_ns + (__u64)g_boot_to_wall_ns : 0;
+					cmdline_split(pi_syn.cmdline, pi_syn.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 				}
 			}
 			cev.sec_af = se_syn->af;
@@ -3152,9 +3232,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			memset(&cev, 0, sizeof(cev));
 			fast_strcpy(cev.rule, sizeof(cev.rule), RULE_NOT_MATCH);
-			struct timespec ts_now;
-			clock_gettime(CLOCK_REALTIME, &ts_now);
-			cev.timestamp_ns = (__u64)ts_now.tv_sec * NS_PER_SEC + (__u64)ts_now.tv_nsec;
+			cev.timestamp_ns = rste->timestamp_ns + (__u64)g_boot_to_wall_ns;
 			fast_strcpy(cev.event_type, sizeof(cev.event_type), rste->direction ? "rst_recv" : "rst_sent");
 			cev.pid = rste->tgid;
 			cev.uid = rste->uid;
@@ -3167,7 +3245,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 					fast_strcpy(cev.rule, sizeof(cev.rule),
 						    rules[ti.rule_id].name);
 				cev.root_pid = ti.root_pid;
-				tags_lookup_ts(rste->tgid, cev.tags,
+				ensure_tags(rste->tgid, cev.tags,
 					       sizeof(cev.tags));
 			}
 			/* Identity из proc_map */
@@ -3180,6 +3258,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 					cev.sessionid = pi_rst.sessionid;
 					cev.euid      = pi_rst.euid;
 					cev.tty_nr    = pi_rst.tty_nr;
+					cev.state = pi_rst.state;
+					cev.start_time_ns = pi_rst.start_ns ? pi_rst.start_ns + (__u64)g_boot_to_wall_ns : 0;
+					cmdline_split(pi_rst.cmdline, pi_rst.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 				}
 			}
 			cev.sec_af = rste->af;
@@ -3260,6 +3343,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			pi.start_ns  = e->start_ns;
 			pi.cgroup_id = e->cgroup_id;
 			memcpy(pi.comm, e->comm, COMM_LEN);
+			memcpy(pi.thread_name, e->thread_name, COMM_LEN);
 			memcpy(pi.cmdline, e->cmdline, CMDLINE_MAX);
 			pi.cmdline_len = e->cmdline_len;
 			bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
@@ -3315,12 +3399,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
 			char fork_tags[TAGS_MAX_LEN];
-			tags_lookup_ts(e->tgid, fork_tags, sizeof(fork_tags));
+			ensure_tags(e->tgid, fork_tags, sizeof(fork_tags));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "fork", rname,
 				       fork_tags, cg_buf);
 			cev.root_pid = parent_ti.root_pid;
 			cev.tty_nr = child_tty;
+			{
+				struct proc_info fork_pi;
+				if (bpf_map_lookup_elem(proc_map_fd, &e->tgid, &fork_pi) == 0)
+					cev.state = fork_pi.state;
+			}
 			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3355,17 +3444,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		 * │  Используем bare-функции (без _ts), т.к. wrlock         │
 		 * │  уже взят вручную.                                       │
 		 * └───────────────────────────────────────────────────────────┘ */
-		pthread_rwlock_wrlock(&g_tags_lock);
-		{
-			const char *t = tags_lookup(e->tgid);
-			if (!t[0]) {
-				tags_inherit(e->tgid, e->ppid);
-				t = tags_lookup(e->tgid);
-			}
-			snprintf(exit_tags, sizeof(exit_tags), "%s", t);
-			/* НЕ удаляем tags — snapshot зачистит вместе с картами */
-		}
-		pthread_rwlock_unlock(&g_tags_lock);
+		ensure_tags(e->tgid, exit_tags, sizeof(exit_tags));
 #endif
 
 		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
@@ -3386,6 +3465,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 					       sizeof(cg_buf));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags, cg_buf);
+			{
+				struct proc_info exit_pi;
+				if (bpf_map_lookup_elem(proc_map_fd, &e->tgid, &exit_pi) == 0)
+					cev.state = exit_pi.state;
+			}
 			pwd_lookup_ts(e->tgid, cev.pwd, sizeof(cev.pwd));
 			fill_parent_pids(&cev);
 			ef_append(&cev, cfg_hostname);
@@ -3434,7 +3518,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			resolve_cgroup_fast_ts(e->cgroup_id, cg_buf,
 					       sizeof(cg_buf));
 			char oom_tags[TAGS_MAX_LEN];
-			tags_lookup_ts(e->tgid, oom_tags, sizeof(oom_tags));
+			ensure_tags(e->tgid, oom_tags, sizeof(oom_tags));
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname,
 				       oom_tags, cg_buf);
@@ -3865,6 +3949,7 @@ static void refresh_processes(void)
 				if (fgets(cbuf, sizeof(cbuf), cf)) {
 					cbuf[strcspn(cbuf, "\n")] = '\0';
 					memcpy(pi.comm, cbuf, COMM_LEN);
+					memcpy(pi.thread_name, cbuf, COMM_LEN);
 					bpf_map_update_elem(proc_map_fd, &key,
 							    &pi, BPF_EXIST);
 				}
@@ -4004,11 +4089,17 @@ static void refresh_processes(void)
 							&ukey.tgid,
 							&upi) == 0) {
 					memcpy(cev.comm, upi.comm, COMM_LEN);
+					memcpy(cev.thread_name, upi.thread_name, COMM_LEN);
 					cev.uid       = upi.uid;
 					cev.loginuid  = upi.loginuid;
 					cev.sessionid = upi.sessionid;
 					cev.euid      = upi.euid;
 					cev.tty_nr    = upi.tty_nr;
+					cev.state = upi.state;
+					cev.start_time_ns = upi.start_ns ? upi.start_ns + (__u64)g_boot_to_wall_ns : 0;
+					cmdline_split(upi.cmdline, upi.cmdline_len,
+						      cev.exec_path, sizeof(cev.exec_path),
+						      cev.args, sizeof(cev.args));
 					resolve_cgroup_ts(upi.cgroup_id,
 							  cev.cgroup,
 							  sizeof(cev.cgroup));
@@ -4353,14 +4444,20 @@ static void write_snapshot(void)
 				 "snapshot");
 			snprintf(cev.rule, sizeof(cev.rule), "%s", rule_name);
 #ifndef NO_TAGS
-			snprintf(cev.tags, sizeof(cev.tags), "%s",
-				 tags_lookup_copy(snap_tgid, snap_data, key));
+			{
+				const char *snap_tags = tags_lookup_copy(snap_tgid, snap_data, key);
+				if (snap_tags[0])
+					snprintf(cev.tags, sizeof(cev.tags), "%s", snap_tags);
+				else
+					ensure_tags(key, cev.tags, sizeof(cev.tags));
+			}
 #endif
 			cev.root_pid = tracked ? ti.root_pid : 0;
 			cev.pid = pi.tgid;
 			cev.ppid = pi.ppid;
 			cev.uid = pi.uid;
 			memcpy(cev.comm, pi.comm, COMM_LEN);
+			memcpy(cev.thread_name, pi.thread_name, COMM_LEN);
 			cmdline_split(pi.cmdline, pi.cmdline_len, cev.exec_path, sizeof(cev.exec_path), cev.args, sizeof(cev.args));
 			snprintf(cev.cgroup, sizeof(cev.cgroup), "%s", cg_path);
 			cev.is_root = tracked ? ti.is_root : 0;
@@ -4491,12 +4588,14 @@ static void write_snapshot(void)
 						    sizeof(cev.rule),
 						    rname);
 #ifndef NO_TAGS
-					fast_strcpy(cev.tags,
-						    sizeof(cev.tags),
-						    tags_lookup_copy(
-							snap_tgid,
-							snap_data,
-							si.tgid));
+					{
+						const char *cs_tags = tags_lookup_copy(
+							snap_tgid, snap_data, si.tgid);
+						if (cs_tags[0])
+							fast_strcpy(cev.tags, sizeof(cev.tags), cs_tags);
+						else
+							ensure_tags(si.tgid, cev.tags, sizeof(cev.tags));
+					}
 #endif
 					cev.root_pid = tracked ? ti.root_pid : 0;
 					cev.pid = si.tgid;
@@ -4509,12 +4608,20 @@ static void write_snapshot(void)
 						proc_map_fd,
 						&si.tgid, &cpi) == 0) {
 						cev.ppid = cpi.ppid;
+						cev.state = 0;  /* state set to L/E below */
 						memcpy(cev.comm, cpi.comm,
+						       COMM_LEN);
+						memcpy(cev.thread_name,
+						       cpi.thread_name,
 						       COMM_LEN);
 						cev.loginuid  = cpi.loginuid;
 						cev.sessionid = cpi.sessionid;
 						cev.euid      = cpi.euid;
 						cev.tty_nr    = cpi.tty_nr;
+						cev.start_time_ns = cpi.start_ns ? cpi.start_ns + (__u64)g_boot_to_wall_ns : 0;
+						cmdline_split(cpi.cmdline, cpi.cmdline_len,
+							      cev.exec_path, sizeof(cev.exec_path),
+							      cev.args, sizeof(cev.args));
 					}
 
 					/* IP-адреса */
@@ -4561,6 +4668,11 @@ static void write_snapshot(void)
 					/* is_listener → state: 'L'=listener, 'E'=established */
 					cev.state = si.is_listener ? 'L' : 'E';
 
+					pidtree_get_chain_copy(
+						snap_pt_pid, snap_pt_ppid,
+						si.tgid,
+						cev.parent_pids,
+						&cev.parent_pids_len);
 					ef_append(&cev, cfg_hostname);
 					conn_count++;
 				}

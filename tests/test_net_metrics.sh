@@ -158,6 +158,9 @@ with open(fname, encoding='utf-8', errors='replace') as f:
             continue
         if filt and filt not in row.get('exec','') and filt not in str(row.get('net_local_port','')) and filt not in str(row.get('net_remote_port','')):
             continue
+        # Для conn_snapshot пропускаем listener — нужны established
+        if evt_type == 'conn_snapshot' and row.get('state') == 'L':
+            continue
         print(row.get(field, ''))
 " "$@" 2>/dev/null | head -1
 }

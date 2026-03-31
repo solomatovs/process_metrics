@@ -13,18 +13,21 @@ CREATE TABLE _pm_target (
     event_type             LowCardinality(String)      CODEC(ZSTD(1)),
     rule                   LowCardinality(String)      CODEC(ZSTD(1)),
     tags                   Array(String)               CODEC(ZSTD(1)),
-    root_pid               UInt32                      CODEC(T64, ZSTD(1)),
+    rule_pid               UInt32                      CODEC(T64, ZSTD(1)),
     pid                    UInt32                      CODEC(T64, ZSTD(1)),
     ppid                   UInt32                      CODEC(T64, ZSTD(1)),
+    process_chain            Array(UInt32)               CODEC(ZSTD(1)),
     uid                    UInt32                      CODEC(T64, ZSTD(1)),
     user_name              LowCardinality(String)      CODEC(ZSTD(1)),
     loginuid               UInt32                      CODEC(T64, ZSTD(1)),
     login_name             LowCardinality(String)      CODEC(ZSTD(1)),
     sessionid              UInt32                      CODEC(T64, ZSTD(1)),
+    session_name           LowCardinality(String)      CODEC(ZSTD(1)),
     euid                   UInt32                      CODEC(T64, ZSTD(1)),
     euser_name             LowCardinality(String)      CODEC(ZSTD(1)),
     tty_nr                 UInt32                      CODEC(T64, ZSTD(1)),
     comm                   LowCardinality(String)      CODEC(ZSTD(1)),
+    thread_name            LowCardinality(String)      CODEC(ZSTD(1)),
     exec                   String                      CODEC(ZSTD(1)),
     args                   String                      CODEC(ZSTD(1)),
     cgroup                 LowCardinality(String)      CODEC(ZSTD(1)),
@@ -58,7 +61,7 @@ CREATE TABLE _pm_target (
     oom_killed             UInt8                       CODEC(T64, ZSTD(1)),
     net_tx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
     net_rx_bytes           UInt64                      CODEC(Delta, ZSTD(1)),
-    start_time_ns          DateTime64(9, 'UTC')        CODEC(Delta, ZSTD(1)),
+    start_time_ns          UInt64                      CODEC(DoubleDelta, ZSTD(1)),
     uptime_seconds         UInt64                      CODEC(T64, ZSTD(1)),
     mnt_ns                 UInt32                      CODEC(T64, ZSTD(1)),
     pid_ns                 UInt32                      CODEC(T64, ZSTD(1)),
@@ -78,7 +81,7 @@ CREATE TABLE _pm_target (
     cgroup_pids_current    Int64                       CODEC(T64, ZSTD(1)),
     file_path              String                      CODEC(ZSTD(1)),
     file_new_path          String                      CODEC(ZSTD(1)),
-    file_flags             UInt32                      CODEC(T64, ZSTD(1)),
+    file_flags             Array(String)               CODEC(ZSTD(1)),
     file_read_bytes        UInt64                      CODEC(Delta, ZSTD(1)),
     file_write_bytes       UInt64                      CODEC(Delta, ZSTD(1)),
     file_open_count        UInt32                      CODEC(T64, ZSTD(1)),
@@ -111,7 +114,6 @@ CREATE TABLE _pm_target (
     disk_total_bytes       UInt64                      CODEC(T64, ZSTD(1)),
     disk_used_bytes        UInt64                      CODEC(T64, ZSTD(1)),
     disk_avail_bytes       UInt64                      CODEC(T64, ZSTD(1)),
-    parent_pids            Array(UInt32)               CODEC(ZSTD(1)),
 
     INDEX idx_pid       pid            TYPE bloom_filter(0.01) GRANULARITY 4,
     INDEX idx_cgroup    cgroup         TYPE bloom_filter(0.01) GRANULARITY 4,
@@ -185,7 +187,7 @@ SELECT 'ALTER TABLE process_metrics MATERIALIZE PROJECTION proj_time_series;';
 -- Генерирует DROP+CREATE с прежним URL и актуальной структурой.
 -- Выполните если менялся набор колонок в CSV.
 
-SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (\n    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n    if(parent_pids = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', parent_pids))) AS parent_pids\n)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
+SELECT format('DROP VIEW IF EXISTS {0};\nCREATE MATERIALIZED VIEW {0}\nREFRESH EVERY 3 SECOND APPEND\nTO {1}.process_metrics\nAS\nSELECT * REPLACE (\n    if(tags = '''', [], splitByChar(''|'', tags)) AS tags,\n    if(process_chain = '''', [], arrayMap(x -> toUInt32(x), splitByChar(''|'', process_chain))) AS process_chain\n)\nFROM url(''{2}'', ''CSVWithNames'', ''{3}'');',
     mv.name,
     currentDatabase(),
     extractAll(mv.create_table_query, 'url\\(''([^'']+)''')[1],
@@ -197,7 +199,7 @@ CROSS JOIN (
         name || ' ' || multiIf(
             name = 'timestamp', 'DateTime64(3, ''''UTC'''')',
             name = 'start_time_ns', 'DateTime64(9, ''''UTC'''')',
-            name IN ('tags', 'parent_pids'), 'String',
+            name IN ('tags', 'process_chain'), 'String',
             type LIKE 'LowCardinality(%)', extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type
         )

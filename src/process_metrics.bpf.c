@@ -601,6 +601,23 @@ static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
 	return (__u16)len;
 }
 
+/*
+ * Заполняет comm = group leader, thread_name = текущий поток.
+ * Для главного потока (tid == tgid) оба совпадают.
+ */
+static __always_inline void read_comm_and_thread(
+	char *comm, int comm_sz,
+	char *thread_name, int thread_sz)
+{
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
+	if (leader)
+		bpf_probe_read_kernel_str(comm, comm_sz, &leader->comm);
+	else
+		bpf_get_current_comm(comm, comm_sz);
+	bpf_get_current_comm(thread_name, thread_sz);
+}
+
 /* ── EXEC ─────────────────────────────────────────────────────────── */
 
 /*
@@ -632,7 +649,8 @@ int handle_exec(void *ctx)
 	 * Это экономит место в ring buffer при интенсивном fork+exec. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
-		bpf_get_current_comm(info->comm, sizeof(info->comm));
+		read_comm_and_thread(info->comm, sizeof(info->comm),
+				     info->thread_name, sizeof(info->thread_name));
 		info->cgroup_id   = bpf_get_current_cgroup_id();
 		info->cmdline_len = read_cmdline(task, info->cmdline);
 		read_identity(
@@ -684,8 +702,9 @@ int handle_exec(void *ctx)
 	e->cgroup_id    = bpf_get_current_cgroup_id();
 	/* Время старта процесса из task_struct (CO-RE) */
 	e->start_ns     = BPF_CORE_READ(task, start_time);
-	/* Имя процесса (comm, до 16 байт) */
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	/* Имя процесса (group leader) и имя потока */
+	read_comm_and_thread(e->comm, sizeof(e->comm),
+			     e->thread_name, sizeof(e->thread_name));
 	/* Полная командная строка из mm->arg_start..arg_end (читается из RAM
 	 * процесса через bpf_probe_read_user, без обращения к диску/VFS) */
 	e->cmdline_len  = read_cmdline(task, e->cmdline);
@@ -759,7 +778,8 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	child_pi->uid       = (__u32)bpf_get_current_uid_gid();
 	child_pi->cgroup_id = bpf_get_current_cgroup_id();
 	child_pi->start_ns  = BPF_CORE_READ(child, start_time);
-	bpf_get_current_comm(child_pi->comm, sizeof(child_pi->comm));
+	read_comm_and_thread(child_pi->comm, sizeof(child_pi->comm),
+			     child_pi->thread_name, sizeof(child_pi->thread_name));
 
 	/* Наследуем identity/планировщик/пространства имён от родителя */
 	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
@@ -794,7 +814,8 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id    = child_pi->cgroup_id;
 	e->start_ns     = child_pi->start_ns;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	read_comm_and_thread(e->comm, sizeof(e->comm),
+			     e->thread_name, sizeof(e->thread_name));
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -1075,7 +1096,8 @@ int handle_exit(void *ctx)
 	e->tgid         = tgid;
 	e->uid          = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = exit_ts;
-	bpf_get_current_comm(e->comm, sizeof(e->comm));
+	read_comm_and_thread(e->comm, sizeof(e->comm),
+			     e->thread_name, sizeof(e->thread_name));
 
 	/* Данные отслеживания */
 	e->root_pid = ti->root_pid;
@@ -1246,7 +1268,8 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	se->sig          = sig;
 	se->sig_code     = code;
 	se->sig_result   = result;
-	bpf_get_current_comm(se->sender_comm, sizeof(se->sender_comm));
+	read_comm_and_thread(se->sender_comm, sizeof(se->sender_comm),
+			     se->sender_thread_name, sizeof(se->sender_thread_name));
 
 	/* cgroup id отправителя */
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -1571,7 +1594,8 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 		fe->tgid = tgid;
 		fe->timestamp_ns = bpf_ktime_get_boot_ns();
 		fe->cgroup_id = bpf_get_current_cgroup_id();
-		bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+		read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 		__builtin_memcpy(fe->path, fi->path, BPF_FILE_PATH_MAX);
 		fe->flags = fi->flags;
 		fe->uid = (__u32)bpf_get_current_uid_gid();
@@ -1626,7 +1650,8 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1690,7 +1715,8 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1754,7 +1780,8 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1798,7 +1825,8 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1836,7 +1864,8 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->tgid = tgid;
 		fe->timestamp_ns = bpf_ktime_get_boot_ns();
 		fe->cgroup_id = bpf_get_current_cgroup_id();
-		bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+		read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 		__builtin_memcpy(fe->path, fi->path, BPF_FILE_PATH_MAX);
 		fe->flags = fi->flags;
 		fe->read_bytes = fi->read_bytes;
@@ -2283,7 +2312,8 @@ int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
 	fe->uid  = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
 	fe->chmod_mode = mode;
 
@@ -2321,7 +2351,8 @@ int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
 	fe->uid  = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(fe->comm, sizeof(fe->comm));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm),
+			     fe->thread_name, sizeof(fe->thread_name));
 	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
 	fe->chown_uid = uid;
 	fe->chown_gid = gid;
@@ -2442,7 +2473,8 @@ static __always_inline void emit_net_event(struct sock_info *si,
 	ne->uid          = si->uid;
 	ne->timestamp_ns = now_ns;
 	ne->cgroup_id    = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(ne->comm, sizeof(ne->comm));
+	read_comm_and_thread(ne->comm, sizeof(ne->comm),
+			     ne->thread_name, sizeof(ne->thread_name));
 
 	struct task_struct *task =
 		(struct task_struct *)bpf_get_current_task();
@@ -2484,7 +2516,8 @@ static __always_inline void emit_net_close(struct sock_info *si,
 	ne->uid          = si->uid;
 	ne->timestamp_ns = now_ns;
 	ne->cgroup_id    = bpf_get_current_cgroup_id();
-	bpf_get_current_comm(ne->comm, sizeof(ne->comm));
+	read_comm_and_thread(ne->comm, sizeof(ne->comm),
+			     ne->thread_name, sizeof(ne->thread_name));
 
 	/* Получаем ppid */
 	struct task_struct *task =
@@ -2545,7 +2578,7 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	si.start_ns = bpf_ktime_get_boot_ns();
 	read_sock_addrs(sk, &si);
 
-	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_ANY);
 	emit_net_event(&si, si.start_ns, EVENT_NET_CONNECT);
 
 	/* open_conn_count: инкремент */
@@ -2594,7 +2627,7 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	si.start_ns = bpf_ktime_get_boot_ns();
 	read_sock_addrs(sk, &si);
 
-	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_ANY);
 	emit_net_event(&si, si.start_ns, EVENT_NET_CONNECT);
 
 	/* open_conn_count: инкремент */
@@ -2627,7 +2660,7 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	si.start_ns = bpf_ktime_get_boot_ns();
 	read_sock_addrs(sk, &si);
 
-	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_ANY);
 	emit_net_event(&si, si.start_ns, EVENT_NET_ACCEPT);
 
 	/* open_conn_count: инкремент */
@@ -2658,7 +2691,7 @@ int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
 	si.is_listener = 1;
 	read_sock_addrs(sk, &si);
 
-	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_ANY);
 	emit_net_event(&si, si.start_ns, EVENT_NET_LISTEN);
 	return 0;
 }
@@ -3553,7 +3586,7 @@ int seed_sock_map_iter(struct bpf_iter__tcp *ctx)
 
 	read_sock_addrs(sk, &si);
 
-	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_NOEXIST);
+	bpf_map_update_elem(&sock_map, &sk_ptr, &si, BPF_ANY);
 
 	/* open_conn_count: инкремент (только для соединений, не listener) */
 	if (!si.is_listener) {

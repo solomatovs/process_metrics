@@ -44,6 +44,7 @@ struct metric_event {
 	__u32 ppid;
 	__u32 uid;                    /* реальный UID процесса */
 	char  comm[COMM_LEN];
+	char  thread_name[COMM_LEN];  /* имя потока (может отличаться от comm у многопоточных процессов) */
 	char  exec_path[CMDLINE_MAX]; /* путь к исполняемому файлу (argv[0]) */
 	char  args[CMDLINE_MAX];      /* аргументы (argv[1..]) */
 	char  cgroup[EV_CGROUP_LEN];
