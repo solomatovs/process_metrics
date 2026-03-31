@@ -191,8 +191,8 @@ WITH
 url_cols AS (
     SELECT arrayStringConcat(groupArray(
         name || ' ' || multiIf(
-            name = 'timestamp',                                'DateTime64(3, \'UTC\')',
-            name = 'start_time_ns',                            'DateTime64(9, \'UTC\')',
+            name = 'timestamp',                                'DateTime64(3, ''UTC'')',
+            name = 'start_time_ns',                            'DateTime64(9, ''UTC'')',
             name IN ('tags', 'process_chain', 'file_flags'),   'String',
             type LIKE 'LowCardinality(%)',                     extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type
@@ -205,13 +205,13 @@ url_cols AS (
 mv_list AS (
     SELECT
         name,
-        extractAll(create_table_query, 'url\\(\'([^\']+)\'')[1] AS url
+        extractAll(create_table_query, 'url\\(''([^'']+)''')[1] AS url
     FROM system.tables
     WHERE database = currentDatabase()
       AND engine = 'MaterializedView'
       AND create_table_query LIKE concat('%TO ', currentDatabase(), '.process_metrics%')
 )
-SELECT format("DROP VIEW IF EXISTS {0};
+SELECT format($$DROP VIEW IF EXISTS {0};
 CREATE MATERIALIZED VIEW {0}
 REFRESH EVERY 3 SECOND APPEND
 TO {1}.process_metrics
@@ -221,7 +221,7 @@ SELECT * REPLACE (
     if(process_chain = '', [], arrayMap(x -> toUInt32(x), splitByChar('|', process_chain))) AS process_chain,
     if(file_flags = '', [], splitByChar('|', file_flags)) AS file_flags
 )
-FROM url('{2}', 'CSVWithNames', '{3}');",
+FROM url('{2}', 'CSVWithNames', '{3}');$$,
     mv_list.name,
     currentDatabase(),
     mv_list.url,
@@ -248,8 +248,8 @@ WITH
 url_cols AS (
     SELECT arrayStringConcat(groupArray(
         name || ' ' || multiIf(
-            name = 'timestamp',                                'DateTime64(3, \'UTC\')',
-            name = 'start_time_ns',                            'DateTime64(9, \'UTC\')',
+            name = 'timestamp',                                'DateTime64(3, ''UTC'')',
+            name = 'start_time_ns',                            'DateTime64(9, ''UTC'')',
             name IN ('tags', 'process_chain', 'file_flags'),   'String',
             type LIKE 'LowCardinality(%)',                     extractAll(type, 'LowCardinality\\((.+)\\)')[1],
             type
@@ -259,7 +259,7 @@ url_cols AS (
           WHERE database = currentDatabase() AND table = 'process_metrics'
           ORDER BY position)
 )
-SELECT format("CREATE MATERIALIZED VIEW mv_process_metrics
+SELECT format($$CREATE MATERIALIZED VIEW mv_process_metrics
 REFRESH EVERY 3 SECOND APPEND
 TO {0}.process_metrics
 AS
@@ -268,7 +268,7 @@ SELECT * REPLACE (
     if(process_chain = '', [], arrayMap(x -> toUInt32(x), splitByChar('|', process_chain))) AS process_chain,
     if(file_flags = '', [], splitByChar('|', file_flags)) AS file_flags
 )
-FROM url('<URL>', 'CSVWithNames', '{1}');",
+FROM url('<URL>', 'CSVWithNames', '{1}');$$,
     currentDatabase(),
     url_cols.cols
 )
