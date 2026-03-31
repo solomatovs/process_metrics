@@ -35,7 +35,7 @@
 
 /* ── ёмкости хеш-таблиц и кешей (userspace) ───────────────────────── */
 #define MAX_RULES            64     /* максимум правил трекинга */
-#define MAX_CGROUPS          256    /* максимум cgroup в кеше */
+#define MAX_CGROUPS          4096   /* максимум cgroup в кеше */
 #define TAGS_HT_SIZE         16384  /* хеш-таблица тегов (степень 2) */
 #define PIDTREE_HT_SIZE      65536  /* дерево pid→ppid (степень 2, покрывает pid_max) */
 #define CHAIN_CACHE_SIZE     16384  /* кеш цепочек parent_pids (степень 2) */

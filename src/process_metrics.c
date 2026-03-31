@@ -982,8 +982,9 @@ struct cgroup_entry {
 	char  fs_path[EV_CGROUP_LEN]; /* реальный путь в файловой системе под /sys/fs/cgroup */
 };
 
-static struct cgroup_entry cgroup_cache[MAX_CGROUPS];
+static struct cgroup_entry *cgroup_cache;    /* выделяется в main(), размер cfg_max_cgroups */
 static int cgroup_cache_count;
+static int cfg_max_cgroups = MAX_CGROUPS;    /* по умолчанию MAX_CGROUPS, настраивается из конфига */
 static char docker_data_root[PATH_MAX_LEN] = "";
 
 /* ── кэш cgroup-метрик (заполняется refresh, читается snapshot) ───── */
@@ -997,7 +998,7 @@ struct cgroup_metrics {
 	int  valid;                     /* 1 = значения прочитаны из /sys/fs/cgroup */
 };
 
-static struct cgroup_metrics cg_metrics[MAX_CGROUPS];
+static struct cgroup_metrics *cg_metrics;    /* выделяется в main(), размер cfg_max_cgroups */
 static int cg_metrics_count;
 
 /*
@@ -1316,15 +1317,20 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 	snprintf(full, sizeof(full), "%s/%s", base, rel);
 
 	struct stat st;
-	if (stat(full, &st) == 0 && cgroup_cache_count < MAX_CGROUPS) {
-		cgroup_cache[cgroup_cache_count].id = (__u64)st.st_ino;
+	if (stat(full, &st) == 0) {
+		if (cgroup_cache_count < cfg_max_cgroups) {
+			cgroup_cache[cgroup_cache_count].id = (__u64)st.st_ino;
 
-		/* Сохраняем реальный путь файловой системы (имена Docker резолвятся лениво при выводе) */
-		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
-			 sizeof(cgroup_cache[0].fs_path), "%s", rel);
-		snprintf(cgroup_cache[cgroup_cache_count].path,
-			 sizeof(cgroup_cache[0].path), "%s", rel);
-		cgroup_cache_count++;
+			/* Сохраняем реальный путь файловой системы (имена Docker резолвятся лениво при выводе) */
+			snprintf(cgroup_cache[cgroup_cache_count].fs_path,
+				 sizeof(cgroup_cache[0].fs_path), "%s", rel);
+			snprintf(cgroup_cache[cgroup_cache_count].path,
+				 sizeof(cgroup_cache[0].path), "%s", rel);
+			cgroup_cache_count++;
+		} else {
+			LOG_WARN("cgroup cache full (%d) during scan, skipping: %s",
+				 cfg_max_cgroups, rel);
+		}
 	}
 
 	DIR *d = opendir(full);
@@ -1335,7 +1341,7 @@ static void scan_cgroup_dir(const char *base, const char *rel)
 	while ((entry = readdir(d)) != NULL) {
 		if (entry->d_type != DT_DIR || entry->d_name[0] == '.')
 			continue;
-		if (cgroup_cache_count >= MAX_CGROUPS)
+		if (cgroup_cache_count >= cfg_max_cgroups)
 			break;
 		char child[PATH_MAX_LEN];
 		if (rel[0])
@@ -1436,13 +1442,16 @@ static void cgroup_cache_add(__u64 id, const char *path)
 		}
 	}
 	/* Добавление новой записи */
-	if (cgroup_cache_count < MAX_CGROUPS) {
+	if (cgroup_cache_count < cfg_max_cgroups) {
 		cgroup_cache[cgroup_cache_count].id = id;
 		snprintf(cgroup_cache[cgroup_cache_count].fs_path,
 			 sizeof(cgroup_cache[0].fs_path), "%s", path);
 		snprintf(cgroup_cache[cgroup_cache_count].path,
 			 sizeof(cgroup_cache[0].path), "%s", path);
 		cgroup_cache_count++;
+	} else {
+		LOG_WARN("cgroup cache full (%d), dropping: id=%llu path=%s",
+			 cfg_max_cgroups, (unsigned long long)id, path);
 	}
 	pthread_rwlock_unlock(&g_cgroup_lock);
 }
@@ -1507,6 +1516,10 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 		break;
 
 	case EVENT_CGROUP_ATTACH_TASK:
+		/* Процесс перемещён в cgroup — убедимся, что она в кэше
+		 * (BPF уже обновил proc_map.cgroup_id, но userspace может
+		 * не знать эту cgroup, если mkdir-событие было дропнуто) */
+		cgroup_cache_add(ce->id, ce->path);
 		if (cfg_log_level >= 2)
 			LOG_DEBUG(cfg_log_level, "cgroup attach: pid=%d → id=%llu path=%s comm=%s",
 			       ce->pid, (unsigned long long)ce->id,
@@ -1514,6 +1527,7 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 		break;
 
 	case EVENT_CGROUP_TRANSFER_TASKS:
+		cgroup_cache_add(ce->id, ce->path);
 		if (cfg_log_level >= 2)
 			LOG_DEBUG(cfg_log_level, "cgroup transfer: pid=%d → id=%llu path=%s comm=%s",
 			       ce->pid, (unsigned long long)ce->id,
@@ -1661,6 +1675,8 @@ static int load_config(const char *path)
 		cfg_refresh_proc = bool_val;
 	if (config_lookup_int(&cfg, "log_level", &int_val))
 		cfg_log_level = int_val;
+	if (config_lookup_int(&cfg, "max_cgroups", &int_val) && int_val > 0)
+		cfg_max_cgroups = int_val;
 	if (config_lookup_int(&cfg, "heartbeat_interval", &int_val))
 		cfg_heartbeat_interval = int_val;
 	if (config_lookup_bool(&cfg, "log_snapshot", &bool_val))
@@ -3981,7 +3997,7 @@ static void refresh_processes(void)
 			char cg_path[PATH_MAX_LEN], cg_fs_path[PATH_MAX_LEN];
 			resolve_cgroup_ts(pi.cgroup_id, cg_path,
 					  sizeof(cg_path));
-			if (cg_path[0] && cg_metrics_count < MAX_CGROUPS) {
+			if (cg_path[0] && cg_metrics_count < cfg_max_cgroups) {
 				/* Проверяем, уже есть ли в кэше */
 				int found = 0;
 				for (int i = 0; i < cg_metrics_count; i++) {
@@ -4920,6 +4936,15 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	/* Выделение памяти под кэши cgroup */
+	cgroup_cache = calloc(cfg_max_cgroups, sizeof(*cgroup_cache));
+	cg_metrics   = calloc(cfg_max_cgroups, sizeof(*cg_metrics));
+	if (!cgroup_cache || !cg_metrics) {
+		LOG_FATAL("failed to allocate cgroup cache (%d entries)", cfg_max_cgroups);
+		return 1;
+	}
+	LOG_INFO("max_cgroups = %d", cfg_max_cgroups);
+
 	/* Построение кэша cgroup */
 	build_cgroup_cache();
 
@@ -5432,6 +5457,8 @@ int main(int argc, char *argv[])
 
 	LOG_INFO("shutdown: userspace cleanup done");
 
+	free(cgroup_cache);
+	free(cg_metrics);
 	free_rules();
 
 	/* BPF cleanup: close() на perf event fd тригерит в ядре
