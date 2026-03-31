@@ -26,7 +26,7 @@
 #   sudo systemctl enable --now process_metrics
 
 [Unit]
-Description=Process Metrics Collector
+Description=Process Metrics Collector (eBPF, legacy systemd)
 Documentation=file:/etc/process_metrics/process_metrics.conf
 After=network.target
 StartLimitIntervalSec=60
@@ -69,14 +69,14 @@ ExecStart=/usr/local/bin/process_metrics -c /etc/process_metrics/process_metrics
 ExecReload=/bin/kill -HUP $MAINPID
 
 # --- Остановка и рестарт ---
-TimeoutStopSec=5
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
 # MemoryLimit — cgroup v1 аналог MemoryMax.
-MemoryLimit=512M
-CPUQuota=50%
+MemoryLimit=768M
+CPUQuota=25%
 
 # --- Hardening ---
 ProtectSystem=strict

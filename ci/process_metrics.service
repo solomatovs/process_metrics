@@ -31,18 +31,18 @@
 #   kernel.unprivileged_bpf_disabled <= 1  (Debian default=2 блокирует CAP_BPF)
 #   Kernel lockdown != confidentiality  (блокирует kprobes и BPF чтение памяти)
 #
-# Ресурсы (по результатам стресс-тестирования, ~400 PIDs, все коллекторы вкл,
-# snapshot_interval=3s, file_tracking с широким include, BPF_FILE_PATH_MAX=1024):
+# Ресурсы (по результатам стресс-тестирования, ~340 PIDs, все коллекторы вкл,
+# snapshot_interval=3s, file_tracking emit_open/close=off):
 #
 #   CPU:  ~1.3% system-wide (0.4% userspace + 0.9% BPF ядро).
-#       При стрессе (12 I/O workers, 86K file events/20s): ~1.3% total.
+#       При стрессе (OOM burst ~24K proc events/30s): ~1.3% total.
 #       Деградация (ringbuf drops) начинается при CPUQuota < 15%.
 #
-#   RAM:  Userspace RSS ≈ 375 МБ (HTTP buffer 256 МБ + хеш-таблицы + stacks).
+#   RAM:  Userspace RSS ≈ 124 МБ (HTTP buffer 32 МБ + хеш-таблицы + stacks).
 #       BPF карты ядра (НЕ в cgroup): proc_map 280 МБ, fd_map 71 МБ,
-#       ring buffers 390 МБ (proc 128 + file 128 + net 128 + остальные 6),
-#       sock_map/tracked/tid 26 МБ = ~770 МБ.
-#       MemoryMax=1792M — достаточно с запасом для userspace RSS.
+#       ring buffers 27 МБ (proc 16 + file 4 + net 4 + остальные 3),
+#       sock_map/tracked/tid 26 МБ = ~400 МБ.
+#       MemoryMax=768M — достаточно с запасом для userspace RSS.
 #
 #   Disk: 0 (все данные в RAM, disk I/O отсутствует).
 
@@ -96,7 +96,7 @@ Restart=on-failure
 RestartSec=5
 
 # --- Ограничение ресурсов ---
-MemoryMax=1792M
+MemoryMax=768M
 CPUQuota=25%
 
 # --- Hardening ---
