@@ -4,31 +4,31 @@
       {
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
         "enable": true,
         "iconColor": "red",
         "name": "OOM Kill",
-        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\nORDER BY timestamp",
+        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY timestamp",
         "target": {
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\nORDER BY timestamp"
+          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'OOM Kill: ', comm, ' [', toString(pid), ']',\n    '\\nRSS max: ', formatReadableSize(rss_max_bytes),\n    '\\nCgroup: ', cgroup,\n    '\\nCmd: ', exec, if(args != '', concat(' ', args), '')\n  ) AS text,\n  'OOM Kill' AS tags\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY timestamp"
         }
       },
       {
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
         "enable": false,
         "iconColor": "orange",
         "name": "Non-Zero Exit",
-        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND (comm, exit_code) NOT IN (${exit_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\nORDER BY timestamp",
+        "rawQuery": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND (comm, exit_code) NOT IN (${exit_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY timestamp",
         "target": {
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND (comm, exit_code) NOT IN (${exit_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\nORDER BY timestamp"
+          "rawSql": "SELECT\n  timestamp AS time,\n  concat(\n    'EXIT rc=', toString(exit_code),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), '')\n  ) AS text,\n  'exit_error' AS tags\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND exit_code != 0\n  AND (comm, exit_code) NOT IN (${exit_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY timestamp"
         }
       }
     ]
@@ -54,7 +54,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -95,11 +95,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, count(DISTINCT pid) AS processes FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') AND ('${rule}' = 'All' OR rule = '${rule}') GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  count(DISTINCT pid) AS processes\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  ${comment_rule} AND rule = '${rule}'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -109,7 +109,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -151,11 +151,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, sum(rss_bytes) AS total_rss FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') AND ('${rule}' = 'All' OR rule = '${rule}') GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  sum(rss_bytes) AS total_rss\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  ${comment_rule} AND rule = '${rule}'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -165,7 +165,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -207,11 +207,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, sum(cpu_usage_ratio) AS total_cpu FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') AND ('${rule}' = 'All' OR rule = '${rule}') GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  sum(cpu_usage_ratio) AS total_cpu\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  ${comment_rule} AND rule = '${rule}'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -221,7 +221,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -262,11 +262,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, count(DISTINCT cgroup) AS cgroups FROM default.process_metrics WHERE event_type='snapshot' AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') AND cgroup_memory_current > 0 GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  count(DISTINCT cgroup) AS cgroups\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  AND cgroup_memory_current > 0\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -276,7 +276,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -317,11 +317,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, count() AS events FROM default.process_metrics WHERE event_type IN ('fork','exec','exit','oom_kill') AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  count() AS events\nFROM default.process_metrics\nWHERE event_type IN ('fork', 'exec', 'exit', 'oom_kill')\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -331,7 +331,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -361,7 +361,7 @@
         "graphMode": "area",
         "reduceOptions": {
           "calcs": [
-            "lastNotNull"
+            "sum"
           ],
           "fields": "",
           "values": false
@@ -372,11 +372,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT toStartOfInterval(timestamp, INTERVAL 30 SECOND) AS time, count() AS oom_kills FROM default.process_metrics WHERE event_type='oom_kill' AND timestamp >= $__fromTime AND timestamp <= $__toTime AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}') GROUP BY time ORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  count() AS oom_kills\nFROM default.process_metrics\nWHERE event_type = 'oom_kill'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\nGROUP BY time\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -398,7 +398,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -463,11 +463,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND cpu_usage_ratio > 0.001\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY process\n  ORDER BY avg(cpu_usage_ratio) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, process, sum(val) AS cpu\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n    pid,\n    if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n       concat(comm, ' [', toString(pid), ']'), 'other') AS process,\n    max(cpu_usage_ratio) AS val\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND cpu_usage_ratio > 0.001\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY time, pid, process\n)\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "WITH top_comms AS (\n  SELECT\n    comm,\n    concat(comm, ' [',\n      arrayStringConcat(\n        arraySlice(arraySort(groupUniqArray(toString(pid))), 1, 10), ','\n      ),\n      if(length(groupUniqArray(pid)) > 10, ',...', ''),\n    ']') AS series\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND cpu_usage_ratio > 0.001\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY comm\n  ORDER BY avg(cpu_usage_ratio) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, series, sum(val) AS cpu\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    pid,\n    max(cpu_usage_ratio) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND cpu_usage_ratio > 0.001\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY time, comm, pid\n) AS t\nLEFT JOIN top_comms AS tc USING (comm)\nGROUP BY time, if(tc.series = '', 'other', tc.series) AS series\nORDER BY time\nSETTINGS join_use_nulls = 0",
           "refId": "A"
         }
       ],
@@ -477,7 +477,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -539,11 +539,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND rss_bytes > 1048576\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY process\n  ORDER BY avg(rss_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, process, sum(val) AS rss\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n    pid,\n    if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n       concat(comm, ' [', toString(pid), ']'), 'other') AS process,\n    max(rss_bytes) AS val\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND rss_bytes > 1048576\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY time, pid, process\n)\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "WITH top_comms AS (\n  SELECT\n    comm,\n    concat(comm, ' [',\n      arrayStringConcat(arraySlice(arraySort(groupUniqArray(toString(pid))), 1, 10), ','),\n      if(length(groupUniqArray(pid)) > 10, ',...', ''),\n    ']') AS series\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND rss_bytes > 1048576\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY comm\n  ORDER BY avg(rss_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, series, sum(val) AS rss\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm, pid,\n    max(rss_bytes) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND rss_bytes > 1048576\n    AND (length('${process_search}') = 0 OR (exec ILIKE '%${process_search}%' OR comm ILIKE '%${process_search}%' OR args ILIKE '%${process_search}%'))\n  GROUP BY time, comm, pid\n) AS t\nLEFT JOIN top_comms AS tc USING (comm)\nGROUP BY time, if(tc.series = '', 'other', tc.series) AS series\nORDER BY time\nSETTINGS join_use_nulls = 0",
           "refId": "A"
         }
       ],
@@ -553,7 +553,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -562,33 +562,32 @@
           },
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 30,
-            "lineWidth": 1,
+            "fillOpacity": 20,
+            "lineWidth": 2,
             "pointSize": 3,
-            "spanNulls": true,
-            "stacking": {
-              "mode": "normal"
-            }
+            "spanNulls": true
           },
-          "unit": "Bps"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^other/"
-            },
-            "properties": [
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "steps": [
               {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#cccccc",
-                  "mode": "fixed"
-                }
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.9
               }
             ]
           }
-        ]
+        },
+        "overrides": []
       },
       "gridPos": {
         "h": 8,
@@ -600,12 +599,11 @@
       "options": {
         "legend": {
           "calcs": [
-            "mean",
-            "max"
+            "lastNotNull"
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "sortBy": "Max",
+          "sortBy": "Last *",
           "sortDesc": true
         },
         "tooltip": {
@@ -617,31 +615,80 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'file_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND file_write_bytes > 0\n  GROUP BY process\n  ORDER BY sum(file_write_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), '] write'), 'other write') AS series,\n  sum(file_write_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\n  AND file_write_bytes > 0\nGROUP BY time, series\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  concat(hostname, ':', file_path) AS mount,\n  avg(disk_used_bytes) / avg(disk_total_bytes) AS used_pct\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND disk_total_bytes > 0\n  ${comment_hostname} AND hostname = '${hostname}'\nGROUP BY time, mount\nORDER BY time",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
-          },
-          "format": 0,
-          "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'file_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND file_read_bytes > 0\n  GROUP BY process\n  ORDER BY sum(file_read_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), '] read'), 'other read') AS series,\n  sum(file_read_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\n  AND file_read_bytes > 0\nGROUP BY time, series\nORDER BY time",
-          "refId": "B"
         }
       ],
-      "title": "File I/O Throughput by Process (read/write)",
+      "title": "Disk Usage % by Mount",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "lineWidth": 2,
+            "pointSize": 3,
+            "spanNulls": true
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "id": 72,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "min"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "sortBy": "Last *",
+          "sortDesc": false
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_PROCESS_METRICS}"
+          },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  concat(hostname, ':', file_path) AS mount,\n  avg(disk_avail_bytes) AS avail\nFROM default.process_metrics\nWHERE event_type = 'disk_usage'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND disk_total_bytes > 0\n  ${comment_hostname} AND hostname = '${hostname}'\nGROUP BY time, mount\nORDER BY time",
+          "refId": "A"
+        }
+      ],
+      "title": "Disk Available by Mount",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "grafana-clickhouse-datasource",
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -659,92 +706,6 @@
             }
           },
           "unit": "Bps"
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "/^other/"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "fixedColor": "#cccccc",
-                  "mode": "fixed"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 14
-      },
-      "id": 61,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "sortBy": "Max",
-          "sortDesc": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
-          },
-          "format": 0,
-          "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND net_conn_tx_bytes > 0\n  GROUP BY process\n  ORDER BY sum(net_conn_tx_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), '] TX'), 'other TX') AS series,\n  sum(net_conn_tx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\n  AND net_conn_tx_bytes > 0\nGROUP BY time, series\nORDER BY time",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
-          },
-          "format": 0,
-          "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND net_conn_rx_bytes > 0\n  GROUP BY process\n  ORDER BY sum(net_conn_rx_bytes) DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), '] RX'), 'other RX') AS series,\n  sum(net_conn_rx_bytes) / 60 AS bps\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\n  AND net_conn_rx_bytes > 0\nGROUP BY time, series\nORDER BY time",
-          "refId": "B"
-        }
-      ],
-      "title": "Network Throughput by Process (TX/RX)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "bars",
-            "fillOpacity": 30,
-            "lineWidth": 0,
-            "stacking": {
-              "mode": "normal"
-            }
-          },
-          "unit": "short"
         },
         "overrides": [
           {
@@ -770,15 +731,16 @@
         "x": 0,
         "y": 22
       },
-      "id": 70,
+      "id": 61,
       "options": {
         "legend": {
           "calcs": [
-            "sum"
+            "mean",
+            "max"
           ],
           "displayMode": "table",
           "placement": "bottom",
-          "sortBy": "Total",
+          "sortBy": "Max",
           "sortDesc": true
         },
         "tooltip": {
@@ -790,21 +752,31 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'file_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n  GROUP BY process\n  ORDER BY count() DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), ']'), 'other') AS process,\n  count() AS file_ops\nFROM default.process_metrics\nWHERE event_type = 'file_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\nGROUP BY time, process\nHAVING file_ops > 1\nORDER BY time",
+          "rawSql": "WITH top_comms AS (\n  SELECT\n    comm,\n    concat(comm, ' [',\n      arrayStringConcat(arraySlice(arraySort(groupUniqArray(toString(pid))), 1, 10), ','),\n      if(length(groupUniqArray(pid)) > 10, ',...', ''),\n    '] TX') AS series\n  FROM default.process_metrics\n  WHERE event_type IN ('conn_snapshot', 'net_close')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_tx_bytes > 0\n  GROUP BY comm\n  ORDER BY sum(net_conn_tx_bytes) DESC\n  LIMIT ${topn:raw}\n),\nsnap_delta AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    toUInt64(max(net_conn_tx_bytes) - min(net_conn_tx_bytes)) AS delta_tx\n  FROM default.process_metrics\n  WHERE event_type = 'conn_snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_tx_bytes > 0\n  GROUP BY time, comm, pid, net_remote_addr, net_remote_port\n),\nclose_data AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    net_conn_tx_bytes AS delta_tx\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_tx_bytes > 0\n),\ncombined AS (\n  SELECT time, comm, delta_tx FROM snap_delta\n  UNION ALL\n  SELECT time, comm, delta_tx FROM close_data\n)\nSELECT\n  time,\n  if(tc.series = '', 'other TX', tc.series) AS series,\n  sum(delta_tx) / 60 AS bps\nFROM combined AS t\nLEFT JOIN top_comms AS tc USING (comm)\nGROUP BY time, series\nORDER BY time\nSETTINGS join_use_nulls = 0",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "grafana-clickhouse-datasource",
+            "uid": "${DS_PROCESS_METRICS}"
+          },
+          "format": 0,
+          "queryType": "sql",
+          "rawSql": "WITH top_comms AS (\n  SELECT\n    comm,\n    concat(comm, ' [',\n      arrayStringConcat(arraySlice(arraySort(groupUniqArray(toString(pid))), 1, 10), ','),\n      if(length(groupUniqArray(pid)) > 10, ',...', ''),\n    '] RX') AS series\n  FROM default.process_metrics\n  WHERE event_type IN ('conn_snapshot', 'net_close')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_rx_bytes > 0\n  GROUP BY comm\n  ORDER BY sum(net_conn_rx_bytes) DESC\n  LIMIT ${topn:raw}\n),\nsnap_delta AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    toUInt64(max(net_conn_rx_bytes) - min(net_conn_rx_bytes)) AS delta_rx\n  FROM default.process_metrics\n  WHERE event_type = 'conn_snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_rx_bytes > 0\n  GROUP BY time, comm, pid, net_remote_addr, net_remote_port\n),\nclose_data AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    net_conn_rx_bytes AS delta_rx\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND net_conn_rx_bytes > 0\n),\ncombined AS (\n  SELECT time, comm, delta_rx FROM snap_delta\n  UNION ALL\n  SELECT time, comm, delta_rx FROM close_data\n)\nSELECT\n  time,\n  if(tc.series = '', 'other RX', tc.series) AS series,\n  sum(delta_rx) / 60 AS bps\nFROM combined AS t\nLEFT JOIN top_comms AS tc USING (comm)\nGROUP BY time, series\nORDER BY time\nSETTINGS join_use_nulls = 0",
+          "refId": "B"
         }
       ],
-      "title": "File Operations per Minute by Process",
+      "title": "Network Throughput by Process (TX/RX)",
       "type": "timeseries"
     },
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -865,11 +837,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT concat(comm, ' [', toString(pid), ']') AS process\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n  GROUP BY process\n  ORDER BY count() DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  if(concat(comm, ' [', toString(pid), ']') IN (SELECT process FROM top15),\n     concat(comm, ' [', toString(pid), ']'), 'other') AS process,\n  count() AS connections\nFROM default.process_metrics\nWHERE event_type = 'net_close'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\nGROUP BY time, process\nHAVING connections > 1\nORDER BY time",
+          "rawSql": "WITH top_comms AS (\n  SELECT\n    comm,\n    concat(comm, ' [',\n      arrayStringConcat(arraySlice(arraySort(groupUniqArray(toString(pid))), 1, 10), ','),\n      if(length(groupUniqArray(pid)) > 10, ',...', ''),\n    ']') AS series\n  FROM default.process_metrics\n  WHERE event_type IN ('net_connect', 'net_accept')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n  GROUP BY comm\n  ORDER BY count() DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  time,\n  if(tc.series = '', 'other', tc.series) AS series,\n  sum(cnt) AS connections\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    comm,\n    count() AS cnt\n  FROM default.process_metrics\n  WHERE event_type IN ('net_connect', 'net_accept')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n  GROUP BY time, comm\n) AS t\nLEFT JOIN top_comms AS tc USING (comm)\nGROUP BY time, series\nHAVING connections > 1\nORDER BY time\nSETTINGS join_use_nulls = 0",
           "refId": "A"
         }
       ],
@@ -879,7 +851,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1261,21 +1233,21 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT *,\n  (cpu_cores / nullIf(max(cpu_cores) OVER (), 0)\n + rss / nullIf(max(rss) OVER (), 0)\n + io_total / nullIf(max(io_total) OVER (), 0)\n + net_total / nullIf(max(net_total) OVER (), 0)) AS rating,\n  max(io_total) OVER () AS io_total_max,\n  max(net_total) OVER () AS net_total_max\nFROM (\n  SELECT\n    any(hostname) AS host,\n    comm,\n    concat(any(exec), ' ', any(args)) AS cmdline,\n    any(if(login_name != '', login_name, user_name)) AS login_user,\n    length(groupUniqArray(pid)) AS pids,\n    sum(cpu_usage_ratio) AS cpu_cores,\n    sum(rss_bytes) AS rss,\n    sum(io_read_bytes) + sum(io_write_bytes) AS io_total,\n    sum(net_tx_bytes) + sum(net_rx_bytes) AS net_total,\n    sum(threads) AS threads,\n    max(uptime_seconds) AS uptime\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND timestamp >= (SELECT max(timestamp) - INTERVAL 1 SECOND FROM default.process_metrics WHERE event_type='snapshot' AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}'))\n  GROUP BY comm\n)\nORDER BY rating DESC\nLIMIT 30",
+          "rawSql": "SELECT *,\n  (cpu_cores / nullIf(max(cpu_cores) OVER (), 0)\n + rss / nullIf(max(rss) OVER (), 0)\n + io_total / nullIf(max(io_total) OVER (), 0)\n + net_total / nullIf(max(net_total) OVER (), 0)) AS rating,\n  max(io_total) OVER () AS io_total_max,\n  max(net_total) OVER () AS net_total_max\nFROM (\n  SELECT\n    any(hostname) AS host,\n    comm,\n    concat(any(exec), ' ', any(args)) AS cmdline,\n    any(if(login_name != '', login_name, user_name)) AS login_user,\n    length(groupUniqArray(pid)) AS pids,\n    sum(cpu_usage_ratio) AS cpu_cores,\n    sum(rss_bytes) AS rss,\n    sum(io_read_bytes) + sum(io_write_bytes) AS io_total,\n    sum(net_tx_bytes) + sum(net_rx_bytes) AS net_total,\n    sum(threads) AS threads,\n    max(uptime_seconds) AS uptime\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND timestamp >= (\n      SELECT max(timestamp) - INTERVAL 1 SECOND\n      FROM default.process_metrics\n      WHERE event_type = 'snapshot'\n        ${comment_hostname} AND hostname = '${hostname}'\n        ${comment_rule} AND rule = '${rule}'\n        ${comment_login} AND (login_name = '${login}' OR login_name = '')\n        ${comment_user} AND user_name = '${user}'\n        ${comment_cgroup} AND cgroup = '${cgroup}'\n    )\n  GROUP BY comm\n)\nORDER BY rating DESC\nLIMIT 30",
           "refId": "A"
         },
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT max(rss) AS \"rss Max\" FROM (  SELECT sum(rss_bytes) AS rss  FROM default.process_metrics  WHERE event_type='snapshot'    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')    AND ('${rule}' = 'All' OR rule = '${rule}')    AND timestamp >= (SELECT max(timestamp) - INTERVAL 1 SECOND FROM default.process_metrics WHERE event_type='snapshot' AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}'))  GROUP BY comm)",
+          "rawSql": "SELECT max(rss) AS \"rss Max\"\nFROM (\n  SELECT sum(rss_bytes) AS rss\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND timestamp >= (\n      SELECT max(timestamp) - INTERVAL 1 SECOND\n      FROM default.process_metrics\n      WHERE event_type = 'snapshot'\n        ${comment_hostname} AND hostname = '${hostname}'\n        ${comment_rule} AND rule = '${rule}'\n        ${comment_login} AND (login_name = '${login}' OR login_name = '')\n        ${comment_user} AND user_name = '${user}'\n        ${comment_cgroup} AND cgroup = '${cgroup}'\n    )\n  GROUP BY comm\n)",
           "refId": "B"
         }
       ],
@@ -1361,7 +1333,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1532,11 +1504,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT *,\n  max(net_total) OVER () AS net_total_max,\n  (connections / nullIf(max(connections) OVER (), 0)\n + net_total / nullIf(max(net_total) OVER (), 0)\n + avg_duration_ms / nullIf(max(avg_duration_ms) OVER (), 0)) AS rating\nFROM (\n  SELECT\n    any(hostname) AS host,\n    comm,\n    net_remote_addr AS remote,\n    count() AS connections,\n    sum(net_conn_tx_bytes) + sum(net_conn_rx_bytes) AS net_total,\n    avg(net_duration_ms) AS avg_duration_ms\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND comm != 'process_metr'\n  GROUP BY comm, net_remote_addr\n)\nORDER BY rating DESC\nLIMIT 100",
+          "rawSql": "SELECT *,\n  max(net_total) OVER () AS net_total_max,\n  (connections / nullIf(max(connections) OVER (), 0)\n + net_total / nullIf(max(net_total) OVER (), 0)\n + avg_duration_ms / nullIf(max(avg_duration_ms) OVER (), 0)) AS rating\nFROM (\n  SELECT\n    any(hostname) AS host,\n    comm,\n    net_remote_addr AS remote,\n    toUInt64(count(DISTINCT (pid, net_remote_addr, net_remote_port))) AS connections,\n    sum(max_tx) + sum(max_rx) AS net_total,\n    avg(max_dur) AS avg_duration_ms\n  FROM (\n    SELECT\n      hostname, comm, pid, net_remote_addr, net_remote_port,\n      max(net_conn_tx_bytes) AS max_tx,\n      max(net_conn_rx_bytes) AS max_rx,\n      max(net_duration_ms) AS max_dur\n    FROM default.process_metrics\n    WHERE event_type IN ('conn_snapshot', 'net_close')\n      AND timestamp >= $__fromTime AND timestamp <= $__toTime\n      ${comment_hostname} AND hostname = '${hostname}'\n      ${comment_login} AND (login_name = '${login}' OR login_name = '')\n      ${comment_user} AND user_name = '${user}'\n      ${comment_cgroup} AND cgroup = '${cgroup}'\n      ${comment_rule} AND rule = '${rule}'\n      AND comm != 'process_metr'\n    GROUP BY hostname, comm, pid, net_remote_addr, net_remote_port\n  )\n  GROUP BY comm, net_remote_addr\n)\nORDER BY rating DESC\nLIMIT 100",
           "refId": "A"
         }
       ],
@@ -1585,7 +1557,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 60
       },
       "id": 303,
       "title": "Network Health",
@@ -1594,7 +1566,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1706,7 +1678,7 @@
         "h": 16,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 61
       },
       "id": 301,
       "options": {
@@ -1730,21 +1702,21 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH owners AS (\n  SELECT net_remote_addr AS remote_addr, any(comm) AS owner\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND net_remote_addr != ''\n  GROUP BY net_remote_addr\n),\nresolved AS (\n  SELECT r.timestamp,\n    if(o.owner != '', o.owner, r.comm) AS process,\n    r.sec_remote_addr AS remote_addr\n  FROM default.process_metrics r\n  LEFT JOIN owners o ON r.sec_remote_addr = o.remote_addr\n  WHERE r.event_type = 'tcp_retrans'\n    AND r.timestamp >= $__fromTime AND r.timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR r.hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR r.rule = '${rule}')\n),\nlabels AS (\n  SELECT\n    process,\n    concat(process, ': [', arrayStringConcat(arraySlice(groupUniqArray(remote_addr), 1, 5), ', '),\n      if(length(groupUniqArray(remote_addr)) > 5, ', ...', ''), ']') AS label,\n    count() AS cnt\n  FROM resolved\n  GROUP BY process\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(r.timestamp, INTERVAL 60 SECOND) AS time,\n  coalesce(l.label, 'other') AS process,\n  count() AS retransmits\nFROM resolved r\nLEFT JOIN labels l ON r.process = l.process\nGROUP BY time, process\nORDER BY time",
+          "rawSql": "WITH owners AS (\n  SELECT net_remote_addr AS remote_addr, any(comm) AS owner\n  FROM default.process_metrics\n  WHERE event_type = 'net_close'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND net_remote_addr != ''\n  GROUP BY net_remote_addr\n),\nresolved AS (\n  SELECT r.timestamp,\n    if(o.owner != '', o.owner, r.comm) AS process,\n    r.sec_remote_addr AS remote_addr\n  FROM default.process_metrics r\n  LEFT JOIN owners o ON r.sec_remote_addr = o.remote_addr\n  WHERE r.event_type = 'tcp_retrans'\n    AND r.timestamp >= $__fromTime AND r.timestamp <= $__toTime\n    ${comment_hostname} AND r.hostname = '${hostname}'\n    ${comment_login} AND (r.login_name = '${login}' OR r.login_name = '')\n    ${comment_user} AND r.user_name = '${user}'\n    ${comment_cgroup} AND r.cgroup = '${cgroup}'\n    ${comment_rule} AND r.rule = '${rule}'\n),\nlabels AS (\n  SELECT\n    process,\n    concat(process, ': [',\n      arrayStringConcat(arraySlice(groupUniqArray(remote_addr), 1, 5), ', '),\n      if(length(groupUniqArray(remote_addr)) > 5, ', ...', ''),\n      ']') AS label,\n    count() AS cnt\n  FROM resolved\n  GROUP BY process\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(r.timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  coalesce(l.label, 'other') AS process,\n  count() AS retransmits\nFROM resolved r\nLEFT JOIN labels l ON r.process = l.process\nGROUP BY time, process\nORDER BY time",
           "refId": "A"
         },
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  time,\n  retrans / nullIf(closes, 0) AS retransmit_ratio\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    countIf(event_type = 'tcp_retrans') AS retrans,\n    countIf(event_type = 'net_close') AS closes\n  FROM default.process_metrics\n  WHERE event_type IN ('tcp_retrans', 'net_close')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n  GROUP BY time\n)\nWHERE closes > 0\nORDER BY time",
+          "rawSql": "SELECT\n  time,\n  retrans / nullIf(closes, 0) AS retransmit_ratio\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    countIf(event_type = 'tcp_retrans') AS retrans,\n    countIf(event_type = 'net_close') AS closes\n  FROM default.process_metrics\n  WHERE event_type IN ('tcp_retrans', 'net_close')\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n  GROUP BY time\n)\nWHERE closes > 0\nORDER BY time",
           "refId": "B"
         }
       ],
@@ -1757,7 +1729,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 51
+        "y": 61
       },
       "id": 306,
       "title": "CPU Throttling",
@@ -1769,7 +1741,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 60
+        "y": 70
       },
       "id": 307,
       "panels": [],
@@ -1779,7 +1751,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1888,7 +1860,7 @@
         "h": 16,
         "w": 24,
         "x": 12,
-        "y": 52
+        "y": 62
       },
       "id": 305,
       "options": {
@@ -1912,21 +1884,21 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY cgroup\n  ORDER BY max(cgroup_cpu_throttled_usec) DESC\n  LIMIT ${topn:raw}\n),\ndata AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top), cgroup, 'other') AS cgroup,\n    max(cgroup_cpu_throttled_usec) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY time, cgroup\n)\nSELECT time, cgroup, throttled_usec\nFROM (\n  SELECT\n    time, cgroup,\n    val - lagInFrame(val, 1, 0) OVER (PARTITION BY cgroup ORDER BY time) AS throttled_usec\n  FROM data\n)\nWHERE throttled_usec > 0\nORDER BY time",
+          "rawSql": "WITH top AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY cgroup\n  ORDER BY max(cgroup_cpu_throttled_usec) DESC\n  LIMIT ${topn:raw}\n),\ndata AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top), cgroup, 'other') AS cgroup,\n    max(cgroup_cpu_throttled_usec) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_cpu_throttled_usec > 0\n  GROUP BY time, cgroup\n)\nSELECT time, cgroup, throttled_usec\nFROM (\n  SELECT\n    time, cgroup,\n    val - lagInFrame(val, 1, 0) OVER (PARTITION BY cgroup ORDER BY time) AS throttled_usec\n  FROM data\n)\nWHERE throttled_usec > 0\nORDER BY time",
           "refId": "A"
         },
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n  sum(cgroup_cpu_nr_throttled) / nullIf(sum(cgroup_cpu_nr_periods), 0) AS throttle_ratio\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND cgroup_cpu_nr_periods > 0\nGROUP BY time\nHAVING throttle_ratio > 0\nORDER BY time",
+          "rawSql": "SELECT\n  toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  sum(cgroup_cpu_nr_throttled) / nullIf(sum(cgroup_cpu_nr_periods), 0) AS throttle_ratio\nFROM default.process_metrics\nWHERE event_type = 'snapshot'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  AND cgroup_cpu_nr_periods > 0\nGROUP BY time\nHAVING throttle_ratio > 0\nORDER BY time",
           "refId": "B"
         }
       ],
@@ -1936,7 +1908,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -1994,7 +1966,7 @@
         "h": 16,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 79
       },
       "id": 308,
       "options": {
@@ -2016,19 +1988,19 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
-          "rawSql": "WITH data AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 60 SECOND) AS time,\n    pid,\n    max(nivcsw) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND nivcsw > 0\n  GROUP BY time, pid\n),\nagg AS (\n  SELECT time, sum(val) AS val FROM data GROUP BY time\n)\nSELECT time, delta AS nivcsw\nFROM (\n  SELECT time,\n    val - lagInFrame(val, 1, 0) OVER (ORDER BY time) AS delta\n  FROM agg\n)\nWHERE delta > 0\nORDER BY time",
+          "rawSql": "WITH data AS (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    pid,\n    max(nivcsw) AS val\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND nivcsw > 0\n  GROUP BY time, pid\n),\nagg AS (\n  SELECT time, sum(val) AS val FROM data GROUP BY time\n)\nSELECT time, delta AS nivcsw\nFROM (\n  SELECT time,\n    val - lagInFrame(val, 1, 0) OVER (ORDER BY time) AS delta\n  FROM agg\n)\nWHERE delta > 0\nORDER BY time",
           "refId": "A"
         },
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
-          "rawSql": "WITH filtered AS (\n  SELECT\n    timestamp,\n    preempted_by_comm AS preemptor,\n    comm AS victim\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND preempted_by_comm != ''\n    AND preempted_by_comm NOT LIKE 'kworker%'\n    AND preempted_by_comm NOT LIKE 'ksoftirqd%'\n    AND preempted_by_comm NOT LIKE 'migration%'\n    AND preempted_by_comm NOT LIKE 'watchdog%'\n    AND preempted_by_comm NOT IN ('rcu_preempt', 'rcu_sched', 'idle')\n),\nlabels AS (\n  SELECT preemptor,\n    concat(preemptor, ': [',\n      arrayStringConcat(arraySlice(groupUniqArray(victim), 1, 5), ', '),\n      if(length(groupUniqArray(victim)) > 5, ', ...', ''),\n    ']') AS label,\n    count() AS cnt\n  FROM filtered\n  GROUP BY preemptor\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(f.timestamp, INTERVAL 60 SECOND) AS time,\n  coalesce(l.label, 'other') AS preemptor,\n  count() AS preemptions\nFROM filtered f\nLEFT JOIN labels l ON f.preemptor = l.preemptor\nGROUP BY time, preemptor\nORDER BY time",
+          "rawSql": "WITH filtered AS (\n  SELECT\n    timestamp,\n    preempted_by_comm AS preemptor,\n    comm AS victim\n  FROM default.process_metrics\n  WHERE event_type = 'snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    ${comment_rule} AND rule = '${rule}'\n    AND preempted_by_comm != ''\n    AND preempted_by_comm NOT LIKE 'kworker%'\n    AND preempted_by_comm NOT LIKE 'ksoftirqd%'\n    AND preempted_by_comm NOT LIKE 'migration%'\n    AND preempted_by_comm NOT LIKE 'watchdog%'\n    AND preempted_by_comm NOT IN ('rcu_preempt', 'rcu_sched', 'idle')\n),\nlabels AS (\n  SELECT preemptor,\n    concat(preemptor, ': [',\n      arrayStringConcat(arraySlice(groupUniqArray(victim), 1, 5), ', '),\n      if(length(groupUniqArray(victim)) > 5, ', ...', ''),\n    ']') AS label,\n    count() AS cnt\n  FROM filtered\n  GROUP BY preemptor\n  ORDER BY cnt DESC\n  LIMIT ${topn:raw}\n)\nSELECT\n  toStartOfInterval(f.timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n  coalesce(l.label, 'other') AS preemptor,\n  count() AS preemptions\nFROM filtered f\nLEFT JOIN labels l ON f.preemptor = l.preemptor\nGROUP BY time, preemptor\nORDER BY time",
           "refId": "B"
         }
       ],
@@ -2041,7 +2013,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 69
+        "y": 79
       },
       "id": 300,
       "title": "Cgroup Memory",
@@ -2050,7 +2022,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -2091,7 +2063,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 70
+        "y": 80
       },
       "id": 20,
       "options": {
@@ -2112,11 +2084,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_memory_current > 10485760\n  GROUP BY cgroup\n  ORDER BY avg(cgroup_memory_current) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, cgroup, sum(val) AS mem_current\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top15), cgroup, 'other') AS cgroup,\n    max(cgroup_memory_current) AS val\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_memory_current > 0\n  GROUP BY time, cgroup\n  HAVING val > 10485760\n)\nGROUP BY time, cgroup\nORDER BY time",
+          "rawSql": "WITH top15 AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_memory_current > 10485760\n  GROUP BY cgroup\n  ORDER BY avg(cgroup_memory_current) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, cgroup, sum(val) AS mem_current\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top15), cgroup, 'other') AS cgroup,\n    max(cgroup_memory_current) AS val\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_memory_current > 0\n  GROUP BY time, cgroup\n  HAVING val > 10485760\n)\nGROUP BY time, cgroup\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -2126,7 +2098,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -2188,7 +2160,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 70
+        "y": 80
       },
       "id": 21,
       "options": {
@@ -2209,11 +2181,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 0,
           "queryType": "sql",
-          "rawSql": "WITH top15 AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_memory_max > 0\n    AND cgroup_memory_current > 0\n  GROUP BY cgroup\n  ORDER BY avg(cgroup_memory_current / cgroup_memory_max) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, cgroup, sum(mem_cur) / sum(mem_max) AS usage_pct\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL 10 SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top15), cgroup, 'other') AS cgroup,\n    max(cgroup_memory_current) AS mem_cur,\n    max(cgroup_memory_max) AS mem_max\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n    AND cgroup_memory_max > 0\n    AND cgroup_memory_current > 0\n  GROUP BY time, cgroup\n)\nGROUP BY time, cgroup\nORDER BY time",
+          "rawSql": "WITH top15 AS (\n  SELECT cgroup\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_memory_max > 0\n    AND cgroup_memory_current > 0\n  GROUP BY cgroup\n  ORDER BY avg(cgroup_memory_current / cgroup_memory_max) DESC\n  LIMIT ${topn:raw}\n)\nSELECT time, cgroup, sum(mem_cur) / sum(mem_max) AS usage_pct\nFROM (\n  SELECT\n    toStartOfInterval(timestamp, INTERVAL ${interval:raw} SECOND) AS time,\n    if(cgroup IN (SELECT cgroup FROM top15), cgroup, 'other') AS cgroup,\n    max(cgroup_memory_current) AS mem_cur,\n    max(cgroup_memory_max) AS mem_max\n  FROM default.process_metrics\n  WHERE event_type='snapshot'\n    AND timestamp >= $__fromTime AND timestamp <= $__toTime\n    ${comment_hostname} AND hostname = '${hostname}'\n    ${comment_rule} AND rule = '${rule}'\n    ${comment_login} AND (login_name = '${login}' OR login_name = '')\n    ${comment_user} AND user_name = '${user}'\n    ${comment_cgroup} AND cgroup = '${cgroup}'\n    AND cgroup_memory_max > 0\n    AND cgroup_memory_current > 0\n  GROUP BY time, cgroup\n)\nGROUP BY time, cgroup\nORDER BY time",
           "refId": "A"
         }
       ],
@@ -2223,7 +2195,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {
@@ -2315,7 +2287,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 88
       },
       "id": 22,
       "options": {
@@ -2331,11 +2303,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  any(hostname) AS host,\n  cgroup,\n  any(rule) AS cgroup_rule,\n  max(cgroup_memory_current) AS mem_current,\n  max(cgroup_memory_max) AS mem_max,\n  if(max(cgroup_memory_max) > 0, max(cgroup_memory_current) / max(cgroup_memory_max), 0) AS usage_pct,\n  max(cgroup_swap_current) AS swap,\n  max(cgroup_cpu_weight) AS cpu_weight,\n  max(cgroup_pids_current) AS pids\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND cgroup_memory_current > 0\nGROUP BY cgroup\nORDER BY usage_pct DESC",
+          "rawSql": "SELECT\n  any(hostname) AS host,\n  cgroup,\n  any(rule) AS cgroup_rule,\n  max(cgroup_memory_current) AS mem_current,\n  max(cgroup_memory_max) AS mem_max,\n  if(max(cgroup_memory_max) > 0, max(cgroup_memory_current) / max(cgroup_memory_max), 0) AS usage_pct,\n  max(cgroup_swap_current) AS swap,\n  max(cgroup_cpu_weight) AS cpu_weight,\n  max(cgroup_pids_current) AS pids\nFROM default.process_metrics\nWHERE event_type='snapshot'\n  AND timestamp >= now() - INTERVAL 2 MINUTE\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  AND cgroup_memory_current > 0\nGROUP BY cgroup\nORDER BY usage_pct DESC",
           "refId": "A"
         }
       ],
@@ -2348,7 +2320,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 86
+        "y": 96
       },
       "id": 80,
       "title": "User Audit Log (bash_history)",
@@ -2357,7 +2329,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {},
@@ -2367,7 +2339,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 87
+        "y": 97
       },
       "id": 81,
       "options": {
@@ -2384,11 +2356,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 2,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    login_name,\n    if(user_name != login_name, concat(' (', user_name, ')'), ''),\n    ' tty=pts/', toString(tty_nr - 34816),\n    ' rc=', toString(exit_code),\n    ' | ',\n    exec,\n    if(args != '', concat(' ', args), '')\n  ) AS body,\n  if(exit_code = 0, 'info', 'error') AS level,\n  login_name AS user,\n  if(user_name != login_name, user_name, '') AS effective_user,\n  concat('pts/', toString(tty_nr - 34816)) AS tty,\n  comm,\n  toString(exit_code) AS rc\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND tty_nr >= 34816\n  AND loginuid != 4294967295\n  AND loginuid > 0\n  AND comm NOT IN (${audit_comm_excludes:raw})\n  AND NOT arrayExists(p -> exec LIKE p, [${audit_exec_excludes:raw}])\n  AND (comm, args) NOT IN (${audit_comm_args_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    login_name,\n    if(user_name != login_name, concat(' (', user_name, ')'), ''),\n    ' tty=pts/', toString(tty_nr - 34816),\n    ' rc=', toString(exit_code),\n    ' | ',\n    exec,\n    if(args != '', concat(' ', args), '')\n  ) AS body,\n  if(exit_code = 0, 'info', 'error') AS level,\n  login_name AS user,\n  if(user_name != login_name, user_name, '') AS effective_user,\n  concat('pts/', toString(tty_nr - 34816)) AS tty,\n  comm,\n  toString(exit_code) AS rc\nFROM default.process_metrics\nWHERE event_type = 'exit'\n  AND tty_nr >= 34816\n  AND loginuid != 4294967295\n  AND loginuid > 0\n  AND comm NOT IN (${audit_comm_excludes:raw})\n  AND NOT arrayExists(p -> exec LIKE p, [${audit_exec_excludes:raw}])\n  AND (comm, args) NOT IN (${audit_comm_args_excludes:raw})\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -2401,7 +2373,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 101
+        "y": 111
       },
       "id": 82,
       "title": "Signal Events",
@@ -2410,13 +2382,13 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "gridPos": {
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 102
+        "y": 112
       },
       "id": 83,
       "options": {
@@ -2433,11 +2405,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 2,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    comm,\n    '[', toString(pid), ']',\n    ' → ',\n    'SIG', CASE sig_num\n      WHEN 1 THEN 'HUP'\n      WHEN 2 THEN 'INT'\n      WHEN 3 THEN 'QUIT'\n      WHEN 6 THEN 'ABRT'\n      WHEN 9 THEN 'KILL'\n      WHEN 10 THEN 'USR1'\n      WHEN 12 THEN 'USR2'\n      WHEN 13 THEN 'PIPE'\n      WHEN 14 THEN 'ALRM'\n      WHEN 15 THEN 'TERM'\n      WHEN 17 THEN 'CHLD'\n      WHEN 19 THEN 'STOP'\n      WHEN 20 THEN 'TSTP'\n      ELSE toString(sig_num)\n    END,\n    ' → ',\n    sig_target_comm,\n    '[', toString(sig_target_pid), ']',\n    if(sig_result != 0, concat(' FAILED(', toString(sig_result), ')'), '')\n  ) AS body,\n  if(sig_result = 0, if(sig_num = 9, 'error', 'info'), 'warning') AS level,\n  comm AS sender,\n  toString(pid) AS sender_pid,\n  sig_target_comm AS target,\n  toString(sig_target_pid) AS target_pid,\n  toString(sig_num) AS signal,\n  rule\nFROM default.process_metrics\nWHERE event_type = 'signal'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND ('${rule}' = 'All' OR rule = '${rule}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    comm,\n    '[', toString(pid), ']',\n    ' → ',\n    'SIG', CASE sig_num\n      WHEN 1 THEN 'HUP'\n      WHEN 2 THEN 'INT'\n      WHEN 3 THEN 'QUIT'\n      WHEN 6 THEN 'ABRT'\n      WHEN 9 THEN 'KILL'\n      WHEN 10 THEN 'USR1'\n      WHEN 12 THEN 'USR2'\n      WHEN 13 THEN 'PIPE'\n      WHEN 14 THEN 'ALRM'\n      WHEN 15 THEN 'TERM'\n      WHEN 17 THEN 'CHLD'\n      WHEN 19 THEN 'STOP'\n      WHEN 20 THEN 'TSTP'\n      ELSE toString(sig_num)\n    END,\n    ' → ',\n    sig_target_comm,\n    '[', toString(sig_target_pid), ']',\n    if(sig_result != 0, concat(' FAILED(', toString(sig_result), ')'), '')\n  ) AS body,\n  if(sig_result = 0, if(sig_num = 9, 'error', 'info'), 'warning') AS level,\n  comm AS sender,\n  toString(pid) AS sender_pid,\n  sig_target_comm AS target,\n  toString(sig_target_pid) AS target_pid,\n  toString(sig_num) AS signal,\n  rule\nFROM default.process_metrics\nWHERE event_type = 'signal'\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_rule} AND rule = '${rule}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -2450,7 +2422,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 114
+        "y": 124
       },
       "id": 84,
       "title": "Error Events",
@@ -2459,7 +2431,7 @@
     {
       "datasource": {
         "type": "grafana-clickhouse-datasource",
-        "uid": "${DS_CLICKHOUSE}"
+        "uid": "${DS_PROCESS_METRICS}"
       },
       "fieldConfig": {
         "defaults": {},
@@ -2469,7 +2441,7 @@
         "h": 14,
         "w": 24,
         "x": 0,
-        "y": 115
+        "y": 125
       },
       "id": 85,
       "options": {
@@ -2486,11 +2458,11 @@
         {
           "datasource": {
             "type": "grafana-clickhouse-datasource",
-            "uid": "${DS_CLICKHOUSE}"
+            "uid": "${DS_PROCESS_METRICS}"
           },
           "format": 1,
           "queryType": "sql",
-          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    if(event_type = 'oom_kill', '🔴 OOM KILL', concat('⚠️ EXIT rc=', toString(exit_code))),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), ''),\n    if(event_type = 'oom_kill', concat(' | RSS max: ', formatReadableSize(rss_max_bytes)), '')\n  ) AS body,\n  if(event_type = 'oom_kill', 'critical', 'error') AS level,\n  event_type,\n  comm,\n  toString(pid) AS pid,\n  toString(exit_code) AS rc,\n  rule,\n  cgroup\nFROM default.process_metrics\nWHERE (event_type = 'oom_kill' OR (event_type = 'exit' AND exit_code != 0\n    AND (comm, exit_code) NOT IN (${exit_excludes:raw})))\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  AND ('${hostname}' = 'All' OR hostname = '${hostname}')\n    AND (('${login}' = 'All' OR login_name = '${login}') OR login_name = '')\n    AND ('${user}' = 'All' OR user_name = '${user}')\n    AND ('${cgroup}' = 'All' OR cgroup = '${cgroup}')\n  AND ('${rule}' = 'All' OR rule = '${rule}')\nORDER BY timestamp DESC\nLIMIT 500",
+          "rawSql": "SELECT\n  timestamp AS timestamp,\n  concat(\n    if(event_type = 'oom_kill', '🔴 OOM KILL', concat('⚠️ EXIT rc=', toString(exit_code))),\n    ' | ', comm, ' [', toString(pid), ']',\n    ' | ', exec, if(args != '', concat(' ', args), ''),\n    if(cgroup != '', concat(' | cgroup: ', cgroup), ''),\n    if(event_type = 'oom_kill', concat(' | RSS max: ', formatReadableSize(rss_max_bytes)), '')\n  ) AS body,\n  if(event_type = 'oom_kill', 'critical', 'error') AS level,\n  event_type,\n  comm,\n  toString(pid) AS pid,\n  toString(exit_code) AS rc,\n  rule,\n  cgroup\nFROM default.process_metrics\nWHERE (event_type = 'oom_kill' OR (event_type = 'exit' AND exit_code != 0\n    AND (comm, exit_code) NOT IN (${exit_excludes:raw})))\n  AND timestamp >= $__fromTime AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  ${comment_login} AND (login_name = '${login}' OR login_name = '')\n  ${comment_user} AND user_name = '${user}'\n  ${comment_cgroup} AND cgroup = '${cgroup}'\n  ${comment_rule} AND rule = '${rule}'\nORDER BY timestamp DESC\nLIMIT 500",
           "refId": "A"
         }
       ],
@@ -2516,20 +2488,31 @@
         },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
-        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY ORDER BY hostname",
+        "definition": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT hostname\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\nORDER BY hostname",
         "hide": 0,
         "includeAll": false,
         "label": "Server",
         "multi": false,
         "name": "hostname",
         "options": [],
-        "query": "SELECT 'All' UNION ALL SELECT DISTINCT hostname FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY ORDER BY hostname",
+        "query": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT hostname\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\nORDER BY hostname",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
+        "type": "query"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_PROCESS_METRICS}"
+        },
+        "hide": 2,
+        "name": "comment_hostname",
+        "query": "SELECT\n  CASE WHEN '${hostname}' = 'All'\n    THEN '--'\n    ELSE ''\n  END",
+        "refresh": 2,
         "type": "query"
       },
       {
@@ -2540,20 +2523,31 @@
         },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
-        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') ORDER BY rule",
+        "definition": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT rule\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY rule",
         "hide": 0,
         "includeAll": false,
         "label": "Rule",
         "multi": false,
         "name": "rule",
         "options": [],
-        "query": "SELECT 'All' UNION ALL SELECT DISTINCT rule FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') ORDER BY rule",
+        "query": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT rule\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\nORDER BY rule",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
+        "type": "query"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_PROCESS_METRICS}"
+        },
+        "hide": 2,
+        "name": "comment_rule",
+        "query": "SELECT\n  CASE WHEN '${rule}' = 'All'\n    THEN '--'\n    ELSE ''\n  END",
+        "refresh": 2,
         "type": "query"
       },
       {
@@ -2564,20 +2558,31 @@
         },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
-        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT cgroup FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND cgroup != '' ORDER BY cgroup",
+        "definition": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT cgroup\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND cgroup != ''\nORDER BY cgroup",
         "hide": 0,
         "includeAll": false,
         "label": "Cgroup",
         "multi": false,
         "name": "cgroup",
         "options": [],
-        "query": "SELECT 'All' UNION ALL SELECT DISTINCT cgroup FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND cgroup != '' ORDER BY cgroup",
+        "query": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT cgroup\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND cgroup != ''\nORDER BY cgroup",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
+        "type": "query"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_PROCESS_METRICS}"
+        },
+        "hide": 2,
+        "name": "comment_cgroup",
+        "query": "SELECT\n  CASE WHEN '${cgroup}' = 'All'\n    THEN '--'\n    ELSE ''\n  END",
+        "refresh": 2,
         "type": "query"
       },
       {
@@ -2588,20 +2593,31 @@
         },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
-        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT login_name FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND login_name != '' ORDER BY login_name",
+        "definition": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT login_name\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND login_name != ''\nORDER BY login_name",
         "hide": 0,
         "includeAll": false,
         "label": "Login",
         "multi": false,
         "name": "login",
         "options": [],
-        "query": "SELECT 'All' UNION ALL SELECT DISTINCT login_name FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND login_name != '' ORDER BY login_name",
+        "query": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT login_name\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND login_name != ''\nORDER BY login_name",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
+        "type": "query"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_PROCESS_METRICS}"
+        },
+        "hide": 2,
+        "name": "comment_login",
+        "query": "SELECT\n  CASE WHEN '${login}' = 'All'\n    THEN '--'\n    ELSE ''\n  END",
+        "refresh": 2,
         "type": "query"
       },
       {
@@ -2612,20 +2628,31 @@
         },
         "datasource": {
           "type": "grafana-clickhouse-datasource",
-          "uid": "${DS_CLICKHOUSE}"
+          "uid": "${DS_PROCESS_METRICS}"
         },
-        "definition": "SELECT 'All' UNION ALL SELECT DISTINCT user_name FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND user_name != '' ORDER BY user_name",
+        "definition": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT user_name\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND user_name != ''\nORDER BY user_name",
         "hide": 0,
         "includeAll": false,
         "label": "User",
         "multi": false,
         "name": "user",
         "options": [],
-        "query": "SELECT 'All' UNION ALL SELECT DISTINCT user_name FROM default.process_metrics WHERE timestamp >= now() - INTERVAL 1 DAY AND ('${hostname}' = 'All' OR hostname = '${hostname}') AND user_name != '' ORDER BY user_name",
+        "query": "SELECT 'All'\nUNION ALL\nSELECT DISTINCT user_name\nFROM default.process_metrics\nWHERE timestamp >= $__fromTime\n  AND timestamp <= $__toTime\n  ${comment_hostname} AND hostname = '${hostname}'\n  AND user_name != ''\nORDER BY user_name",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
         "sort": 0,
+        "type": "query"
+      },
+      {
+        "datasource": {
+          "type": "grafana-clickhouse-datasource",
+          "uid": "${DS_PROCESS_METRICS}"
+        },
+        "hide": 2,
+        "name": "comment_user",
+        "query": "SELECT\n  CASE WHEN '${user}' = 'All'\n    THEN '--'\n    ELSE ''\n  END",
+        "refresh": 2,
         "type": "query"
       },
       {
@@ -2789,6 +2816,22 @@
       },
       {
         "current": {
+          "selected": true,
+          "text": "30",
+          "value": "30"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Interval (sec)",
+        "multi": false,
+        "name": "interval",
+        "options": [],
+        "query": "10,15,30,60,120,300,600",
+        "type": "custom",
+        "skipUrlSync": false
+      },
+      {
+        "current": {
           "selected": false,
           "text": "('grep',1),('grep',2),('kafka-run-class',1),('kafka-run-class',2),('ls',1),('ls',2),('runc',1),('runc',2),('runc:[2:INIT]',1),('runc:[2:INIT]',2),('bash',1),('bash',2),('iptables',1),('iptables',2),('sshd',255),('runc',255),('runc:[2:INIT]',255)",
           "value": "('grep',1),('grep',2),('kafka-run-class',1),('kafka-run-class',2),('ls',1),('ls',2),('runc',1),('runc',2),('runc:[2:INIT]',1),('runc:[2:INIT]',2),('bash',1),('bash',2),('iptables',1),('iptables',2),('sshd',255),('runc',255),('runc:[2:INIT]',255)"
@@ -2852,12 +2895,11 @@
   "timepicker": {},
   "timezone": "",
   "title": "Process Metrics (eBPF)",
-  "uid": "process-metrics-ebpf",
   "__inputs": [
     {
-      "name": "DS_CLICKHOUSE",
-      "label": "ClickHouse",
-      "description": "ClickHouse datasource",
+      "name": "DS_PROCESS_METRICS",
+      "label": "Process Metrics",
+      "description": "ClickHouse datasource with process_metrics table",
       "type": "datasource",
       "pluginId": "grafana-clickhouse-datasource",
       "pluginName": "ClickHouse"
@@ -2868,13 +2910,31 @@
       "type": "grafana",
       "id": "grafana",
       "name": "Grafana",
-      "version": "9.0.0"
+      "version": "10.0.0"
     },
     {
       "type": "datasource",
       "id": "grafana-clickhouse-datasource",
       "name": "ClickHouse",
-      "version": "3.0.0"
+      "version": "4.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
     }
   ]
 }
