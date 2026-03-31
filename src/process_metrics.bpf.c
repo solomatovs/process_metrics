@@ -45,33 +45,32 @@ static __always_inline void _bpf_zero(void *p, unsigned int sz)
 	unsigned int longs = sz / sizeof(unsigned long);
 	unsigned int i;
 
-	#pragma unroll
-	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
+#pragma unroll
+	for (i = 0; i < 1024; i++) { /* 1024 × 8 = 8192 байт макс */
 		if (i >= longs)
 			break;
 		lp[i] = 0;
 		/* Барьер: запрещаем clang сворачивать цикл в __builtin_memset */
-		asm volatile("" : "+r"(lp) :: "memory");
+		asm volatile("" : "+r"(lp)::"memory");
 	}
 }
 
-#define BPF_ZERO(var)         _bpf_zero(&(var), sizeof(var))
+#define BPF_ZERO(var)	      _bpf_zero(&(var), sizeof(var))
 #define BPF_ZERO_PTR(ptr, sz) _bpf_zero((ptr), (sz))
 
 /*
  * _bpf_copy: chunked memcpy для BPF (аналогично _bpf_zero).
  * clang не inline'ит __builtin_memcpy > ~1024 байт.
  */
-static __always_inline void _bpf_copy(void *dst, const void *src,
-				      unsigned int sz)
+static __always_inline void _bpf_copy(void *dst, const void *src, unsigned int sz)
 {
 	unsigned long *dp = (unsigned long *)dst;
 	const unsigned long *sp = (const unsigned long *)src;
 	unsigned int longs = sz / sizeof(unsigned long);
 	unsigned int i;
 
-	#pragma unroll
-	for (i = 0; i < 1024; i++) {  /* 1024 × 8 = 8192 байт макс */
+#pragma unroll
+	for (i = 0; i < 1024; i++) { /* 1024 × 8 = 8192 байт макс */
 		if (i >= longs)
 			break;
 		dp[i] = sp[i];
@@ -146,8 +145,8 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_PROCS);
-	__type(key, __u32);           /* pid (thread id) */
-	__type(value, __u64);         /* last seen utime+stime */
+	__type(key, __u32);   /* pid (thread id) */
+	__type(value, __u64); /* last seen utime+stime */
 } thread_cpu_map SEC(".maps");
 
 /*
@@ -163,7 +162,7 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_PROCS);
-	__type(key, __u32);           /* tid (thread id) */
+	__type(key, __u32); /* tid (thread id) */
 	__type(value, struct tid_info);
 } tid_tgid_map SEC(".maps");
 
@@ -185,18 +184,19 @@ static __always_inline void rb_stat_inc(__u64 offset)
 		__sync_fetch_and_add((__u64 *)((char *)s + offset), 1);
 }
 
-#define RB_STAT_TOTAL_PROC()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
-#define RB_STAT_TOTAL_FILE()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
-#define RB_STAT_TOTAL_FILE_OPS() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file_ops))
-#define RB_STAT_TOTAL_NET()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_net))
-#define RB_STAT_DROP_PROC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
-#define RB_STAT_DROP_FILE()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
-#define RB_STAT_DROP_FILE_OPS()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file_ops))
-#define RB_STAT_DROP_NET()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
-#define RB_STAT_TOTAL_SEC()   rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_sec))
-#define RB_STAT_DROP_SEC()    rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_sec))
-#define RB_STAT_TOTAL_CGROUP() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_cgroup))
-#define RB_STAT_DROP_CGROUP()  rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_cgroup))
+#define RB_STAT_TOTAL_PROC() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
+#define RB_STAT_TOTAL_FILE() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
+#define RB_STAT_TOTAL_FILE_OPS() \
+	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file_ops))
+#define RB_STAT_TOTAL_NET()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_net))
+#define RB_STAT_DROP_PROC()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_proc))
+#define RB_STAT_DROP_FILE()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file))
+#define RB_STAT_DROP_FILE_OPS() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_file_ops))
+#define RB_STAT_DROP_NET()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_net))
+#define RB_STAT_TOTAL_SEC()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_sec))
+#define RB_STAT_DROP_SEC()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_sec))
+#define RB_STAT_TOTAL_CGROUP()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_cgroup))
+#define RB_STAT_DROP_CGROUP()	rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_cgroup))
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -226,8 +226,8 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_MISSED_EXEC_SIZE);
-	__type(key, __u32);           /* tgid */
-	__type(value, __u32);         /* ppid */
+	__type(key, __u32);   /* tgid */
+	__type(value, __u32); /* ppid */
 } missed_exec_map SEC(".maps");
 
 /* ── ограничитель частоты ─────────────────────────────────────────── */
@@ -274,9 +274,9 @@ static __always_inline int exec_rate_check(void)
 /* ── вспомогательные функции ──────────────────────────────────────── */
 
 struct mem_info {
-	__u64 rss_pages;    /* файловые + анонимные + shmem */
-	__u64 shmem_pages;  /* только разделяемая память */
-	__u64 swap_pages;   /* записи подкачки */
+	__u64 rss_pages;   /* файловые + анонимные + shmem */
+	__u64 shmem_pages; /* только разделяемая память */
+	__u64 swap_pages;  /* записи подкачки */
 };
 
 /*
@@ -338,9 +338,9 @@ static __always_inline struct mem_info read_mem_pages(struct task_struct *task)
 	}
 
 	long total = v0 + v1 + v3;
-	mi.rss_pages   = total > 0 ? (__u64)total : 0;
+	mi.rss_pages = total > 0 ? (__u64)total : 0;
 	mi.shmem_pages = v3 > 0 ? (__u64)v3 : 0;
-	mi.swap_pages  = v2 > 0 ? (__u64)v2 : 0;
+	mi.swap_pages = v2 > 0 ? (__u64)v2 : 0;
 	return mi;
 }
 
@@ -412,8 +412,7 @@ static __always_inline void read_io_bytes(struct task_struct *task, __u64 *r, __
  *
  * Faults остальных живых потоков не учтены (ограничение BPF).
  */
-static __always_inline void read_faults(struct task_struct *task,
-					__u64 *maj, __u64 *min)
+static __always_inline void read_faults(struct task_struct *task, __u64 *maj, __u64 *min)
 {
 	*maj = BPF_CORE_READ(task, signal, cmaj_flt);
 	*min = BPF_CORE_READ(task, signal, cmin_flt);
@@ -437,15 +436,14 @@ static __always_inline void read_faults(struct task_struct *task,
  * signal накапливает завершённые потоки, добавляем счётчики leader.
  * Живые рабочие потоки (кроме leader) не учтены (ограничение BPF).
  */
-static __always_inline void read_ctxsw(struct task_struct *task,
-					__u64 *vol, __u64 *invol)
+static __always_inline void read_ctxsw(struct task_struct *task, __u64 *vol, __u64 *invol)
 {
-	*vol   = BPF_CORE_READ(task, signal, nvcsw);
+	*vol = BPF_CORE_READ(task, signal, nvcsw);
 	*invol = BPF_CORE_READ(task, signal, nivcsw);
 
 	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
 	if (leader) {
-		*vol   += BPF_CORE_READ(leader, nvcsw);
+		*vol += BPF_CORE_READ(leader, nvcsw);
 		*invol += BPF_CORE_READ(leader, nivcsw);
 	}
 }
@@ -461,8 +459,7 @@ static __always_inline void read_ctxsw(struct task_struct *task,
  * signal накапливает завершённые потоки, добавляем счётчики leader.
  * Живые рабочие потоки (кроме leader) не учтены (ограничение BPF).
  */
-static __always_inline void read_io_accounting(struct task_struct *task,
-					       __u64 *rchar, __u64 *wchar,
+static __always_inline void read_io_accounting(struct task_struct *task, __u64 *rchar, __u64 *wchar,
 					       __u64 *syscr, __u64 *syscw)
 {
 	*rchar = BPF_CORE_READ(task, signal, ioac.rchar);
@@ -486,13 +483,12 @@ static __always_inline void read_io_accounting(struct task_struct *task,
  * sessionid  — идентификатор сессии аудита (audit session).
  * euid       — effective UID, определяющий права доступа процесса.
  */
-static __always_inline void read_identity(struct task_struct *task,
-					  __u32 *loginuid, __u32 *sessionid,
-					  __u32 *euid)
+static __always_inline void read_identity(struct task_struct *task, __u32 *loginuid,
+					  __u32 *sessionid, __u32 *euid)
 {
-	*loginuid  = BPF_CORE_READ(task, loginuid.val);
+	*loginuid = BPF_CORE_READ(task, loginuid.val);
 	*sessionid = BPF_CORE_READ(task, sessionid);
-	*euid      = BPF_CORE_READ(task, cred, euid.val);
+	*euid = BPF_CORE_READ(task, cred, euid.val);
 }
 
 /*
@@ -530,8 +526,7 @@ static __always_inline __u32 read_tty_nr(struct task_struct *task)
  *
  * nsproxy может быть NULL во время завершения процесса.
  */
-static __always_inline void read_ns_inums(struct task_struct *task,
-					  __u32 *mnt_ns, __u32 *pid_ns,
+static __always_inline void read_ns_inums(struct task_struct *task, __u32 *mnt_ns, __u32 *pid_ns,
 					  __u32 *net_ns, __u32 *cgroup_ns)
 {
 	*mnt_ns = 0;
@@ -566,13 +561,20 @@ static __always_inline void read_ns_inums(struct task_struct *task,
  */
 static __always_inline __u8 state_to_char(long state)
 {
-	if (state == 0)    return 'R'; /* TASK_RUNNING (вытеснен) */
-	if (state & 0x01)  return 'S'; /* TASK_INTERRUPTIBLE */
-	if (state & 0x02)  return 'D'; /* TASK_UNINTERRUPTIBLE */
-	if (state & 0x04)  return 'T'; /* __TASK_STOPPED */
-	if (state & 0x08)  return 't'; /* __TASK_TRACED */
-	if (state & 0x20)  return 'Z'; /* EXIT_ZOMBIE */
-	if (state & 0x10)  return 'X'; /* EXIT_DEAD */
+	if (state == 0)
+		return 'R'; /* TASK_RUNNING (вытеснен) */
+	if (state & 0x01)
+		return 'S'; /* TASK_INTERRUPTIBLE */
+	if (state & 0x02)
+		return 'D'; /* TASK_UNINTERRUPTIBLE */
+	if (state & 0x04)
+		return 'T'; /* __TASK_STOPPED */
+	if (state & 0x08)
+		return 't'; /* __TASK_TRACED */
+	if (state & 0x20)
+		return 'Z'; /* EXIT_ZOMBIE */
+	if (state & 0x10)
+		return 'X'; /* EXIT_DEAD */
 	return '?';
 }
 
@@ -587,7 +589,7 @@ static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
 		return 0;
 
 	unsigned long arg_start = BPF_CORE_READ(mm, arg_start);
-	unsigned long arg_end   = BPF_CORE_READ(mm, arg_end);
+	unsigned long arg_end = BPF_CORE_READ(mm, arg_end);
 	if (arg_end <= arg_start)
 		return 0;
 
@@ -605,9 +607,8 @@ static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
  * Заполняет comm = group leader, thread_name = текущий поток.
  * Для главного потока (tid == tgid) оба совпадают.
  */
-static __always_inline void read_comm_and_thread(
-	char *comm, int comm_sz,
-	char *thread_name, int thread_sz)
+static __always_inline void read_comm_and_thread(char *comm, int comm_sz, char *thread_name,
+						 int thread_sz)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
@@ -649,24 +650,14 @@ int handle_exec(void *ctx)
 	 * Это экономит место в ring buffer при интенсивном fork+exec. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
-		read_comm_and_thread(info->comm, sizeof(info->comm),
-				     info->thread_name, sizeof(info->thread_name));
-		info->cgroup_id   = bpf_get_current_cgroup_id();
+		read_comm_and_thread(info->comm, sizeof(info->comm), info->thread_name,
+				     sizeof(info->thread_name));
+		info->cgroup_id = bpf_get_current_cgroup_id();
 		info->cmdline_len = read_cmdline(task, info->cmdline);
-		read_identity(
-			task,
-			&info->loginuid,
-			&info->sessionid,
-			&info->euid
-		);
+		read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
 		info->sched_policy = BPF_CORE_READ(task, policy);
-		read_ns_inums(
-			task,
-			&info->mnt_ns_inum,
-			&info->pid_ns_inum,
-			&info->net_ns_inum,
-			&info->cgroup_ns_inum
-		);
+		read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum, &info->net_ns_inum,
+			      &info->cgroup_ns_inum);
 		return 0;
 	}
 
@@ -682,44 +673,35 @@ int handle_exec(void *ctx)
 		/* Сохраняем tgid→ppid в fallback-карту, чтобы userspace мог
 		 * обнаружить и отследить процесс через try_track_pid().
 		 * Без этого процесс полностью теряется. */
-		if (bpf_map_update_elem(&missed_exec_map, &tgid, &ppid,
-					BPF_NOEXIST) != 0)
-			rb_stat_inc(__builtin_offsetof(
-				struct ringbuf_stats, drop_missed_exec));
+		if (bpf_map_update_elem(&missed_exec_map, &tgid, &ppid, BPF_NOEXIST) != 0)
+			rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_missed_exec));
 		return 0;
 	}
 
 	/* Обнуляем структуру события (требование BPF-верификатора) */
 	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type         = EVENT_EXEC;
-	e->tgid         = tgid;
-	e->ppid         = ppid;
+	e->type = EVENT_EXEC;
+	e->tgid = tgid;
+	e->ppid = ppid;
 	/* UID текущего процесса (младшие 32 бита uid_gid) */
-	e->uid          = (__u32)bpf_get_current_uid_gid();
+	e->uid = (__u32)bpf_get_current_uid_gid();
 	/* Время с момента загрузки системы, включая suspend (нс) */
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	/* ID cgroup v2, в которой работает процесс */
-	e->cgroup_id    = bpf_get_current_cgroup_id();
+	e->cgroup_id = bpf_get_current_cgroup_id();
 	/* Время старта процесса из task_struct (CO-RE) */
-	e->start_ns     = BPF_CORE_READ(task, start_time);
+	e->start_ns = BPF_CORE_READ(task, start_time);
 	/* Имя процесса (group leader) и имя потока */
-	read_comm_and_thread(e->comm, sizeof(e->comm),
-			     e->thread_name, sizeof(e->thread_name));
+	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
 	/* Полная командная строка из mm->arg_start..arg_end (читается из RAM
 	 * процесса через bpf_probe_read_user, без обращения к диску/VFS) */
-	e->cmdline_len  = read_cmdline(task, e->cmdline);
+	e->cmdline_len = read_cmdline(task, e->cmdline);
 	/* loginuid, sessionid (audit) и effective UID */
 	read_identity(task, &e->loginuid, &e->sessionid, &e->euid);
 	/* Политика планировщика (SCHED_NORMAL, SCHED_FIFO и т.д.) */
 	e->sched_policy = BPF_CORE_READ(task, policy);
 	/* Номера inode namespace'ов: mnt, pid, net, cgroup */
-	read_ns_inums(
-		task,
-		&e->mnt_ns_inum,
-		&e->pid_ns_inum,
-		&e->net_ns_inum,
-		&e->cgroup_ns_inum
-	);
+	read_ns_inums(task, &e->mnt_ns_inum, &e->pid_ns_inum, &e->net_ns_inum, &e->cgroup_ns_inum);
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -731,9 +713,9 @@ SEC("raw_tracepoint/sched_process_fork")
 int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 {
 	struct task_struct *parent = (struct task_struct *)ctx->args[0];
-	struct task_struct *child  = (struct task_struct *)ctx->args[1];
+	struct task_struct *child = (struct task_struct *)ctx->args[1];
 
-	__u32 child_pid  = BPF_CORE_READ(child, pid);
+	__u32 child_pid = BPF_CORE_READ(child, pid);
 	__u32 child_tgid = BPF_CORE_READ(child, tgid);
 
 	/* Обрабатываем только fork процессов, не clone потоков */
@@ -755,14 +737,13 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	struct track_info child_ti;
 	BPF_ZERO(child_ti);
 	child_ti.root_pid = parent_ti->root_pid;
-	child_ti.rule_id  = parent_ti->rule_id;
-	child_ti.is_root  = 0;
+	child_ti.rule_id = parent_ti->rule_id;
+	child_ti.is_root = 0;
 	/* BPF_NOEXIST: если карта полна (-E2BIG) — не отслеживаем ребёнка.
 	 * Это защита от fork storm'ов: при переполнении tracked_map
 	 * новые короткоживущие процессы не добавляются, что позволяет
 	 * userspace cleanup дренировать карту. */
-	if (bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti,
-				BPF_NOEXIST) != 0)
+	if (bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti, BPF_NOEXIST) != 0)
 		return 0;
 
 	/* Создаём proc_info для потомка через per-CPU scratch buffer
@@ -773,17 +754,16 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	BPF_ZERO_PTR(child_pi, sizeof(*child_pi));
-	child_pi->tgid      = child_tgid;
-	child_pi->ppid      = parent_tgid;
-	child_pi->uid       = (__u32)bpf_get_current_uid_gid();
+	child_pi->tgid = child_tgid;
+	child_pi->ppid = parent_tgid;
+	child_pi->uid = (__u32)bpf_get_current_uid_gid();
 	child_pi->cgroup_id = bpf_get_current_cgroup_id();
-	child_pi->start_ns  = BPF_CORE_READ(child, start_time);
-	read_comm_and_thread(child_pi->comm, sizeof(child_pi->comm),
-			     child_pi->thread_name, sizeof(child_pi->thread_name));
+	child_pi->start_ns = BPF_CORE_READ(child, start_time);
+	read_comm_and_thread(child_pi->comm, sizeof(child_pi->comm), child_pi->thread_name,
+			     sizeof(child_pi->thread_name));
 
 	/* Наследуем identity/планировщик/пространства имён от родителя */
-	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid,
-		      &child_pi->euid);
+	read_identity(parent, &child_pi->loginuid, &child_pi->sessionid, &child_pi->euid);
 	child_pi->tty_nr = read_tty_nr(child);
 	child_pi->sched_policy = BPF_CORE_READ(parent, policy);
 	read_ns_inums(parent, &child_pi->mnt_ns_inum, &child_pi->pid_ns_inum,
@@ -804,18 +784,17 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	}
 
 	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type         = EVENT_FORK;
-	e->tgid         = child_tgid;
-	e->ppid         = parent_tgid;
-	e->uid          = child_pi->uid;
-	e->loginuid     = child_pi->loginuid;
-	e->sessionid    = child_pi->sessionid;
-	e->euid         = child_pi->euid;
+	e->type = EVENT_FORK;
+	e->tgid = child_tgid;
+	e->ppid = parent_tgid;
+	e->uid = child_pi->uid;
+	e->loginuid = child_pi->loginuid;
+	e->sessionid = child_pi->sessionid;
+	e->euid = child_pi->euid;
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	e->cgroup_id    = child_pi->cgroup_id;
-	e->start_ns     = child_pi->start_ns;
-	read_comm_and_thread(e->comm, sizeof(e->comm),
-			     e->thread_name, sizeof(e->thread_name));
+	e->cgroup_id = child_pi->cgroup_id;
+	e->start_ns = child_pi->start_ns;
+	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -837,11 +816,11 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 struct sched_switch_args {
 	/* первые 8 байт: общие поля (type, flags, preempt_count, pid) */
 	__u64 __pad;
-	char  prev_comm[16];
+	char prev_comm[16];
 	__s32 prev_pid;
 	__s32 prev_prio;
-	long  prev_state;
-	char  next_comm[16];
+	long prev_state;
+	char next_comm[16];
 	__s32 next_pid;
 	__s32 next_prio;
 };
@@ -850,7 +829,7 @@ SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch(struct sched_switch_args *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 tid  = (__u32)pid_tgid;
+	__u32 tid = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	/*
@@ -862,26 +841,19 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	 * потому что для главного потока comm совпадает с preempted_by_comm.
 	 */
 	if (tid != tgid) {
-		struct tid_info *existing = bpf_map_lookup_elem(&tid_tgid_map,
-								&tid);
+		struct tid_info *existing = bpf_map_lookup_elem(&tid_tgid_map, &tid);
 		if (!existing) {
 			struct task_struct *leader;
-			struct task_struct *curr =
-				(struct task_struct *)bpf_get_current_task();
-			struct tid_info ti = { .tgid = tgid };
+			struct task_struct *curr = (struct task_struct *)bpf_get_current_task();
+			struct tid_info ti = {.tgid = tgid};
 
 			leader = BPF_CORE_READ(curr, group_leader);
 			if (leader)
-				bpf_probe_read_kernel_str(ti.comm,
-							  sizeof(ti.comm),
-							  &leader->comm);
+				bpf_probe_read_kernel_str(ti.comm, sizeof(ti.comm), &leader->comm);
 			else
-				bpf_probe_read_kernel(ti.comm,
-						      COMM_LEN,
-						      ctx->prev_comm);
+				bpf_probe_read_kernel(ti.comm, COMM_LEN, ctx->prev_comm);
 			ti.comm[COMM_LEN - 1] = '\0';
-			bpf_map_update_elem(&tid_tgid_map, &tid,
-					    &ti, BPF_NOEXIST);
+			bpf_map_update_elem(&tid_tgid_map, &tid, &ti, BPF_NOEXIST);
 		}
 	}
 
@@ -897,11 +869,10 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 
 	/* Память (страницы) — RSS, разделяемая, подкачка */
 	struct mem_info mi = read_mem_pages(task);
-	info->rss_pages   = mi.rss_pages;
+	info->rss_pages = mi.rss_pages;
 	info->shmem_pages = mi.shmem_pages;
-	info->swap_pages  = mi.swap_pages;
-	if (mi.rss_pages > 0 &&
-	    (info->rss_min_pages == 0 || mi.rss_pages < info->rss_min_pages))
+	info->swap_pages = mi.swap_pages;
+	if (mi.rss_pages > 0 && (info->rss_min_pages == 0 || mi.rss_pages < info->rss_min_pages))
 		info->rss_min_pages = mi.rss_pages;
 	if (mi.rss_pages > info->rss_max_pages)
 		info->rss_max_pages = mi.rss_pages;
@@ -918,17 +889,14 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	 */
 	{
 		__u32 tid = (__u32)pid_tgid;
-		__u64 thr_cpu = BPF_CORE_READ(task, utime)
-			      + BPF_CORE_READ(task, stime);
+		__u64 thr_cpu = BPF_CORE_READ(task, utime) + BPF_CORE_READ(task, stime);
 		__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map, &tid);
 		if (prev) {
 			if (thr_cpu > *prev)
-				__sync_fetch_and_add(&info->cpu_ns,
-						     thr_cpu - *prev);
+				__sync_fetch_and_add(&info->cpu_ns, thr_cpu - *prev);
 			*prev = thr_cpu;
 		} else {
-			bpf_map_update_elem(&thread_cpu_map, &tid,
-					    &thr_cpu, BPF_NOEXIST);
+			bpf_map_update_elem(&thread_cpu_map, &tid, &thr_cpu, BPF_NOEXIST);
 		}
 	}
 
@@ -972,12 +940,12 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	info->sched_policy = BPF_CORE_READ(task, policy);
 
 	/* Учёт ввода-вывода (включая page cache) */
-	read_io_accounting(task, &info->io_rchar, &info->io_wchar,
-			   &info->io_syscr, &info->io_syscw);
+	read_io_accounting(task, &info->io_rchar, &info->io_wchar, &info->io_syscr,
+			   &info->io_syscw);
 
 	/* Номера inode пространств имён */
-	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum,
-		      &info->net_ns_inum, &info->cgroup_ns_inum);
+	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum, &info->net_ns_inum,
+		      &info->cgroup_ns_inum);
 
 	/*
 	 * Отслеживание вытеснения: prev_state == 0 означает TASK_RUNNING,
@@ -995,17 +963,13 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		 * Если записи нет — это главный поток, берём данные из
 		 * tracepoint args как есть.
 		 */
-		struct tid_info *ti = bpf_map_lookup_elem(&tid_tgid_map,
-							  &next_tid);
+		struct tid_info *ti = bpf_map_lookup_elem(&tid_tgid_map, &next_tid);
 		if (ti) {
 			info->preempted_by_pid = ti->tgid;
-			__builtin_memcpy(info->preempted_by_comm,
-					 ti->comm, COMM_LEN);
+			__builtin_memcpy(info->preempted_by_comm, ti->comm, COMM_LEN);
 		} else {
 			info->preempted_by_pid = next_tid;
-			bpf_probe_read_kernel(info->preempted_by_comm,
-					      COMM_LEN,
-					      ctx->next_comm);
+			bpf_probe_read_kernel(info->preempted_by_comm, COMM_LEN, ctx->next_comm);
 		}
 		info->preempted_by_comm[COMM_LEN - 1] = '\0';
 		info->preempted_by_cgroup_id = 0;
@@ -1020,7 +984,7 @@ SEC("tracepoint/sched/sched_process_exit")
 int handle_exit(void *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 pid  = (__u32)pid_tgid;
+	__u32 pid = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	/* Cleanup tid_tgid_map для завершающегося потока (до проверки tracked) */
@@ -1038,13 +1002,10 @@ int handle_exit(void *ctx)
 	{
 		struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
 		if (pi) {
-			__u64 thr_cpu = BPF_CORE_READ(task, utime)
-				      + BPF_CORE_READ(task, stime);
-			__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map,
-							  &pid);
+			__u64 thr_cpu = BPF_CORE_READ(task, utime) + BPF_CORE_READ(task, stime);
+			__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map, &pid);
 			if (prev && thr_cpu > *prev)
-				__sync_fetch_and_add(&pi->cpu_ns,
-						     thr_cpu - *prev);
+				__sync_fetch_and_add(&pi->cpu_ns, thr_cpu - *prev);
 		}
 		bpf_map_delete_elem(&thread_cpu_map, &pid);
 	}
@@ -1055,22 +1016,22 @@ int handle_exit(void *ctx)
 
 	/* Финальный снимок метрик из task_struct */
 	struct mem_info exit_mi = read_mem_pages(task);
-	__u64 final_vsize    = read_vsize_pages(task);
-	__u32 final_threads  = read_nr_threads(task);
-	__s16 final_oom_adj  = read_oom_score_adj(task);
+	__u64 final_vsize = read_vsize_pages(task);
+	__u32 final_threads = read_nr_threads(task);
+	__s16 final_oom_adj = read_oom_score_adj(task);
 	__u32 final_exit_code = BPF_CORE_READ(task, exit_code);
-	__u64 exit_ts        = bpf_ktime_get_boot_ns();
+	__u64 exit_ts = bpf_ktime_get_boot_ns();
 
 	/* Финальные метрики из proc_info. Карты удаляются ПОСЛЕ отправки
 	 * exit-события, чтобы не инвалидировать указатель info. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
-		info->status        = PROC_STATUS_EXITED;
-		info->exit_ns       = exit_ts;
-		info->exit_code     = final_exit_code;
-		info->rss_pages     = exit_mi.rss_pages;
-		info->vsize_pages   = final_vsize;
-		info->threads       = final_threads;
+		info->status = PROC_STATUS_EXITED;
+		info->exit_ns = exit_ts;
+		info->exit_code = final_exit_code;
+		info->rss_pages = exit_mi.rss_pages;
+		info->vsize_pages = final_vsize;
+		info->threads = final_threads;
 		info->oom_score_adj = final_oom_adj;
 	}
 
@@ -1092,52 +1053,51 @@ int handle_exit(void *ctx)
 	}
 
 	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type         = EVENT_EXIT;
-	e->tgid         = tgid;
-	e->uid          = (__u32)bpf_get_current_uid_gid();
+	e->type = EVENT_EXIT;
+	e->tgid = tgid;
+	e->uid = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = exit_ts;
-	read_comm_and_thread(e->comm, sizeof(e->comm),
-			     e->thread_name, sizeof(e->thread_name));
+	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
 
 	/* Данные отслеживания */
 	e->root_pid = ti->root_pid;
-	e->rule_id  = ti->rule_id;
+	e->rule_id = ti->rule_id;
 
 	/* Финальные метрики */
-	e->rss_pages     = exit_mi.rss_pages;
-	e->vsize_pages   = final_vsize;
-	e->threads       = final_threads;
+	e->rss_pages = exit_mi.rss_pages;
+	e->vsize_pages = final_vsize;
+	e->threads = final_threads;
 	e->oom_score_adj = final_oom_adj;
-	e->exit_code     = final_exit_code;
+	e->exit_code = final_exit_code;
 
 	/* Накопленные метрики из proc_info */
 	if (info) {
-		e->cpu_ns        = info->cpu_ns;
+		e->cpu_ns = info->cpu_ns;
 		e->rss_min_pages = info->rss_min_pages;
 		e->rss_max_pages = info->rss_max_pages;
-		e->start_ns      = info->start_ns;
-		e->cgroup_id     = info->cgroup_id;
-		e->ppid          = info->ppid;
-		e->cmdline_len   = info->cmdline_len;
-		e->oom_killed    = info->oom_killed;
-		e->net_tcp_tx_bytes  = info->net_tcp_tx_bytes;
-		e->net_tcp_rx_bytes  = info->net_tcp_rx_bytes;
-		e->net_udp_tx_bytes  = info->net_udp_tx_bytes;
-		e->net_udp_rx_bytes  = info->net_udp_rx_bytes;
+		e->start_ns = info->start_ns;
+		e->cgroup_id = info->cgroup_id;
+		e->ppid = info->ppid;
+		e->cmdline_len = info->cmdline_len;
+		e->oom_killed = info->oom_killed;
+		e->net_tcp_tx_bytes = info->net_tcp_tx_bytes;
+		e->net_tcp_rx_bytes = info->net_tcp_rx_bytes;
+		e->net_udp_tx_bytes = info->net_udp_tx_bytes;
+		e->net_udp_rx_bytes = info->net_udp_rx_bytes;
 		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
-		e->loginuid      = info->loginuid;
-		e->sessionid     = info->sessionid;
-		e->euid          = info->euid;
-		e->tty_nr        = info->tty_nr;
-		e->sched_policy  = info->sched_policy;
-		e->io_rchar      = info->io_rchar;
-		e->io_wchar      = info->io_wchar;
-		e->io_syscr      = info->io_syscr;
-		e->io_syscw      = info->io_syscw;
-		e->mnt_ns_inum   = info->mnt_ns_inum;
-		e->pid_ns_inum   = info->pid_ns_inum;
-		e->net_ns_inum   = info->net_ns_inum;
+		e->loginuid = info->loginuid;
+		e->sessionid = info->sessionid;
+		e->euid = info->euid;
+		e->tty_nr = info->tty_nr;
+		e->sched_policy = info->sched_policy;
+		e->io_rchar = info->io_rchar;
+		e->io_wchar = info->io_wchar;
+		e->io_syscr = info->io_syscr;
+		e->io_syscw = info->io_syscw;
+		e->mnt_ns_inum = info->mnt_ns_inum;
+		e->pid_ns_inum = info->pid_ns_inum;
+		e->net_ns_inum = info->net_ns_inum;
 		e->cgroup_ns_inum = info->cgroup_ns_inum;
 	}
 
@@ -1180,26 +1140,25 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	}
 
 	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type         = EVENT_OOM_KILL;
-	e->tgid         = tgid;
-	e->uid          = (__u32)bpf_get_current_uid_gid();
+	e->type = EVENT_OOM_KILL;
+	e->tgid = tgid;
+	e->uid = (__u32)bpf_get_current_uid_gid();
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm),
-				  BPF_CORE_READ(task, comm));
+	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm), BPF_CORE_READ(task, comm));
 
 	if (info) {
-		e->ppid          = info->ppid;
-		e->cgroup_id     = info->cgroup_id;
-		e->rss_pages     = info->rss_pages;
+		e->ppid = info->ppid;
+		e->cgroup_id = info->cgroup_id;
+		e->rss_pages = info->rss_pages;
 		e->rss_min_pages = info->rss_min_pages;
 		e->rss_max_pages = info->rss_max_pages;
-		e->cpu_ns        = info->cpu_ns;
-		e->start_ns      = info->start_ns;
-		e->cmdline_len   = info->cmdline_len;
-		e->loginuid      = info->loginuid;
-		e->sessionid     = info->sessionid;
-		e->euid          = info->euid;
-		e->tty_nr        = info->tty_nr;
+		e->cpu_ns = info->cpu_ns;
+		e->start_ns = info->start_ns;
+		e->cmdline_len = info->cmdline_len;
+		e->loginuid = info->loginuid;
+		e->sessionid = info->sessionid;
+		e->euid = info->euid;
+		e->tty_nr = info->tty_nr;
 		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 	}
 
@@ -1229,8 +1188,8 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	 *   args[3] = int group
 	 *   args[4] = int result
 	 */
-	int sig        = (int)ctx->args[0];
-	int result     = (int)ctx->args[4];
+	int sig = (int)ctx->args[0];
+	int result = (int)ctx->args[4];
 	struct task_struct *target = (struct task_struct *)ctx->args[2];
 	int target_pid = BPF_CORE_READ(target, tgid);
 
@@ -1262,16 +1221,16 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	}
 
 	BPF_ZERO_PTR(se, sizeof(*se));
-	se->type         = EVENT_SIGNAL;
-	se->sender_tgid  = sender_tgid;
-	se->sender_uid   = (__u32)bpf_get_current_uid_gid();
-	se->target_pid   = target_tgid;
+	se->type = EVENT_SIGNAL;
+	se->sender_tgid = sender_tgid;
+	se->sender_uid = (__u32)bpf_get_current_uid_gid();
+	se->target_pid = target_tgid;
 	se->timestamp_ns = bpf_ktime_get_boot_ns();
-	se->sig          = sig;
-	se->sig_code     = code;
-	se->sig_result   = result;
-	read_comm_and_thread(se->sender_comm, sizeof(se->sender_comm),
-			     se->sender_thread_name, sizeof(se->sender_thread_name));
+	se->sig = sig;
+	se->sig_code = code;
+	se->sig_result = result;
+	read_comm_and_thread(se->sender_comm, sizeof(se->sender_comm), se->sender_thread_name,
+			     sizeof(se->sender_thread_name));
 
 	/* cgroup id отправителя */
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -1367,14 +1326,14 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);    /* pid_tgid */
+	__type(key, __u64); /* pid_tgid */
 	__type(value, struct file_path_scratch);
 } openat_args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);    /* pid_tgid */
+	__type(key, __u64); /* pid_tgid */
 	__type(value, struct rw_args);
 } rw_args_map SEC(".maps");
 
@@ -1393,7 +1352,7 @@ struct {
 struct file_path_scratch {
 	char path[BPF_FILE_PATH_MAX];
 	char path2[BPF_FILE_PATH_MAX];
-	int  flags;    /* openat: O_RDONLY/O_WRONLY/etc. */
+	int flags; /* openat: O_RDONLY/O_WRONLY/etc. */
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1445,14 +1404,13 @@ struct {
  * Результат: верификатор видит линейный код с фиксированными offset-ами,
  * работает на ядрах от 5.15 до 6.x без изменений.
  */
-static __always_inline int prefix_match(const char *path,
-					const char *prefix, int len)
+static __always_inline int prefix_match(const char *path, const char *prefix, int len)
 {
 	if (len <= 0 || len > PREFIX_CMP_MAX)
 		len = PREFIX_CMP_MAX;
 
 	int match = 1;
-	#pragma unroll
+#pragma unroll
 	for (int j = 0; j < PREFIX_CMP_MAX; j++) {
 		if (j < len && path[j] != prefix[j])
 			match = 0;
@@ -1466,11 +1424,10 @@ static __always_inline int path_matches_include(const char *path)
 {
 	int has_any = 0;
 
-	#pragma unroll
+#pragma unroll
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
-		struct file_prefix *fp = bpf_map_lookup_elem(
-			&file_include_prefixes, &idx);
+		struct file_prefix *fp = bpf_map_lookup_elem(&file_include_prefixes, &idx);
 		if (!fp || fp->len == 0)
 			continue;
 		has_any = 1;
@@ -1486,11 +1443,10 @@ static __always_inline int path_matches_include(const char *path)
  * Возвращает 1 если путь нужно исключить. */
 static __always_inline int path_matches_exclude(const char *path)
 {
-	#pragma unroll
+#pragma unroll
 	for (int i = 0; i < FILE_MAX_PREFIXES; i++) {
 		__u32 idx = i;
-		struct file_prefix *fp = bpf_map_lookup_elem(
-			&file_exclude_prefixes, &idx);
+		struct file_prefix *fp = bpf_map_lookup_elem(&file_exclude_prefixes, &idx);
 		if (!fp || fp->len == 0)
 			continue;
 
@@ -1558,8 +1514,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
-	struct file_path_scratch *oa = bpf_map_lookup_elem(
-		&openat_args_map, &pid_tgid);
+	struct file_path_scratch *oa = bpf_map_lookup_elem(&openat_args_map, &pid_tgid);
 	if (!oa)
 		return 0;
 
@@ -1570,7 +1525,7 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 	}
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = (__s32)ret };
+	struct fd_key fk = {.tgid = tgid, .fd = (__s32)ret};
 
 	/* path в oa->path, flags в первых 4 байтах oa->path2 (см. handle_openat_enter) */
 	__u32 fi_zero = 0;
@@ -1596,14 +1551,13 @@ int handle_openat_exit(struct trace_event_raw_sys_exit *ctx)
 		fe->tgid = tgid;
 		fe->timestamp_ns = bpf_ktime_get_boot_ns();
 		fe->cgroup_id = bpf_get_current_cgroup_id();
-		read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+		read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name,
+				     sizeof(fe->thread_name));
 		__builtin_memcpy(fe->path, fi->path, BPF_FILE_PATH_MAX);
 		fe->flags = fi->flags;
 		fe->uid = (__u32)bpf_get_current_uid_gid();
 
-		struct task_struct *task =
-			(struct task_struct *)bpf_get_current_task();
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 		fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
@@ -1642,9 +1596,11 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 		return 0;
 
 	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
-						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_RENAME;
@@ -1652,8 +1608,7 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1670,16 +1625,14 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 SEC("tracepoint/syscalls/sys_enter_rename")
 int handle_rename(struct trace_event_raw_sys_enter *ctx)
 {
-	return do_rename((const char *)ctx->args[0],
-			 (const char *)ctx->args[1]);
+	return do_rename((const char *)ctx->args[0], (const char *)ctx->args[1]);
 }
 
 /* renameat2(olddfd, oldname, newdfd, newname, flags) — args[1]=oldname, args[3]=newname */
 SEC("tracepoint/syscalls/sys_enter_renameat2")
 int handle_renameat2(struct trace_event_raw_sys_enter *ctx)
 {
-	return do_rename((const char *)ctx->args[1],
-			 (const char *)ctx->args[3]);
+	return do_rename((const char *)ctx->args[1], (const char *)ctx->args[3]);
 }
 
 static __always_inline int do_unlink(const char *pathname, int unlink_flags)
@@ -1707,9 +1660,11 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 		return 0;
 
 	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
-						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_UNLINK;
@@ -1717,8 +1672,7 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1772,9 +1726,11 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
-						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;
@@ -1782,8 +1738,7 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1811,15 +1766,17 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 		return 0;
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (!fi || fi->path[0] == '\0')
 		return 0;
 
 	RB_STAT_TOTAL_FILE();
-	struct file_event *fe = bpf_ringbuf_reserve(&events_file,
-						    sizeof(*fe), 0);
-	if (!fe) { RB_STAT_DROP_FILE(); return 0; }
+	struct file_event *fe = bpf_ringbuf_reserve(&events_file, sizeof(*fe), 0);
+	if (!fe) {
+		RB_STAT_DROP_FILE();
+		return 0;
+	}
 
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_TRUNCATE;
@@ -1827,8 +1784,7 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
@@ -1851,11 +1807,10 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	int fd = (int)ctx->args[0];
 
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (!fi)
 		return 0;
-
 
 	/* Отправляем событие закрытия файла через кольцевой буфер */
 	RB_STAT_TOTAL_FILE();
@@ -1866,8 +1821,8 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->tgid = tgid;
 		fe->timestamp_ns = bpf_ktime_get_boot_ns();
 		fe->cgroup_id = bpf_get_current_cgroup_id();
-		read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+		read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name,
+				     sizeof(fe->thread_name));
 		__builtin_memcpy(fe->path, fi->path, BPF_FILE_PATH_MAX);
 		fe->flags = fi->flags;
 		fe->read_bytes = fi->read_bytes;
@@ -1876,11 +1831,10 @@ int handle_close_enter(struct trace_event_raw_sys_enter *ctx)
 		fe->fsync_count = fi->fsync_count;
 
 		/* Получаем ppid */
-		struct task_struct *task =
-			(struct task_struct *)bpf_get_current_task();
+		struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 		struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 		fe->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
-		fe->uid  = (__u32)bpf_get_current_uid_gid();
+		fe->uid = (__u32)bpf_get_current_uid_gid();
 
 		bpf_ringbuf_submit(fe, 0);
 	} else {
@@ -1907,11 +1861,11 @@ int handle_read_enter(struct trace_event_raw_sys_enter *ctx)
 
 	/* Быстрая проверка: отслеживается ли этот fd? */
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -1936,7 +1890,7 @@ int handle_read_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->read_bytes, (__u64)ret);
@@ -1959,11 +1913,11 @@ int handle_write_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -1988,7 +1942,7 @@ int handle_write_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
@@ -2010,11 +1964,11 @@ int handle_pread_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -2036,7 +1990,7 @@ int handle_pread_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->read_bytes, (__u64)ret);
@@ -2056,11 +2010,11 @@ int handle_pwrite_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -2082,7 +2036,7 @@ int handle_pwrite_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
@@ -2104,11 +2058,11 @@ int handle_readv_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -2130,7 +2084,7 @@ int handle_readv_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->read_bytes, (__u64)ret);
@@ -2150,11 +2104,11 @@ int handle_writev_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	if (!bpf_map_lookup_elem(&fd_map, &fk))
 		return 0;
 
-	struct rw_args ra = { .fd = fd };
+	struct rw_args ra = {.fd = fd};
 	bpf_map_update_elem(&rw_args_map, &pid_tgid, &ra, BPF_ANY);
 	return 0;
 }
@@ -2176,7 +2130,7 @@ int handle_writev_exit(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->write_bytes, (__u64)ret);
@@ -2190,7 +2144,7 @@ int handle_writev_exit(struct trace_event_raw_sys_exit *ctx)
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);    /* pid_tgid */
+	__type(key, __u64); /* pid_tgid */
 	__type(value, struct sendfile_args);
 } sendfile_args_map SEC(".maps");
 
@@ -2206,16 +2160,15 @@ int handle_sendfile_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int out_fd = (int)ctx->args[0];
-	int in_fd  = (int)ctx->args[1];
+	int in_fd = (int)ctx->args[1];
 
 	/* Хотя бы один fd должен отслеживаться */
-	struct fd_key fk_out = { .tgid = tgid, .fd = out_fd };
-	struct fd_key fk_in  = { .tgid = tgid, .fd = in_fd };
-	if (!bpf_map_lookup_elem(&fd_map, &fk_out) &&
-	    !bpf_map_lookup_elem(&fd_map, &fk_in))
+	struct fd_key fk_out = {.tgid = tgid, .fd = out_fd};
+	struct fd_key fk_in = {.tgid = tgid, .fd = in_fd};
+	if (!bpf_map_lookup_elem(&fd_map, &fk_out) && !bpf_map_lookup_elem(&fd_map, &fk_in))
 		return 0;
 
-	struct sendfile_args sa = { .out_fd = out_fd, .in_fd = in_fd };
+	struct sendfile_args sa = {.out_fd = out_fd, .in_fd = in_fd};
 	bpf_map_update_elem(&sendfile_args_map, &pid_tgid, &sa, BPF_ANY);
 	return 0;
 }
@@ -2225,14 +2178,13 @@ int handle_sendfile_exit(struct trace_event_raw_sys_exit *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 
-	struct sendfile_args *sa = bpf_map_lookup_elem(
-		&sendfile_args_map, &pid_tgid);
+	struct sendfile_args *sa = bpf_map_lookup_elem(&sendfile_args_map, &pid_tgid);
 	if (!sa)
 		return 0;
 
 	long ret = ctx->ret;
 	int out_fd = sa->out_fd;
-	int in_fd  = sa->in_fd;
+	int in_fd = sa->in_fd;
 	bpf_map_delete_elem(&sendfile_args_map, &pid_tgid);
 
 	if (ret <= 0)
@@ -2242,12 +2194,12 @@ int handle_sendfile_exit(struct trace_event_raw_sys_exit *ctx)
 	__u64 bytes = (__u64)ret;
 
 	/* read_bytes → in_fd, write_bytes → out_fd */
-	struct fd_key fk_in = { .tgid = tgid, .fd = in_fd };
+	struct fd_key fk_in = {.tgid = tgid, .fd = in_fd};
 	struct fd_info *fi_in = bpf_map_lookup_elem(&fd_map, &fk_in);
 	if (fi_in)
 		__sync_fetch_and_add(&fi_in->read_bytes, bytes);
 
-	struct fd_key fk_out = { .tgid = tgid, .fd = out_fd };
+	struct fd_key fk_out = {.tgid = tgid, .fd = out_fd};
 	struct fd_info *fi_out = bpf_map_lookup_elem(&fd_map, &fk_out);
 	if (fi_out)
 		__sync_fetch_and_add(&fi_out->write_bytes, bytes);
@@ -2264,7 +2216,7 @@ int handle_fsync_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->fsync_count, 1);
@@ -2279,7 +2231,7 @@ int handle_fdatasync_enter(struct trace_event_raw_sys_enter *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	int fd = (int)ctx->args[0];
-	struct fd_key fk = { .tgid = tgid, .fd = fd };
+	struct fd_key fk = {.tgid = tgid, .fd = fd};
 	struct fd_info *fi = bpf_map_lookup_elem(&fd_map, &fk);
 	if (fi)
 		__sync_fetch_and_add(&fi->fsync_count, 1);
@@ -2311,11 +2263,10 @@ int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_CHMOD;
 	fe->tgid = tgid;
-	fe->uid  = (__u32)bpf_get_current_uid_gid();
+	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
 	fe->chmod_mode = mode;
 
@@ -2350,11 +2301,10 @@ int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
 	BPF_ZERO_PTR(fe, sizeof(*fe));
 	fe->type = EVENT_FILE_CHOWN;
 	fe->tgid = tgid;
-	fe->uid  = (__u32)bpf_get_current_uid_gid();
+	fe->uid = (__u32)bpf_get_current_uid_gid();
 	fe->timestamp_ns = bpf_ktime_get_boot_ns();
 	fe->cgroup_id = bpf_get_current_cgroup_id();
-	read_comm_and_thread(fe->comm, sizeof(fe->comm),
-			     fe->thread_name, sizeof(fe->thread_name));
+	read_comm_and_thread(fe->comm, sizeof(fe->comm), fe->thread_name, sizeof(fe->thread_name));
 	bpf_probe_read_user_str(fe->path, sizeof(fe->path), filename);
 	fe->chown_uid = uid;
 	fe->chown_gid = gid;
@@ -2388,21 +2338,21 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, NET_MAX_SOCKETS);
-	__type(key, __u64);           /* указатель на sock как u64 */
+	__type(key, __u64); /* указатель на sock как u64 */
 	__type(value, struct sock_info);
 } sock_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);           /* pid_tgid */
+	__type(key, __u64); /* pid_tgid */
 	__type(value, struct connect_args);
 } connect_args_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, BPF_ARGS_MAP_SIZE);
-	__type(key, __u64);           /* pid_tgid */
+	__type(key, __u64); /* pid_tgid */
 	__type(value, struct sendmsg_args);
 } sendmsg_args_map SEC(".maps");
 
@@ -2420,22 +2370,21 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, NET_MAX_SOCKETS);
-	__type(key, __u64);           /* inode number */
-	__type(value, __u32);         /* tgid */
+	__type(key, __u64);   /* inode number */
+	__type(value, __u32); /* tgid */
 } seed_inode_map SEC(".maps");
 
 /*
  * Чтение адресов сокета в sock_info.
  * Поддерживает AF_INET и AF_INET6.
  */
-static __always_inline void read_sock_addrs(struct sock *sk,
-					    struct sock_info *si)
+static __always_inline void read_sock_addrs(struct sock *sk, struct sock_info *si)
 {
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	si->af = (__u8)family;
 	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
 	si->remote_port = __bpf_ntohs(dport);
-	si->local_port  = BPF_CORE_READ(sk, __sk_common.skc_num);
+	si->local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
 
 	if (family == 2) { /* AF_INET */
 		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
@@ -2443,19 +2392,15 @@ static __always_inline void read_sock_addrs(struct sock *sk,
 		__builtin_memcpy(si->remote_addr, &daddr, 4);
 		__builtin_memcpy(si->local_addr, &saddr, 4);
 	} else if (family == 10) { /* AF_INET6 */
-		BPF_CORE_READ_INTO(si->remote_addr, sk,
-				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-		BPF_CORE_READ_INTO(si->local_addr, sk,
-				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(si->remote_addr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(si->local_addr, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
 	}
 }
 
 /*
  * Отправка события NET_LISTEN/NET_CONNECT/NET_ACCEPT из sock_info.
  */
-static __always_inline void emit_net_event(struct sock_info *si,
-					   __u64 now_ns,
-					   __u32 evt_type)
+static __always_inline void emit_net_event(struct sock_info *si, __u64 now_ns, __u32 evt_type)
 {
 	__u32 zero = 0;
 	struct net_config *nc = bpf_map_lookup_elem(&net_cfg, &zero);
@@ -2470,23 +2415,21 @@ static __always_inline void emit_net_event(struct sock_info *si,
 	}
 
 	BPF_ZERO_PTR(ne, sizeof(*ne));
-	ne->type         = evt_type;
-	ne->tgid         = si->tgid;
-	ne->uid          = si->uid;
+	ne->type = evt_type;
+	ne->tgid = si->tgid;
+	ne->uid = si->uid;
 	ne->timestamp_ns = now_ns;
-	ne->cgroup_id    = bpf_get_current_cgroup_id();
-	read_comm_and_thread(ne->comm, sizeof(ne->comm),
-			     ne->thread_name, sizeof(ne->thread_name));
+	ne->cgroup_id = bpf_get_current_cgroup_id();
+	read_comm_and_thread(ne->comm, sizeof(ne->comm), ne->thread_name, sizeof(ne->thread_name));
 
-	struct task_struct *task =
-		(struct task_struct *)bpf_get_current_task();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 	ne->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
 	ne->af = si->af;
 	__builtin_memcpy(ne->local_addr, si->local_addr, 16);
 	__builtin_memcpy(ne->remote_addr, si->remote_addr, 16);
-	ne->local_port  = si->local_port;
+	ne->local_port = si->local_port;
 	ne->remote_port = si->remote_port;
 
 	bpf_ringbuf_submit(ne, 0);
@@ -2495,9 +2438,7 @@ static __always_inline void emit_net_event(struct sock_info *si,
 /*
  * Отправка события NET_CLOSE из sock_info.
  */
-static __always_inline void emit_net_close(struct sock_info *si,
-					   __u64 now_ns,
-					   __u8 tcp_state)
+static __always_inline void emit_net_close(struct sock_info *si, __u64 now_ns, __u8 tcp_state)
 {
 	/* net_close только если net_tracking.enabled = true */
 	__u32 zero = 0;
@@ -2513,31 +2454,29 @@ static __always_inline void emit_net_close(struct sock_info *si,
 	}
 
 	BPF_ZERO_PTR(ne, sizeof(*ne));
-	ne->type         = EVENT_NET_CLOSE;
-	ne->tgid         = si->tgid;
-	ne->uid          = si->uid;
+	ne->type = EVENT_NET_CLOSE;
+	ne->tgid = si->tgid;
+	ne->uid = si->uid;
 	ne->timestamp_ns = now_ns;
-	ne->cgroup_id    = bpf_get_current_cgroup_id();
-	read_comm_and_thread(ne->comm, sizeof(ne->comm),
-			     ne->thread_name, sizeof(ne->thread_name));
+	ne->cgroup_id = bpf_get_current_cgroup_id();
+	read_comm_and_thread(ne->comm, sizeof(ne->comm), ne->thread_name, sizeof(ne->thread_name));
 
 	/* Получаем ppid */
-	struct task_struct *task =
-		(struct task_struct *)bpf_get_current_task();
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
 	ne->ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
 
 	ne->af = si->af;
 	__builtin_memcpy(ne->local_addr, si->local_addr, 16);
 	__builtin_memcpy(ne->remote_addr, si->remote_addr, 16);
-	ne->local_port  = si->local_port;
+	ne->local_port = si->local_port;
 	ne->remote_port = si->remote_port;
-	ne->tx_bytes    = si->tx_bytes;
-	ne->rx_bytes    = si->rx_bytes;
-	ne->tx_calls    = si->tx_calls;
-	ne->rx_calls    = si->rx_calls;
+	ne->tx_bytes = si->tx_bytes;
+	ne->rx_bytes = si->rx_bytes;
+	ne->tx_calls = si->tx_calls;
+	ne->rx_calls = si->rx_calls;
 	ne->duration_ns = (now_ns > si->start_ns) ? now_ns - si->start_ns : 0;
-	ne->tcp_state   = tcp_state;
+	ne->tcp_state = tcp_state;
 
 	bpf_ringbuf_submit(ne, 0);
 }
@@ -2548,7 +2487,7 @@ SEC("kprobe/tcp_v4_connect")
 int BPF_KPROBE(kp_tcp_v4_connect, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct connect_args args = { .sock_ptr = (__u64)sk };
+	struct connect_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&connect_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2557,9 +2496,9 @@ SEC("kretprobe/tcp_v4_connect")
 int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map,
-							&pid_tgid);
-	if (!args) return 0;
+	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map, &pid_tgid);
+	if (!args)
+		return 0;
 
 	__u64 sk_ptr = args->sock_ptr;
 	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
@@ -2574,7 +2513,8 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
-	struct sock_info si; BPF_ZERO(si);
+	struct sock_info si;
+	BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -2585,8 +2525,12 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
-	if (cnt) __sync_fetch_and_add(cnt, 1);
-	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+	if (cnt)
+		__sync_fetch_and_add(cnt, 1);
+	else {
+		__u64 one = 1;
+		bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST);
+	}
 
 	return 0;
 }
@@ -2597,7 +2541,7 @@ SEC("kprobe/tcp_v6_connect")
 int BPF_KPROBE(kp_tcp_v6_connect, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct connect_args args = { .sock_ptr = (__u64)sk };
+	struct connect_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&connect_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2606,9 +2550,9 @@ SEC("kretprobe/tcp_v6_connect")
 int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map,
-							&pid_tgid);
-	if (!args) return 0;
+	struct connect_args *args = bpf_map_lookup_elem(&connect_args_map, &pid_tgid);
+	if (!args)
+		return 0;
 
 	__u64 sk_ptr = args->sock_ptr;
 	bpf_map_delete_elem(&connect_args_map, &pid_tgid);
@@ -2623,7 +2567,8 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
-	struct sock_info si; BPF_ZERO(si);
+	struct sock_info si;
+	BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -2634,8 +2579,12 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
-	if (cnt) __sync_fetch_and_add(cnt, 1);
-	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+	if (cnt)
+		__sync_fetch_and_add(cnt, 1);
+	else {
+		__u64 one = 1;
+		bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST);
+	}
 
 	return 0;
 }
@@ -2656,7 +2605,8 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
 		return 0;
 
-	struct sock_info si; BPF_ZERO(si);
+	struct sock_info si;
+	BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -2667,8 +2617,12 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 
 	/* open_conn_count: инкремент */
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
-	if (cnt) __sync_fetch_and_add(cnt, 1);
-	else { __u64 one = 1; bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST); }
+	if (cnt)
+		__sync_fetch_and_add(cnt, 1);
+	else {
+		__u64 one = 1;
+		bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST);
+	}
 
 	return 0;
 }
@@ -2686,7 +2640,8 @@ int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
 		return 0;
 
 	__u64 sk_ptr = (__u64)sk;
-	struct sock_info si; BPF_ZERO(si);
+	struct sock_info si;
+	BPF_ZERO(si);
 	si.tgid = tgid;
 	si.uid = (__u32)bpf_get_current_uid_gid();
 	si.start_ns = bpf_ktime_get_boot_ns();
@@ -2711,7 +2666,7 @@ struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
-	__type(value, __u64);	/* sk_ptr, 0 = не ожидаем kretprobe */
+	__type(value, __u64); /* sk_ptr, 0 = не ожидаем kretprobe */
 } tcp_close_sk SEC(".maps");
 
 SEC("kprobe/tcp_close")
@@ -2731,7 +2686,8 @@ int BPF_KPROBE(kp_tcp_close, struct sock *sk)
 	/* open_conn_count: декремент */
 	__u32 tgid = si->tgid;
 	__u64 *cnt = bpf_map_lookup_elem(&open_conn_map, &tgid);
-	if (cnt && *cnt > 0) __sync_fetch_and_add(cnt, -1);
+	if (cnt && *cnt > 0)
+		__sync_fetch_and_add(cnt, -1);
 
 	/* Отложенное удаление: помечаем CLOSED вместо delete.
 	 * write_snapshot() запишет финальный conn_snapshot и удалит. */
@@ -2766,7 +2722,7 @@ SEC("kprobe/tcp_sendmsg")
 int BPF_KPROBE(kp_tcp_sendmsg, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	struct sendmsg_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2803,7 +2759,7 @@ SEC("kprobe/tcp_recvmsg")
 int BPF_KPROBE(kp_tcp_recvmsg, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	struct sendmsg_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2815,8 +2771,7 @@ int BPF_KRETPROBE(ret_tcp_recvmsg, int ret)
 		return 0;
 
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
-							&pid_tgid);
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map, &pid_tgid);
 	__u64 sk_ptr = args ? args->sock_ptr : 0;
 	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
 
@@ -2843,7 +2798,7 @@ SEC("kprobe/udp_sendmsg")
 int BPF_KPROBE(kp_udp_sendmsg, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	struct sendmsg_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2880,7 +2835,7 @@ SEC("kprobe/udp_recvmsg")
 int BPF_KPROBE(kp_udp_recvmsg, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args args = { .sock_ptr = (__u64)sk };
+	struct sendmsg_args args = {.sock_ptr = (__u64)sk};
 	bpf_map_update_elem(&sendmsg_args_map, &pid_tgid, &args, BPF_ANY);
 	return 0;
 }
@@ -2892,8 +2847,7 @@ int BPF_KRETPROBE(ret_udp_recvmsg, int ret)
 		return 0;
 
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map,
-							&pid_tgid);
+	struct sendmsg_args *args = bpf_map_lookup_elem(&sendmsg_args_map, &pid_tgid);
 	__u64 sk_ptr = args ? args->sock_ptr : 0;
 	bpf_map_delete_elem(&sendmsg_args_map, &pid_tgid);
 
@@ -2940,13 +2894,14 @@ static __always_inline int sec_enabled(int offset)
 {
 	__u32 zero = 0;
 	struct sec_config *cfg = bpf_map_lookup_elem(&sec_cfg, &zero);
-	if (!cfg) return 0;
+	if (!cfg)
+		return 0;
 	return *((__u8 *)cfg + offset);
 }
 
 #define SEC_TCP_RETRANSMIT  0
-#define SEC_TCP_SYN         1
-#define SEC_TCP_RST         2
+#define SEC_TCP_SYN	    1
+#define SEC_TCP_RST	    2
 #define SEC_ICMP_TRACKING   3
 #define SEC_OPEN_CONN_COUNT 4
 
@@ -2954,16 +2909,15 @@ static __always_inline int sec_enabled(int offset)
  * Вспомогательная функция: читает адреса сокета в плоские поля
  * (переиспользует логику парсинга sock).
  */
-static __always_inline void read_sock_to_event(
-	struct sock *sk,
-	__u8 *af, __u8 *local_addr, __u8 *remote_addr,
-	__u16 *local_port, __u16 *remote_port)
+static __always_inline void read_sock_to_event(struct sock *sk, __u8 *af, __u8 *local_addr,
+					       __u8 *remote_addr, __u16 *local_port,
+					       __u16 *remote_port)
 {
 	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
 	*af = (__u8)family;
 	__be16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
 	*remote_port = __bpf_ntohs(dport);
-	*local_port  = BPF_CORE_READ(sk, __sk_common.skc_num);
+	*local_port = BPF_CORE_READ(sk, __sk_common.skc_num);
 
 	if (family == 2) { /* AF_INET */
 		__u32 daddr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
@@ -2971,10 +2925,8 @@ static __always_inline void read_sock_to_event(
 		__builtin_memcpy(remote_addr, &daddr, 4);
 		__builtin_memcpy(local_addr, &saddr, 4);
 	} else if (family == 10) { /* AF_INET6 */
-		BPF_CORE_READ_INTO(remote_addr, sk,
-				   __sk_common.skc_v6_daddr.in6_u.u6_addr8);
-		BPF_CORE_READ_INTO(local_addr, sk,
-				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(remote_addr, sk, __sk_common.skc_v6_daddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(local_addr, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
 	}
 }
 
@@ -2996,8 +2948,7 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	RB_STAT_TOTAL_SEC();
-	struct retransmit_event *re =
-		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
+	struct retransmit_event *re = bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
 		RB_STAT_DROP_SEC();
 		return 0;
@@ -3009,7 +2960,7 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 
 	/* tgid/uid из sock_map (в softirq bpf_get_current_pid_tgid = 0) */
 	re->tgid = si->tgid;
-	re->uid  = si->uid;
+	re->uid = si->uid;
 
 	/* comm и cgroup из proc_map */
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
@@ -3019,8 +2970,8 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 	}
 
 	/* адреса из sock */
-	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
-			   &re->local_port, &re->remote_port);
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr, &re->local_port,
+			   &re->remote_port);
 
 	/* Состояние TCP */
 	re->state = (__u8)BPF_CORE_READ(sk, __sk_common.skc_state);
@@ -3032,8 +2983,8 @@ int handle_tcp_retransmit(struct bpf_raw_tracepoint_args *ctx)
 /* ── SYN flood: kprobe/tcp_conn_request ───────────────────────────── */
 
 SEC("kprobe/tcp_conn_request")
-int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
-	       const void *af_ops, struct sock *sk, struct sk_buff *skb)
+int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops, const void *af_ops,
+	       struct sock *sk, struct sk_buff *skb)
 {
 	if (!sec_enabled(SEC_TCP_SYN))
 		return 0;
@@ -3045,8 +2996,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 		return 0;
 
 	RB_STAT_TOTAL_SEC();
-	struct syn_event *se =
-		bpf_ringbuf_reserve(&events_sec, sizeof(*se), 0);
+	struct syn_event *se = bpf_ringbuf_reserve(&events_sec, sizeof(*se), 0);
 	if (!se) {
 		RB_STAT_DROP_SEC();
 		return 0;
@@ -3058,7 +3008,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 
 	/* tgid/uid из sock_map (в softirq bpf_get_current_pid_tgid = 0) */
 	se->tgid = si->tgid;
-	se->uid  = si->uid;
+	se->uid = si->uid;
 
 	/* comm и cgroup из proc_map */
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
@@ -3076,8 +3026,7 @@ int BPF_KPROBE(kp_tcp_conn_request, struct request_sock_ops *rsk_ops,
 		__u32 saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
 		__builtin_memcpy(se->local_addr, &saddr, 4);
 	} else if (family == 10) { /* AF_INET6 */
-		BPF_CORE_READ_INTO(se->local_addr, sk,
-				   __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+		BPF_CORE_READ_INTO(se->local_addr, sk, __sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
 	}
 
 	/* Удалённый адрес из IP-заголовка skb */
@@ -3124,8 +3073,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	RB_STAT_TOTAL_SEC();
-	struct rst_event *re =
-		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
+	struct rst_event *re = bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
 		RB_STAT_DROP_SEC();
 		return 0;
@@ -3138,7 +3086,7 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 
 	/* tgid/uid из sock_map */
 	re->tgid = si->tgid;
-	re->uid  = si->uid;
+	re->uid = si->uid;
 
 	/* comm и cgroup из proc_map */
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
@@ -3147,8 +3095,8 @@ int handle_tcp_send_reset(struct bpf_raw_tracepoint_args *ctx)
 		re->cgroup_id = pi->cgroup_id;
 	}
 
-	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
-			   &re->local_port, &re->remote_port);
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr, &re->local_port,
+			   &re->remote_port);
 
 	bpf_ringbuf_submit(re, 0);
 	return 0;
@@ -3168,8 +3116,7 @@ int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 		return 0;
 
 	RB_STAT_TOTAL_SEC();
-	struct rst_event *re =
-		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
+	struct rst_event *re = bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
 		RB_STAT_DROP_SEC();
 		return 0;
@@ -3181,7 +3128,7 @@ int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 	re->timestamp_ns = bpf_ktime_get_boot_ns();
 
 	re->tgid = si->tgid;
-	re->uid  = si->uid;
+	re->uid = si->uid;
 
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
 	if (pi) {
@@ -3189,8 +3136,8 @@ int BPF_KPROBE(kp_tcp_send_active_reset, struct sock *sk)
 		re->cgroup_id = pi->cgroup_id;
 	}
 
-	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
-			   &re->local_port, &re->remote_port);
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr, &re->local_port,
+			   &re->remote_port);
 
 	bpf_ringbuf_submit(re, 0);
 	return 0;
@@ -3214,8 +3161,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 		return 0;
 
 	RB_STAT_TOTAL_SEC();
-	struct rst_event *re =
-		bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
+	struct rst_event *re = bpf_ringbuf_reserve(&events_sec, sizeof(*re), 0);
 	if (!re) {
 		RB_STAT_DROP_SEC();
 		return 0;
@@ -3228,7 +3174,7 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 
 	/* tgid/uid из sock_map */
 	re->tgid = si->tgid;
-	re->uid  = si->uid;
+	re->uid = si->uid;
 
 	/* comm и cgroup из proc_map */
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &si->tgid);
@@ -3237,13 +3183,12 @@ int handle_tcp_receive_reset(struct bpf_raw_tracepoint_args *ctx)
 		re->cgroup_id = pi->cgroup_id;
 	}
 
-	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr,
-			   &re->local_port, &re->remote_port);
+	read_sock_to_event(sk, &re->af, re->local_addr, re->remote_addr, &re->local_port,
+			   &re->remote_port);
 
 	bpf_ringbuf_submit(re, 0);
 	return 0;
 }
-
 
 /* ── ICMP flood: kprobe/icmp_rcv ──────────────────────────────────── */
 
@@ -3253,7 +3198,8 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 	if (!sec_enabled(SEC_ICMP_TRACKING))
 		return 0;
 
-	struct icmp_agg_key key; BPF_ZERO(key);
+	struct icmp_agg_key key;
+	BPF_ZERO(key);
 
 	/* Читаем IP-адрес источника из IP-заголовка */
 	unsigned char *head = BPF_CORE_READ(skb, head);
@@ -3273,7 +3219,7 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
 	if (val) {
 		__sync_fetch_and_add(&val->count, 1);
 	} else {
-		struct icmp_agg_val new_val = { .count = 1 };
+		struct icmp_agg_val new_val = {.count = 1};
 		bpf_map_update_elem(&icmp_agg_map, &key, &new_val, BPF_NOEXIST);
 	}
 	return 0;
@@ -3291,8 +3237,7 @@ int BPF_KPROBE(kp_icmp_rcv, struct sk_buff *skb)
  * __data_loc — это __u32, где младшие 16 бит = смещение от начала структуры,
  * старшие 16 бит = длина.
  */
-static __always_inline int read_data_loc_str(void *ctx, __u32 data_loc,
-					     char *buf, int buflen)
+static __always_inline int read_data_loc_str(void *ctx, __u32 data_loc, char *buf, int buflen)
 {
 	__u16 offset = data_loc & 0xFFFF;
 	return bpf_probe_read_kernel_str(buf, buflen, (char *)ctx + offset);
@@ -3306,21 +3251,19 @@ static __always_inline int emit_cgroup_event(void *ctx, __u32 type)
 	struct trace_event_raw_cgroup *tp = ctx;
 
 	RB_STAT_TOTAL_CGROUP();
-	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
-						      sizeof(*ce), 0);
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup, sizeof(*ce), 0);
 	if (!ce) {
 		RB_STAT_DROP_CGROUP();
 		return 0;
 	}
 
 	BPF_ZERO_PTR(ce, sizeof(*ce));
-	ce->type         = type;
-	ce->id           = tp->id;
-	ce->level        = tp->level;
+	ce->type = type;
+	ce->id = tp->id;
+	ce->level = tp->level;
 	ce->timestamp_ns = bpf_ktime_get_boot_ns();
 
-	read_data_loc_str(ctx, tp->__data_loc_path,
-			  ce->path, sizeof(ce->path));
+	read_data_loc_str(ctx, tp->__data_loc_path, ce->path, sizeof(ce->path));
 
 	bpf_ringbuf_submit(ce, 0);
 	return 0;
@@ -3365,24 +3308,21 @@ static __always_inline int emit_cgroup_migrate(void *ctx, __u32 type)
 		pi->cgroup_id = tp->dst_id;
 
 	RB_STAT_TOTAL_CGROUP();
-	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
-						      sizeof(*ce), 0);
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup, sizeof(*ce), 0);
 	if (!ce) {
 		RB_STAT_DROP_CGROUP();
 		return 0;
 	}
 
 	BPF_ZERO_PTR(ce, sizeof(*ce));
-	ce->type         = type;
-	ce->id           = tp->dst_id;
-	ce->level        = tp->dst_level;
-	ce->pid          = tp->pid;
+	ce->type = type;
+	ce->id = tp->dst_id;
+	ce->level = tp->dst_level;
+	ce->pid = tp->pid;
 	ce->timestamp_ns = bpf_ktime_get_boot_ns();
 
-	read_data_loc_str(ctx, tp->__data_loc_dst_path,
-			  ce->path, sizeof(ce->path));
-	read_data_loc_str(ctx, tp->__data_loc_comm,
-			  ce->comm, sizeof(ce->comm));
+	read_data_loc_str(ctx, tp->__data_loc_dst_path, ce->path, sizeof(ce->path));
+	read_data_loc_str(ctx, tp->__data_loc_comm, ce->comm, sizeof(ce->comm));
 
 	bpf_ringbuf_submit(ce, 0);
 	return 0;
@@ -3408,22 +3348,20 @@ static __always_inline int emit_cgroup_state(void *ctx, __u32 type)
 	struct trace_event_raw_cgroup_event *tp = ctx;
 
 	RB_STAT_TOTAL_CGROUP();
-	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup,
-						      sizeof(*ce), 0);
+	struct cgroup_event *ce = bpf_ringbuf_reserve(&events_cgroup, sizeof(*ce), 0);
 	if (!ce) {
 		RB_STAT_DROP_CGROUP();
 		return 0;
 	}
 
 	BPF_ZERO_PTR(ce, sizeof(*ce));
-	ce->type         = type;
-	ce->id           = tp->id;
-	ce->level        = tp->level;
-	ce->val          = tp->val;
+	ce->type = type;
+	ce->id = tp->id;
+	ce->level = tp->level;
+	ce->val = tp->val;
 	ce->timestamp_ns = bpf_ktime_get_boot_ns();
 
-	read_data_loc_str(ctx, tp->__data_loc_path,
-			  ce->path, sizeof(ce->path));
+	read_data_loc_str(ctx, tp->__data_loc_path, ce->path, sizeof(ce->path));
 
 	bpf_ringbuf_submit(ce, 0);
 	return 0;
@@ -3496,9 +3434,10 @@ int seed_sock_map_iter(struct bpf_iter__tcp *ctx)
 	if (bpf_map_lookup_elem(&sock_map, &sk_ptr))
 		return 0;
 
-	struct sock_info si; BPF_ZERO(si);
+	struct sock_info si;
+	BPF_ZERO(si);
 	si.tgid = tgid;
-	si.uid  = ctx->uid;
+	si.uid = ctx->uid;
 	si.start_ns = bpf_ktime_get_boot_ns();
 
 	/* TCP_LISTEN = 10 */
@@ -3517,8 +3456,7 @@ int seed_sock_map_iter(struct bpf_iter__tcp *ctx)
 			__sync_fetch_and_add(cnt, 1);
 		else {
 			__u64 one = 1;
-			bpf_map_update_elem(&open_conn_map, &tgid, &one,
-					    BPF_NOEXIST);
+			bpf_map_update_elem(&open_conn_map, &tgid, &one, BPF_NOEXIST);
 		}
 	}
 

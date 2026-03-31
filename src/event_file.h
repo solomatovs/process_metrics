@@ -17,13 +17,14 @@
 
 /* ── размеры полей metric_event ──────────────────────────────────── */
 
-#define EV_EVENT_TYPE_LEN  16    /* "fork","exec","exit","oom_kill","snapshot","conn_snapshot","file_close" */
-#define EV_RULE_LEN        64   /* имя правила */
-#define EV_TAGS_LEN        512  /* список всех сработавших правил, разделённых символом | */
-#define EV_CGROUP_LEN      512  /* путь cgroup */
-#define EV_ADDR_LEN        46   /* форматированная строка IP (INET6_ADDRSTRLEN) */
-#define EV_PWD_LEN         512  /* текущий рабочий каталог */
-#define EV_PARENT_PIDS_MAX 32   /* макс. глубина цепочки предков процесса */
+#define EV_EVENT_TYPE_LEN \
+	16 /* "fork","exec","exit","oom_kill","snapshot","conn_snapshot","file_close" */
+#define EV_RULE_LEN	   64  /* имя правила */
+#define EV_TAGS_LEN	   512 /* список всех сработавших правил, разделённых символом | */
+#define EV_CGROUP_LEN	   512 /* путь cgroup */
+#define EV_ADDR_LEN	   46  /* форматированная строка IP (INET6_ADDRSTRLEN) */
+#define EV_PWD_LEN	   512 /* текущий рабочий каталог */
+#define EV_PARENT_PIDS_MAX 32  /* макс. глубина цепочки предков процесса */
 
 /*
  * Наихудший случай экранирования CSV: каждый символ удвоен + 2 кавычки + NUL.
@@ -36,20 +37,21 @@
 struct metric_event {
 	/* ── общие поля ───────────────────────────────────────────── */
 	__u64 timestamp_ns;
-	char  event_type[EV_EVENT_TYPE_LEN];
-	char  rule[EV_RULE_LEN];
-	char  tags[EV_TAGS_LEN];     /* список всех сработавших правил, разделённых символом | */
+	char event_type[EV_EVENT_TYPE_LEN];
+	char rule[EV_RULE_LEN];
+	char tags[EV_TAGS_LEN]; /* список всех сработавших правил, разделённых символом | */
 	__u32 root_pid;
 	__u32 pid;
 	__u32 ppid;
-	__u32 uid;                    /* реальный UID процесса */
-	char  comm[COMM_LEN];
-	char  thread_name[COMM_LEN];  /* имя потока (может отличаться от comm у многопоточных процессов) */
-	char  exec_path[CMDLINE_MAX]; /* путь к исполняемому файлу (argv[0]) */
-	char  args[CMDLINE_MAX];      /* аргументы (argv[1..]) */
-	char  cgroup[EV_CGROUP_LEN];
-	__u8  is_root;
-	__u8  state;
+	__u32 uid; /* реальный UID процесса */
+	char comm[COMM_LEN];
+	char thread_name
+	    [COMM_LEN]; /* имя потока (может отличаться от comm у многопоточных процессов) */
+	char exec_path[CMDLINE_MAX]; /* путь к исполняемому файлу (argv[0]) */
+	char args[CMDLINE_MAX];	     /* аргументы (argv[1..]) */
+	char cgroup[EV_CGROUP_LEN];
+	__u8 is_root;
+	__u8 state;
 
 	/* ── метрики процесса ─────────────────────────────────────── */
 	__u32 exit_code;
@@ -69,7 +71,7 @@ struct metric_event {
 	__u64 nivcsw;
 	__u32 threads;
 	__s16 oom_score_adj;
-	__u8  oom_killed;
+	__u8 oom_killed;
 	__u64 net_tcp_tx_bytes;
 	__u64 net_tcp_rx_bytes;
 	__u64 net_udp_tx_bytes;
@@ -82,82 +84,82 @@ struct metric_event {
 	__s64 cgroup_memory_current;
 	__s64 cgroup_swap_current;
 	__s64 cgroup_cpu_weight;
-	__s64 cgroup_cpu_max;           /* квота за период (мкс), 0 = "max" (без ограничений) */
-	__s64 cgroup_cpu_max_period;    /* период (мкс), обычно 100000 */
-	__s64 cgroup_cpu_nr_periods;    /* общее число периодов планирования */
-	__s64 cgroup_cpu_nr_throttled;  /* периоды, в которых происходило троттлинг */
+	__s64 cgroup_cpu_max;		 /* квота за период (мкс), 0 = "max" (без ограничений) */
+	__s64 cgroup_cpu_max_period;	 /* период (мкс), обычно 100000 */
+	__s64 cgroup_cpu_nr_periods;	 /* общее число периодов планирования */
+	__s64 cgroup_cpu_nr_throttled;	 /* периоды, в которых происходило троттлинг */
 	__s64 cgroup_cpu_throttled_usec; /* суммарное время троттлинга (мкс) */
 	__s64 cgroup_pids_current;
 
 	/* ── метрики отслеживания файлов ─────────────────────────────── */
-	char  file_path[FILE_PATH_MAX];      /* путь к файлу (4096) */
-	char  file_new_path[FILE_PATH_MAX];  /* rename: новый путь (4096) */
+	char file_path[FILE_PATH_MAX];	   /* путь к файлу (4096) */
+	char file_new_path[FILE_PATH_MAX]; /* rename: новый путь (4096) */
 	__u32 file_flags;
 	__u64 file_read_bytes;
 	__u64 file_write_bytes;
 	__u32 file_open_count;
 	__u32 file_fsync_count;
-	__u32 file_chmod_mode;           /* chmod: новый mode (octal) */
-	__u32 file_chown_uid;            /* chown: новый uid */
-	__u32 file_chown_gid;            /* chown: новый gid */
+	__u32 file_chmod_mode; /* chmod: новый mode (octal) */
+	__u32 file_chown_uid;  /* chown: новый uid */
+	__u32 file_chown_gid;  /* chown: новый gid */
 
 	/* ── метрики отслеживания сети (только EVENT_NET_CLOSE) ────── */
-	char  net_local_addr[EV_ADDR_LEN];   /* форматированная строка IP */
-	char  net_remote_addr[EV_ADDR_LEN];  /* форматированная строка IP */
+	char net_local_addr[EV_ADDR_LEN];  /* форматированная строка IP */
+	char net_remote_addr[EV_ADDR_LEN]; /* форматированная строка IP */
 	__u16 net_local_port;
 	__u16 net_remote_port;
-	__u64 net_conn_tx_bytes;    /* байт отправлено через это соединение */
-	__u64 net_conn_rx_bytes;    /* байт получено через это соединение */
-	__u64 net_conn_tx_calls;    /* количество вызовов sendmsg */
-	__u64 net_conn_rx_calls;    /* количество вызовов recvmsg */
-	__u64 net_duration_ms;      /* длительность соединения в миллисекундах */
+	__u64 net_conn_tx_bytes; /* байт отправлено через это соединение */
+	__u64 net_conn_rx_bytes; /* байт получено через это соединение */
+	__u64 net_conn_tx_calls; /* количество вызовов sendmsg */
+	__u64 net_conn_rx_calls; /* количество вызовов recvmsg */
+	__u64 net_duration_ms;	 /* длительность соединения в миллисекундах */
 
 	/* ── идентификация ───────────────────────────────────────── */
-	__u32 loginuid;             /* audit loginuid (4294967295 = не задан) */
-	__u32 sessionid;            /* идентификатор audit-сессии */
-	__u32 euid;                 /* эффективный UID */
-	__u32 tty_nr;               /* управляющий терминал (major<<8|minor), 0 = отсутствует */
+	__u32 loginuid;	 /* audit loginuid (4294967295 = не задан) */
+	__u32 sessionid; /* идентификатор audit-сессии */
+	__u32 euid;	 /* эффективный UID */
+	__u32 tty_nr;	 /* управляющий терминал (major<<8|minor), 0 = отсутствует */
 
 	/* ── планировщик ─────────────────────────────────────────── */
-	__u32 sched_policy;         /* SCHED_NORMAL=0, SCHED_FIFO=1, ... */
+	__u32 sched_policy; /* SCHED_NORMAL=0, SCHED_FIFO=1, ... */
 
 	/* ── учёт ввода-вывода (включая page cache) ─────────────── */
-	__u64 io_rchar;             /* всего байт прочитано (вкл. кеш) */
-	__u64 io_wchar;             /* всего байт записано (вкл. кеш) */
-	__u64 io_syscr;             /* количество системных вызовов чтения */
-	__u64 io_syscw;             /* количество системных вызовов записи */
-	__u64 file_opens;           /* кумулятивный: кол-во openat вызовов */
-	__u64 socket_creates;       /* кумулятивный: кол-во socket() вызовов */
+	__u64 io_rchar;	      /* всего байт прочитано (вкл. кеш) */
+	__u64 io_wchar;	      /* всего байт записано (вкл. кеш) */
+	__u64 io_syscr;	      /* количество системных вызовов чтения */
+	__u64 io_syscw;	      /* количество системных вызовов записи */
+	__u64 file_opens;     /* кумулятивный: кол-во openat вызовов */
+	__u64 socket_creates; /* кумулятивный: кол-во socket() вызовов */
 
 	/* ── номера inode пространств имён ──────────────────────── */
-	__u32 mnt_ns_inum;          /* пространство имён монтирования */
-	__u32 pid_ns_inum;          /* пространство имён PID */
-	__u32 net_ns_inum;          /* сетевое пространство имён */
-	__u32 cgroup_ns_inum;       /* пространство имён cgroup */
+	__u32 mnt_ns_inum;    /* пространство имён монтирования */
+	__u32 pid_ns_inum;    /* пространство имён PID */
+	__u32 net_ns_inum;    /* сетевое пространство имён */
+	__u32 cgroup_ns_inum; /* пространство имён cgroup */
 
 	/* ── отслеживание вытеснения (только snapshot) ──────────── */
-	__u32 preempted_by_pid;     /* tgid последнего вытеснителя */
-	char  preempted_by_comm[COMM_LEN]; /* comm последнего вытеснителя */
+	__u32 preempted_by_pid;		  /* tgid последнего вытеснителя */
+	char preempted_by_comm[COMM_LEN]; /* comm последнего вытеснителя */
 
 	/* ── файловая система ────────────────────────────────────── */
-	char  pwd[EV_PWD_LEN];      /* текущий рабочий каталог */
+	char pwd[EV_PWD_LEN]; /* текущий рабочий каталог */
 
 	/* ── отслеживание сигналов (только EVENT_SIGNAL) ─────────── */
-	__u32 sig_num;              /* номер сигнала (SIGKILL=9 и т.д.) */
-	__u32 sig_target_pid;       /* PID процесса-получателя сигнала */
-	char  sig_target_comm[COMM_LEN]; /* comm процесса-получателя */
-	__s32 sig_code;             /* SI_USER=0, SI_KERNEL=0x80 и т.д. */
-	__s32 sig_result;           /* 0 = успешно доставлен */
+	__u32 sig_num;			/* номер сигнала (SIGKILL=9 и т.д.) */
+	__u32 sig_target_pid;		/* PID процесса-получателя сигнала */
+	char sig_target_comm[COMM_LEN]; /* comm процесса-получателя */
+	__s32 sig_code;			/* SI_USER=0, SI_KERNEL=0x80 и т.д. */
+	__s32 sig_result;		/* 0 = успешно доставлен */
 
 	/* ── отслеживание безопасности ────────────────────────────── */
 	/* TCP-ретрансмиссия (EVENT_TCP_RETRANSMIT) */
-	char  sec_local_addr[EV_ADDR_LEN];   /* форматированная строка IP */
-	char  sec_remote_addr[EV_ADDR_LEN];  /* форматированная строка IP */
+	char sec_local_addr[EV_ADDR_LEN];  /* форматированная строка IP */
+	char sec_remote_addr[EV_ADDR_LEN]; /* форматированная строка IP */
 	__u16 sec_local_port;
 	__u16 sec_remote_port;
-	__u8  sec_af;               /* AF_INET=2, AF_INET6=10 */
-	__u8  sec_tcp_state;        /* состояние TCP на момент ретрансмиссии */
-	__u8  sec_direction;        /* RST: 0=отправлен, 1=получен */
+	__u8 sec_af;	    /* AF_INET=2, AF_INET6=10 */
+	__u8 sec_tcp_state; /* состояние TCP на момент ретрансмиссии */
+	__u8 sec_direction; /* RST: 0=отправлен, 1=получен */
 
 	/* открытые TCP-соединения (только snapshot) */
 	__u64 open_tcp_conns;
@@ -169,7 +171,7 @@ struct metric_event {
 
 	/* ── цепочка предков процесса ────────────────────────────────── */
 	__u32 parent_pids[EV_PARENT_PIDS_MAX]; /* [ppid, ppid's parent, ..., 1] */
-	__u8  parent_pids_len;                  /* число валидных элементов */
+	__u8 parent_pids_len;		       /* число валидных элементов */
 };
 
 /* ── запись файла событий (hostname + событие) ───────────────────── */
@@ -177,7 +179,7 @@ struct metric_event {
 #define EF_HOSTNAME_LEN 256
 
 struct ef_record {
-	char               hostname[EF_HOSTNAME_LEN];
+	char hostname[EF_HOSTNAME_LEN];
 	struct metric_event event;
 };
 
@@ -219,11 +221,11 @@ void ef_append(const struct metric_event *ev, const char *hostname);
  */
 
 struct ef_iter {
-	__u32 pos;       /* текущая позиция чтения в кольце */
-	__u32 end;       /* конечная позиция (не включительно) */
-	__u32 capacity;  /* ёмкость кольца */
-	int   count;     /* общее количество записей для чтения */
-	int   read;      /* уже прочитанных записей */
+	__u32 pos;	/* текущая позиция чтения в кольце */
+	__u32 end;	/* конечная позиция (не включительно) */
+	__u32 capacity; /* ёмкость кольца */
+	int count;	/* общее количество записей для чтения */
+	int read;	/* уже прочитанных записей */
 };
 
 int ef_read_begin(struct ef_iter *it);

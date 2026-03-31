@@ -34,14 +34,14 @@
 
 /* ── состояние ───────────────────────────────────────────────────── */
 
-static int           g_listen_fd = -1;
-static pthread_t     g_thread;
-static volatile int  g_running;
-static int           g_max_connections;
-static volatile int  g_active_connections;
-static volatile int  g_client_fd = -1;   /* текущий клиентский сокет (для прерывания при shutdown) */
-static int           g_log_requests;
-static int                    g_allow_count;
+static int g_listen_fd = -1;
+static pthread_t g_thread;
+static volatile int g_running;
+static int g_max_connections;
+static volatile int g_active_connections;
+static volatile int g_client_fd = -1; /* текущий клиентский сокет (для прерывания при shutdown) */
+static int g_log_requests;
+static int g_allow_count;
 static struct http_allow_entry g_allow[HTTP_MAX_ALLOW];
 
 /*
@@ -67,8 +67,8 @@ static int is_allowed(const struct sockaddr_in *addr)
 static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 {
 	static const struct csv_resolvers resolvers = {
-		.resolve_cgroup = http_resolve_cgroup,
-		.resolve_uid    = http_resolve_uid,
+	    .resolve_cgroup = http_resolve_cgroup,
+	    .resolve_uid = http_resolve_uid,
 	};
 	return csv_format_row(buf, buflen, rec, &resolvers);
 }
@@ -76,18 +76,18 @@ static int format_csv_row(char *buf, int buflen, const struct ef_record *rec)
 /*
  * Отправляет полный HTTP-ответ. Возвращает 0 при успехе, -1 при ошибке.
  */
-static int send_response(int fd, int status, const char *content_type,
-			 const char *body, int body_len)
+static int send_response(int fd, int status, const char *content_type, const char *body,
+			 int body_len)
 {
 	const char *status_text = (status == 200) ? "OK" : "Not Found";
 	char header[HTTP_HEADER_LEN];
 	int hlen = snprintf(header, sizeof(header),
-		"HTTP/1.1 %d %s\r\n"
-		"Content-Type: %s\r\n"
-		"Content-Length: %d\r\n"
-		"Connection: close\r\n"
-		"\r\n",
-		status, status_text, content_type, body_len);
+			    "HTTP/1.1 %d %s\r\n"
+			    "Content-Type: %s\r\n"
+			    "Content-Length: %d\r\n"
+			    "Connection: close\r\n"
+			    "\r\n",
+			    status, status_text, content_type, body_len);
 
 	/* Отправляем заголовок */
 	ssize_t sent = send(fd, header, hlen, MSG_NOSIGNAL);
@@ -97,8 +97,7 @@ static int send_response(int fd, int status, const char *content_type,
 	/* Отправляем тело по частям */
 	ssize_t total = 0;
 	while (total < body_len) {
-		ssize_t n = send(fd, body + total, body_len - total,
-				 MSG_NOSIGNAL);
+		ssize_t n = send(fd, body + total, body_len - total, MSG_NOSIGNAL);
 		if (n <= 0)
 			return -1;
 		total += n;
@@ -115,11 +114,11 @@ static int send_stream_header(int fd, const char *content_type)
 {
 	char header[HTTP_HEADER_LEN];
 	int hlen = snprintf(header, sizeof(header),
-		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: %s\r\n"
-		"Connection: close\r\n"
-		"\r\n",
-		content_type);
+			    "HTTP/1.1 200 OK\r\n"
+			    "Content-Type: %s\r\n"
+			    "Connection: close\r\n"
+			    "\r\n",
+			    content_type);
 	ssize_t sent = send(fd, header, hlen, MSG_NOSIGNAL);
 	return (sent == hlen) ? 0 : -1;
 }
@@ -155,8 +154,7 @@ static int flush_sendbuf(int fd, char *buf, int *used)
  * Добавляет данные в буфер отправки, сбрасывая при заполнении.
  * Возвращает 0 при успехе, -1 при ошибке отправки.
  */
-static int buf_append(int fd, char *buf, int bufsize, int *used,
-		      const char *data, int len)
+static int buf_append(int fd, char *buf, int bufsize, int *used, const char *data, int len)
 {
 	while (len > 0) {
 		int avail = bufsize - *used;
@@ -206,8 +204,7 @@ static void handle_csv_stream(int client_fd, int clear)
 		/* Заголовок столбцов CSV */
 		int hdr_len;
 		const char *hdr = csv_header(&hdr_len);
-		if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
-			       hdr, hdr_len) < 0) {
+		if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used, hdr, hdr_len) < 0) {
 			ef_read_end(&iter, 0);
 			free(sendbuf);
 			break;
@@ -224,8 +221,8 @@ static void handle_csv_stream(int client_fd, int clear)
 			if (len <= 0)
 				continue;
 
-			if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used,
-				       row_buf, len) < 0) {
+			if (buf_append(client_fd, sendbuf, SEND_BUF_SIZE, &used, row_buf, len) <
+			    0) {
 				ok = 0;
 				break;
 			}
@@ -250,7 +247,7 @@ static int parse_format_csv(const char *request)
 	/* По умолчанию CSV; явный format=csv тоже принимается */
 	const char *fmt = strstr(request, "format=");
 	if (!fmt)
-		return 1;  /* формат не указан → CSV */
+		return 1; /* формат не указан → CSV */
 	return strncmp(fmt + 7, "csv", 3) == 0;
 }
 
@@ -261,8 +258,7 @@ static int parse_clear(const char *request)
 
 /* ── обработчик запросов ─────────────────────────────────────────── */
 
-static void handle_request(int client_fd,
-			   const struct sockaddr_in *peer)
+static void handle_request(int client_fd, const struct sockaddr_in *peer)
 {
 	char buf[HTTP_BUF_LEN];
 	int n = (int)recv(client_fd, buf, sizeof(buf) - 1, 0);
@@ -277,18 +273,15 @@ static void handle_request(int client_fd,
 	if (strncmp(buf, "HEAD /metrics", 13) == 0) {
 		if (g_log_requests)
 			LOG_INFO("http: HEAD /metrics from %s", peer_ip);
-		send_response(client_fd, 200, "text/csv; charset=utf-8",
-			      "", 0);
+		send_response(client_fd, 200, "text/csv; charset=utf-8", "", 0);
 		return;
 	}
 
 	/* Обрабатываем только GET /metrics */
 	if (strncmp(buf, "GET /metrics", 12) != 0) {
-		LOG_WARN("http: 404 from %s: %.40s",
-		       peer_ip, buf);
+		LOG_WARN("http: 404 from %s: %.40s", peer_ip, buf);
 		const char *msg = "Not Found\n";
-		send_response(client_fd, 404, "text/plain",
-			      msg, (int)strlen(msg));
+		send_response(client_fd, 404, "text/plain", msg, (int)strlen(msg));
 		return;
 	}
 
@@ -298,19 +291,16 @@ static void handle_request(int client_fd,
 		if (fmt) {
 			int i = 0;
 			fmt += 7;
-			while (*fmt && *fmt != '&' && *fmt != ' ' &&
-			       *fmt != '\r' && i < 31)
+			while (*fmt && *fmt != '&' && *fmt != ' ' && *fmt != '\r' && i < 31)
 				fmt_val[i++] = *fmt++;
 			fmt_val[i] = '\0';
 		}
-		LOG_WARN("http: unknown format=%s from %s, serving csv",
-		       fmt_val, peer_ip);
+		LOG_WARN("http: unknown format=%s from %s, serving csv", fmt_val, peer_ip);
 	}
 
 	int do_clear = parse_clear(buf);
 	if (g_log_requests)
-		LOG_INFO("http: GET /metrics%s from %s",
-		       do_clear ? "?clear=1" : "", peer_ip);
+		LOG_INFO("http: GET /metrics%s from %s", do_clear ? "?clear=1" : "", peer_ip);
 	handle_csv_stream(client_fd, do_clear);
 }
 
@@ -335,17 +325,13 @@ static void *server_thread(void *arg)
 		if (fd < 0)
 			break;
 
-		int client_fd = accept(fd,
-				       (struct sockaddr *)&client_addr,
-				       &addr_len);
+		int client_fd = accept(fd, (struct sockaddr *)&client_addr, &addr_len);
 		if (client_fd < 0) {
-			if (errno == EINTR || errno == EAGAIN ||
-			    errno == EBADF || errno == EINVAL)
+			if (errno == EINTR || errno == EAGAIN || errno == EBADF || errno == EINVAL)
 				continue;
 			if (!g_running)
 				break;
-			LOG_ERROR("http_server: accept: %s",
-			       strerror(errno));
+			LOG_ERROR("http_server: accept: %s", strerror(errno));
 			continue;
 		}
 
@@ -356,19 +342,16 @@ static void *server_thread(void *arg)
 		}
 
 		/* Проверяем лимит одновременных подключений */
-		if (__atomic_load_n(&g_active_connections, __ATOMIC_RELAXED) >=
-		    g_max_connections) {
+		if (__atomic_load_n(&g_active_connections, __ATOMIC_RELAXED) >= g_max_connections) {
 			close(client_fd);
 			continue;
 		}
 
 		__atomic_add_fetch(&g_active_connections, 1, __ATOMIC_RELAXED);
 
-		struct timeval tv = { .tv_sec = HTTP_SOCK_TIMEOUT_SEC, .tv_usec = 0 };
-		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
-			   &tv, sizeof(tv));
-		setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
-			   &tv, sizeof(tv));
+		struct timeval tv = {.tv_sec = HTTP_SOCK_TIMEOUT_SEC, .tv_usec = 0};
+		setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
 		__atomic_store_n(&g_client_fd, client_fd, __ATOMIC_RELEASE);
 		handle_request(client_fd, &client_addr);
@@ -390,14 +373,13 @@ int http_server_start(const struct http_config *cfg)
 
 	if (cfg->max_connections <= 0) {
 		LOG_ERROR("http_server: max_connections must be > 0 (got %d)",
-		       cfg->max_connections);
+			  cfg->max_connections);
 		return -1;
 	}
 
 	g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (g_listen_fd < 0) {
-		LOG_ERROR("http_server: socket: %s",
-		       strerror(errno));
+		LOG_ERROR("http_server: socket: %s", strerror(errno));
 		return -1;
 	}
 
@@ -415,23 +397,21 @@ int http_server_start(const struct http_config *cfg)
 		addr.sin_addr.s_addr = INADDR_ANY;
 
 	if (bind(g_listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		LOG_ERROR("http_server: bind(%s:%d): %s",
-		       cfg->bind[0] ? cfg->bind : "0.0.0.0",
-		       cfg->port, strerror(errno));
+		LOG_ERROR("http_server: bind(%s:%d): %s", cfg->bind[0] ? cfg->bind : "0.0.0.0",
+			  cfg->port, strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
 	}
 
 	if (listen(g_listen_fd, HTTP_LISTEN_BACKLOG) < 0) {
-		LOG_ERROR("http_server: listen: %s",
-		       strerror(errno));
+		LOG_ERROR("http_server: listen: %s", strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
 	}
 
-	struct timeval tv = { .tv_sec = HTTP_LISTEN_TIMEOUT_SEC, .tv_usec = 0 };
+	struct timeval tv = {.tv_sec = HTTP_LISTEN_TIMEOUT_SEC, .tv_usec = 0};
 	setsockopt(g_listen_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
 	g_running = 1;
@@ -441,15 +421,14 @@ int http_server_start(const struct http_config *cfg)
 	memcpy(g_allow, cfg->allow, sizeof(g_allow[0]) * cfg->allow_count);
 
 	if (pthread_create(&g_thread, NULL, server_thread, NULL) != 0) {
-		LOG_ERROR("http_server: pthread_create: %s",
-		       strerror(errno));
+		LOG_ERROR("http_server: pthread_create: %s", strerror(errno));
 		close(g_listen_fd);
 		g_listen_fd = -1;
 		return -1;
 	}
 
-	LOG_INFO("http_server: listening on %s:%d",
-	       cfg->bind[0] ? cfg->bind : "0.0.0.0", cfg->port);
+	LOG_INFO("http_server: listening on %s:%d", cfg->bind[0] ? cfg->bind : "0.0.0.0",
+		 cfg->port);
 	return 0;
 }
 

@@ -21,15 +21,15 @@
 
 /* ── состояние ───────────────────────────────────────────────────── */
 
-static struct ef_record *g_ring;        /* массив кольцевого буфера */
-static __u32             g_capacity;    /* количество слотов */
-static __u32             g_head;        /* следующая позиция записи */
-static __u32             g_tail;        /* позиция самой старой непрочитанной записи */
-static int               g_full;        /* head догнал tail */
-static int               g_initialized;
+static struct ef_record *g_ring; /* массив кольцевого буфера */
+static __u32 g_capacity;	 /* количество слотов */
+static __u32 g_head;		 /* следующая позиция записи */
+static __u32 g_tail;		 /* позиция самой старой непрочитанной записи */
+static int g_full;		 /* head догнал tail */
+static int g_initialized;
 
-static pthread_mutex_t   g_mutex       = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t   g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_batch_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ── вспомогательные функции ──────────────────────────────────────── */
 
@@ -37,9 +37,7 @@ static __u32 ring_count(void)
 {
 	if (g_full)
 		return g_capacity;
-	return (g_head >= g_tail)
-		? g_head - g_tail
-		: g_capacity - g_tail + g_head;
+	return (g_head >= g_tail) ? g_head - g_tail : g_capacity - g_tail + g_head;
 }
 
 /* ── публичный API ───────────────────────────────────────────────── */
@@ -57,15 +55,14 @@ int ef_init(__u64 max_size_bytes)
 
 	g_ring = calloc((size_t)cap, sizeof(struct ef_record));
 	if (!g_ring) {
-		LOG_ERROR("ef_init: calloc(%llu records) failed",
-		       (unsigned long long)cap);
+		LOG_ERROR("ef_init: calloc(%llu records) failed", (unsigned long long)cap);
 		return -1;
 	}
 
-	g_capacity    = (__u32)cap;
-	g_head        = 0;
-	g_tail        = 0;
-	g_full        = 0;
+	g_capacity = (__u32)cap;
+	g_head = 0;
+	g_tail = 0;
+	g_full = 0;
 	g_initialized = 1;
 	return 0;
 }
@@ -98,11 +95,11 @@ int ef_read_begin(struct ef_iter *it)
 	pthread_mutex_lock(&g_mutex);
 
 	__u32 n = ring_count();
-	it->pos      = g_tail;
-	it->end      = g_head;
+	it->pos = g_tail;
+	it->end = g_head;
 	it->capacity = g_capacity;
-	it->count    = (int)n;
-	it->read     = 0;
+	it->count = (int)n;
+	it->read = 0;
 
 	pthread_mutex_unlock(&g_mutex);
 	/* g_batch_mutex остаётся захваченным — не допускает новые пакеты во время итерации */

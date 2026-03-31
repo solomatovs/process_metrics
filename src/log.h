@@ -19,7 +19,7 @@
 #include <stdarg.h>
 
 static inline void log_ts(const char *level, const char *fmt, ...)
-	__attribute__((format(printf, 2, 3)));
+    __attribute__((format(printf, 2, 3)));
 
 static inline void log_ts(const char *level, const char *fmt, ...)
 {
@@ -33,11 +33,15 @@ static inline void log_ts(const char *level, const char *fmt, ...)
 
 #define LOG_FATAL(...) log_ts("FATAL", __VA_ARGS__)
 #define LOG_ERROR(...) log_ts("ERROR", __VA_ARGS__)
-#define LOG_WARN(...)  log_ts("WARN",  __VA_ARGS__)
-#define LOG_INFO(...)  log_ts("INFO",  __VA_ARGS__)
+#define LOG_WARN(...)  log_ts("WARN", __VA_ARGS__)
+#define LOG_INFO(...)  log_ts("INFO", __VA_ARGS__)
 
 /* LOG_DEBUG проверяет уровень логирования, чтобы не форматировать строку зря.
  * Первый аргумент — переменная уровня (cfg_log_level). */
-#define LOG_DEBUG(level, ...) do { if ((level) >= 2) log_ts("DEBUG", __VA_ARGS__); } while (0)
+#define LOG_DEBUG(level, ...)                         \
+	do {                                          \
+		if ((level) >= 2)                     \
+			log_ts("DEBUG", __VA_ARGS__); \
+	} while (0)
 
 #endif /* LOG_H */

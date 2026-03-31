@@ -36,8 +36,7 @@ struct csv_resolvers {
  *
  * Возвращает количество записанных байт (без NUL) или -1, если буфер слишком мал.
  */
-int csv_format_row(char *buf, int buflen,
-		   const struct ef_record *rec,
+int csv_format_row(char *buf, int buflen, const struct ef_record *rec,
 		   const struct csv_resolvers *resolvers);
 
 #endif /* CSV_FORMAT_H */

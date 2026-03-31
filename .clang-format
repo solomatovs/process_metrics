@@ -1,0 +1,49 @@
+---
+# Linux kernel style
+BasedOnStyle: LLVM
+
+# Табы, ширина 8 (стандарт ядра Linux)
+UseTab: Always
+IndentWidth: 8
+TabWidth: 8
+
+# Скобки — Linux стиль
+BreakBeforeBraces: Linux
+
+# Ширина строки
+ColumnLimit: 100
+
+# Указатели: char *ptr
+PointerAlignment: Right
+
+# Не пересортировывать #include
+SortIncludes: Never
+
+# Не переформатировать комментарии
+ReflowComments: false
+
+# Выравнивание макросов
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+AlignEscapedNewlines: Left
+
+# Пробелы
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: false
+
+# Без однострочников
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# switch/case — не сдвигать case
+IndentCaseLabels: false
+
+# Аргументы
+BinPackArguments: true
+BinPackParameters: true
+AlignAfterOpenBracket: Align
+
+# Препроцессор
+IndentPPDirectives: None

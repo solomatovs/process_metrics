@@ -19,30 +19,32 @@
 /* ── Заголовок CSV (идентичен прежнему в http_server.c) ───────────── */
 
 static const char CSV_HEADER_STR[] =
-	"timestamp,hostname,event_type,rule,tags,"
-	"rule_pid,pid,ppid,process_chain,uid,user_name,loginuid,login_name,sessionid,session_name,euid,euser_name,tty_nr,"
-	"comm,thread_name,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
-	"cpu_ns,cpu_usage_ratio,"
-	"rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
-	"io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,socket_creates,"
-	"maj_flt,min_flt,"
-	"nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
-	"net_tcp_tx_bytes,net_tcp_rx_bytes,net_udp_tx_bytes,net_udp_rx_bytes,"
-	"start_time_ns,uptime_seconds,"
-	"mnt_ns,pid_ns,net_ns,cgroup_ns,"
-	"preempted_by_pid,preempted_by_comm,"
-	"cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
-	"cgroup_cpu_weight,"
-	"cgroup_cpu_max,cgroup_cpu_max_period,"
-	"cgroup_cpu_nr_periods,cgroup_cpu_nr_throttled,cgroup_cpu_throttled_usec,"
-	"cgroup_pids_current,"
-	"file_path,file_new_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,file_fsync_count,file_chmod_mode,file_chown_uid,file_chown_gid,"
-	"net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
-	"net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,"
-	"sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
-	"sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
-	"sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
-	"disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
+    "timestamp,hostname,event_type,rule,tags,"
+    "rule_pid,pid,ppid,process_chain,uid,user_name,loginuid,login_name,sessionid,session_name,euid,"
+    "euser_name,tty_nr,"
+    "comm,thread_name,exec,args,cgroup,pwd,is_root,state,exit_code,sched_policy,"
+    "cpu_ns,cpu_usage_ratio,"
+    "rss_bytes,rss_min_bytes,rss_max_bytes,shmem_bytes,swap_bytes,vsize_bytes,"
+    "io_read_bytes,io_write_bytes,io_rchar,io_wchar,io_syscr,io_syscw,file_opens,socket_creates,"
+    "maj_flt,min_flt,"
+    "nvcsw,nivcsw,threads,oom_score_adj,oom_killed,"
+    "net_tcp_tx_bytes,net_tcp_rx_bytes,net_udp_tx_bytes,net_udp_rx_bytes,"
+    "start_time_ns,uptime_seconds,"
+    "mnt_ns,pid_ns,net_ns,cgroup_ns,"
+    "preempted_by_pid,preempted_by_comm,"
+    "cgroup_memory_max,cgroup_memory_current,cgroup_swap_current,"
+    "cgroup_cpu_weight,"
+    "cgroup_cpu_max,cgroup_cpu_max_period,"
+    "cgroup_cpu_nr_periods,cgroup_cpu_nr_throttled,cgroup_cpu_throttled_usec,"
+    "cgroup_pids_current,"
+    "file_path,file_new_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,file_"
+    "fsync_count,file_chmod_mode,file_chown_uid,file_chown_gid,"
+    "net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
+    "net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,"
+    "sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
+    "sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
+    "sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
+    "disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
 
 const char *csv_header(int *len)
 {
@@ -118,10 +120,15 @@ static inline char *put_f64_4(char *p, double v)
 	/* дробная часть: 4 цифры */
 	double frac = v - (double)ipart;
 	unsigned int f4 = (unsigned int)(frac * 10000.0 + 0.5);
-	if (f4 >= 10000) { f4 = 9999; }  /* ограничиваем переполнение округления */
-	p[0] = '0' + (char)(f4 / 1000); f4 %= 1000;
-	p[1] = '0' + (char)(f4 / 100);  f4 %= 100;
-	p[2] = '0' + (char)(f4 / 10);   f4 %= 10;
+	if (f4 >= 10000) {
+		f4 = 9999;
+	} /* ограничиваем переполнение округления */
+	p[0] = '0' + (char)(f4 / 1000);
+	f4 %= 1000;
+	p[1] = '0' + (char)(f4 / 100);
+	f4 %= 100;
+	p[2] = '0' + (char)(f4 / 10);
+	f4 %= 10;
 	p[3] = '0' + (char)f4;
 	return p + 4;
 }
@@ -145,9 +152,9 @@ static inline char *put_f64_4(char *p, double v)
  */
 static inline char *put_str(char *p, const char *src, int limit)
 {
-	const char quotec  = '"';
-	const char escapec = '"';   /* совпадает с quotec, как в PostgreSQL по умолчанию */
-	const char delimc  = ',';
+	const char quotec = '"';
+	const char escapec = '"'; /* совпадает с quotec, как в PostgreSQL по умолчанию */
+	const char delimc = ',';
 
 	/* эффективная длина (до NUL или limit) */
 	int len = 0;
@@ -198,9 +205,12 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 
 	/* YYYY-MM-DD HH:MM:SS.mmm — hand-write each part */
 	int y = tm.tm_year + 1900;
-	p[0] = '0' + (char)(y / 1000); y %= 1000;
-	p[1] = '0' + (char)(y / 100);  y %= 100;
-	p[2] = '0' + (char)(y / 10);   y %= 10;
+	p[0] = '0' + (char)(y / 1000);
+	y %= 1000;
+	p[1] = '0' + (char)(y / 100);
+	y %= 100;
+	p[2] = '0' + (char)(y / 10);
+	y %= 10;
 	p[3] = '0' + (char)y;
 	p[4] = '-';
 	int m = tm.tm_mon + 1;
@@ -219,8 +229,10 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 	p[17] = '0' + (char)(tm.tm_sec / 10);
 	p[18] = '0' + (char)(tm.tm_sec % 10);
 	p[19] = '.';
-	p[20] = '0' + (char)(ms / 100); ms %= 100;
-	p[21] = '0' + (char)(ms / 10);  ms %= 10;
+	p[20] = '0' + (char)(ms / 100);
+	ms %= 100;
+	p[21] = '0' + (char)(ms / 10);
+	ms %= 10;
 	p[22] = '0' + (char)ms;
 	return p + 23;
 }
@@ -231,27 +243,50 @@ static inline char *put_timestamp(char *p, unsigned long long ts_ns)
 #define COMMA() (*p++ = ',')
 
 /* Добавить строковое поле + запятую */
-#define STR(field, maxlen) do { p = put_str(p, (field), (maxlen)); COMMA(); } while(0)
+#define STR(field, maxlen)                         \
+	do {                                       \
+		p = put_str(p, (field), (maxlen)); \
+		COMMA();                           \
+	} while (0)
 
 /* Добавить беззнаковое 64-бит + запятую */
-#define U64(v) do { p = put_u64(p, (unsigned long long)(v)); COMMA(); } while(0)
+#define U64(v)                                           \
+	do {                                             \
+		p = put_u64(p, (unsigned long long)(v)); \
+		COMMA();                                 \
+	} while (0)
 
 /* Добавить знаковое 64-бит + запятую */
-#define I64(v) do { p = put_i64(p, (long long)(v)); COMMA(); } while(0)
+#define I64(v)                                  \
+	do {                                    \
+		p = put_i64(p, (long long)(v)); \
+		COMMA();                        \
+	} while (0)
 
 /* Добавить беззнаковое 32-бит + запятую */
-#define U32(v) do { p = put_u32(p, (unsigned int)(v)); COMMA(); } while(0)
+#define U32(v)                                     \
+	do {                                       \
+		p = put_u32(p, (unsigned int)(v)); \
+		COMMA();                           \
+	} while (0)
 
 /* Добавить знаковое 32-бит + запятую */
-#define I32(v) do { p = put_i32(p, (int)(v)); COMMA(); } while(0)
+#define I32(v)                            \
+	do {                              \
+		p = put_i32(p, (int)(v)); \
+		COMMA();                  \
+	} while (0)
 
 /* Добавить double (4 знака после точки) + запятую */
-#define F64(v) do { p = put_f64_4(p, (v)); COMMA(); } while(0)
+#define F64(v)                         \
+	do {                           \
+		p = put_f64_4(p, (v)); \
+		COMMA();               \
+	} while (0)
 
 /* ── основная функция форматирования ─────────────────────────────── */
 
-int csv_format_row(char *buf, int buflen,
-		   const struct ef_record *rec,
+int csv_format_row(char *buf, int buflen, const struct ef_record *rec,
 		   const struct csv_resolvers *resolvers)
 {
 	/*
@@ -298,7 +333,9 @@ int csv_format_row(char *buf, int buflen,
 		resolvers->resolve_uid(ev->uid, uname, sizeof(uname));
 		STR(uname, 64);
 	} else {
-		*p++ = '"'; *p++ = '"'; COMMA();
+		*p++ = '"';
+		*p++ = '"';
+		COMMA();
 	}
 	U32(ev->loginuid);
 	/* login_name (разрешается из loginuid) */
@@ -309,7 +346,9 @@ int csv_format_row(char *buf, int buflen,
 		resolvers->resolve_uid(ev->loginuid, lname, sizeof(lname));
 		STR(lname, 64);
 	} else {
-		*p++ = '"'; *p++ = '"'; COMMA();
+		*p++ = '"';
+		*p++ = '"';
+		COMMA();
 	}
 	U32(ev->sessionid);
 	/* session_name (разрешается из loginuid — владелец audit-сессии) */
@@ -322,7 +361,9 @@ int csv_format_row(char *buf, int buflen,
 		resolvers->resolve_uid(ev->loginuid, sname, sizeof(sname));
 		STR(sname, 64);
 	} else {
-		*p++ = '"'; *p++ = '"'; COMMA();
+		*p++ = '"';
+		*p++ = '"';
+		COMMA();
 	}
 	U32(ev->euid);
 	/* euser_name (разрешается из euid) */
@@ -331,7 +372,9 @@ int csv_format_row(char *buf, int buflen,
 		resolvers->resolve_uid(ev->euid, ename, sizeof(ename));
 		STR(ename, 64);
 	} else {
-		*p++ = '"'; *p++ = '"'; COMMA();
+		*p++ = '"';
+		*p++ = '"';
+		COMMA();
 	}
 	U32(ev->tty_nr);
 
@@ -344,8 +387,7 @@ int csv_format_row(char *buf, int buflen,
 	/* cgroup: разрешаем имена docker-контейнеров если callback задан */
 	if (resolvers && resolvers->resolve_cgroup) {
 		char cg_resolved[EV_CGROUP_LEN];
-		resolvers->resolve_cgroup(ev->cgroup, cg_resolved,
-					  sizeof(cg_resolved));
+		resolvers->resolve_cgroup(ev->cgroup, cg_resolved, sizeof(cg_resolved));
 		STR(cg_resolved, EV_CGROUP_LEN);
 	} else {
 		STR(ev->cgroup, EV_CGROUP_LEN);
@@ -357,7 +399,7 @@ int csv_format_row(char *buf, int buflen,
 	/* state: однобайтовое поле.
 	 * 0 = процесс ещё не попадал в sched_switch (очень короткоживущий). */
 	{
-		char state_raw[2] = { (char)(ev->state ? ev->state : 'N'), '\0' };
+		char state_raw[2] = {(char)(ev->state ? ev->state : 'N'), '\0'};
 		STR(state_raw, 2);
 	}
 
@@ -438,27 +480,42 @@ int csv_format_row(char *buf, int buflen,
 		int first = 1;
 		/* Access mode (bits 0-1) */
 		switch (ff & 3) {
-		case 0: memcpy(p, "O_RDONLY", 8); p += 8; first = 0; break;
-		case 1: memcpy(p, "O_WRONLY", 8); p += 8; first = 0; break;
-		case 2: memcpy(p, "O_RDWR",   6); p += 6; first = 0; break;
+		case 0:
+			memcpy(p, "O_RDONLY", 8);
+			p += 8;
+			first = 0;
+			break;
+		case 1:
+			memcpy(p, "O_WRONLY", 8);
+			p += 8;
+			first = 0;
+			break;
+		case 2:
+			memcpy(p, "O_RDWR", 6);
+			p += 6;
+			first = 0;
+			break;
 		}
-#define FLAG(bit, name, len) \
-		if (ff & (bit)) { \
-			if (!first) *p++ = '|'; \
-			memcpy(p, name, len); p += len; first = 0; \
-		}
-		FLAG(0100,     "O_CREAT",     7)
-		FLAG(0200,     "O_EXCL",      6)
-		FLAG(01000,    "O_TRUNC",     7)
-		FLAG(02000,    "O_APPEND",    8)
-		FLAG(04000,    "O_NONBLOCK",  10)
-		FLAG(010000,   "O_DSYNC",     7)
-		FLAG(020000,   "O_DIRECT",    8)
-		FLAG(040000,   "O_LARGEFILE", 11)
-		FLAG(0100000,  "O_DIRECTORY", 11)
-		FLAG(0200000,  "O_NOFOLLOW",  10)
-		FLAG(0400000,  "O_NOATIME",   9)
-		FLAG(02000000, "O_CLOEXEC",   9)
+#define FLAG(bit, name, len)          \
+	if (ff & (bit)) {             \
+		if (!first)           \
+			*p++ = '|';   \
+		memcpy(p, name, len); \
+		p += len;             \
+		first = 0;            \
+	}
+		FLAG(0100, "O_CREAT", 7)
+		FLAG(0200, "O_EXCL", 6)
+		FLAG(01000, "O_TRUNC", 7)
+		FLAG(02000, "O_APPEND", 8)
+		FLAG(04000, "O_NONBLOCK", 10)
+		FLAG(010000, "O_DSYNC", 7)
+		FLAG(020000, "O_DIRECT", 8)
+		FLAG(040000, "O_LARGEFILE", 11)
+		FLAG(0100000, "O_DIRECTORY", 11)
+		FLAG(0200000, "O_NOFOLLOW", 10)
+		FLAG(0400000, "O_NOATIME", 9)
+		FLAG(02000000, "O_CLOEXEC", 9)
 #undef FLAG
 		*p++ = '"';
 		COMMA();
