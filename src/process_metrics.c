@@ -214,6 +214,11 @@ static void fill_from_proc_info(struct metric_event *cev, const struct proc_info
 static void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
 				 int tracked);
 static void fill_proc_info_from_event(struct proc_info *pi, const struct event *e);
+static int fill_proc_info_for_pid(struct metric_event *cev, __u32 tgid);
+static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
+static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
+static void fill_pwd(struct metric_event *cev, __u32 tgid);
+static void fill_parent_pids(struct metric_event *cev);
 static void ensure_tags(__u32 tgid, char *buf, int buflen);
 /* log_ts определён в log.h */
 
@@ -873,14 +878,6 @@ static void init_metric_event(struct metric_event *cev, enum event_type type)
 	fast_strcpy(cev->event_type, sizeof(cev->event_type), event_type_name(type));
 }
 
-/*
- * Инициализация metric_event с кастомным именем типа (для rst_sent/rst_recv).
- */
-static void init_metric_event_named(struct metric_event *cev, const char *name)
-{
-	memset(cev, 0, sizeof(*cev));
-	fast_strcpy(cev->event_type, sizeof(cev->event_type), name);
-}
 
 /*
  * Lookup proc_info по tgid и заполнить metric_event.
@@ -895,6 +892,50 @@ static void store_proc_info_from_event(const struct event *e)
 	struct proc_info pi = {0};
 	fill_proc_info_from_event(&pi, e);
 	bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
+}
+
+/*
+ * Общая подготовка metric_event для BPF-событий с tracked_map.
+ * Инициализирует event, заполняет track_info + tags + proc_info + cgroup.
+ *
+ * После вызова остаётся добавить type-specific данные (fill_from_*_event)
+ * и вызвать enrich_and_emit.
+ */
+static void prepare_metric_event(struct metric_event *cev,
+				 enum event_type type, __u32 tgid,
+				 __u64 cgroup_id,
+				 const struct track_info *ti, int tracked)
+{
+	init_metric_event(cev, type);
+	fill_from_track_info(cev, ti, tracked);
+	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
+	fill_proc_info_for_pid(cev, tgid);
+	fill_cgroup(cev, cgroup_id);
+}
+
+/*
+ * Вариант prepare_metric_event без внешнего track_info.
+ * Делает lookup tracked_map самостоятельно.
+ */
+static void prepare_metric_event_simple(struct metric_event *cev,
+					enum event_type type, __u32 tgid,
+					__u64 cgroup_id)
+{
+	init_metric_event(cev, type);
+	fill_track_info_for_pid(cev, tgid);
+	fill_proc_info_for_pid(cev, tgid);
+	fill_cgroup(cev, cgroup_id);
+}
+
+/*
+ * Финализация metric_event: pwd, parent_pids, отправка в ring buffer.
+ */
+static void enrich_and_emit(struct metric_event *cev, __u32 tgid,
+			    const char *hostname)
+{
+	fill_pwd(cev, tgid);
+	fill_parent_pids(cev);
+	ef_append(cev, hostname);
 }
 
 static int fill_proc_info_for_pid(struct metric_event *cev, __u32 tgid)
@@ -941,18 +982,14 @@ static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
 /*
  * Заполняет sig_target_comm из /proc/<pid>/comm.
  */
+/*
+ * Заполняет sig_target_comm из proc_map (comm процесса-получателя сигнала).
+ */
 static void fill_target_comm(struct metric_event *cev, __u32 target_pid)
 {
-	char path[PROC_PATH_LEN], buf[COMM_LEN + 2];
-	snprintf(path, sizeof(path), "/proc/%u/comm", target_pid);
-	FILE *f = fopen(path, "r");
-	if (f) {
-		if (fgets(buf, sizeof(buf), f)) {
-			buf[strcspn(buf, "\n")] = '\0';
-			fast_strcpy(cev->sig_target_comm, sizeof(cev->sig_target_comm), buf);
-		}
-		fclose(f);
-	}
+	struct proc_info pi;
+	if (bpf_map_lookup_elem(proc_map_fd, &target_pid, &pi) == 0)
+		memcpy(cev->sig_target_comm, pi.comm, COMM_LEN);
 }
 
 static const char *resolve_rule_name(__u16 rule_id)
@@ -2867,6 +2904,10 @@ static void fill_from_signal_event(struct metric_event *cev, const struct signal
 	cev->sig_target_pid = se->target_pid;
 	cev->sig_code = se->sig_code;
 	cev->sig_result = se->sig_result;
+
+	/* Signal-специфика: tags fallback sender→target, comm получателя */
+	fill_tags_with_fallback(cev, se->sender_tgid, se->target_pid);
+	fill_target_comm(cev, se->target_pid);
 }
 
 /* ── fill_from_retransmit_event: TCP_RETRANSMIT ───────────────────── */
@@ -3467,19 +3508,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event(&cev, type);
-			fill_from_track_info(&cev, &ti, tracked);
-			ensure_tags(fe->tgid, cev.tags, sizeof(cev.tags));
-
-			fill_proc_info_for_pid(&cev, fe->tgid);
+			prepare_metric_event(&cev, type, fe->tgid,
+					     fe->cgroup_id, &ti, tracked);
 			fill_from_file_event(&cev, fe, type);
-
-			fill_cgroup(&cev, fe->cgroup_id);
-
-			fill_pwd(&cev, fe->tgid);
-
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, fe->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3518,19 +3550,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event(&cev, type);
-			fill_from_track_info(&cev, &ti, tracked);
-			ensure_tags(ne->tgid, cev.tags, sizeof(cev.tags));
-
-			/* proc_info enrichment, then BPF event overrides */
-			fill_proc_info_for_pid(&cev, ne->tgid);
+			prepare_metric_event(&cev, type, ne->tgid,
+					     ne->cgroup_id, &ti, tracked);
 			fill_from_net_event(&cev, ne, type);
-
-			fill_cgroup(&cev, ne->cgroup_id);
-			fill_pwd(&cev, ne->tgid);
-
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, ne->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3557,26 +3580,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event(&cev, EVENT_SIGNAL);
-			fill_rule(&cev, rname);
-
-			fill_tags_with_fallback(&cev, se->sender_tgid, se->target_pid);
-
-			/* Данные отправителя из tracked_map */
-			struct track_info ti;
-			if (is_pid_tracked(se->sender_tgid, &ti))
-				fill_from_track_info(&cev, &ti, 1);
-
-			fill_proc_info_for_pid(&cev, se->sender_tgid);
+			prepare_metric_event_simple(&cev, EVENT_SIGNAL,
+						    se->sender_tgid, se->cgroup_id);
 			fill_from_signal_event(&cev, se);
-
-			fill_cgroup(&cev, se->cgroup_id);
-
-			fill_target_comm(&cev, se->target_pid);
-
-			fill_pwd(&cev, se->sender_tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, se->sender_tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3596,15 +3603,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event(&cev, EVENT_TCP_RETRANSMIT);
-			fill_track_info_for_pid(&cev, re->tgid);
-			fill_proc_info_for_pid(&cev, re->tgid);
+			prepare_metric_event_simple(&cev, EVENT_TCP_RETRANSMIT,
+						    re->tgid, re->cgroup_id);
 			fill_from_retransmit_event(&cev, re);
-
-			fill_cgroup(&cev, re->cgroup_id);
-			fill_pwd(&cev, re->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, re->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3624,15 +3626,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event(&cev, EVENT_SYN_RECV);
-			fill_track_info_for_pid(&cev, se_syn->tgid);
-			fill_proc_info_for_pid(&cev, se_syn->tgid);
+			prepare_metric_event_simple(&cev, EVENT_SYN_RECV,
+						    se_syn->tgid, se_syn->cgroup_id);
 			fill_from_syn_event(&cev, se_syn);
-
-			fill_cgroup(&cev, se_syn->cgroup_id);
-			fill_pwd(&cev, se_syn->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, se_syn->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3653,15 +3650,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			init_metric_event_named(&cev, rst_event_name(rste->direction));
-			fill_track_info_for_pid(&cev, rste->tgid);
-			fill_proc_info_for_pid(&cev, rste->tgid);
+			prepare_metric_event_simple(&cev, EVENT_RST,
+						    rste->tgid, rste->cgroup_id);
+			/* Override: rst_sent / rst_recv */
+			fast_strcpy(cev.event_type, sizeof(cev.event_type),
+				    rst_event_name(rste->direction));
 			fill_from_rst_event(&cev, rste);
-
-			fill_cgroup(&cev, rste->cgroup_id);
-			fill_pwd(&cev, rste->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, rste->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3703,9 +3698,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 				struct metric_event cev;
 				event_from_bpf(&cev, e, "exec", rules[first].name, tags_buf);
 				fill_track_info_for_pid(&cev, e->tgid);
-				fill_pwd(&cev, e->tgid);
-				fill_parent_pids(&cev);
-				ef_append(&cev, cfg_hostname);
+				enrich_and_emit(&cev, e->tgid, cfg_hostname);
 			}
 		}
 		return 0;
@@ -3736,10 +3729,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "fork", rname, fork_tags);
 			fill_track_info_for_pid(&cev, e->tgid);
-			fill_proc_info_for_pid(&cev, e->tgid);
-			fill_pwd(&cev, e->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			enrich_and_emit(&cev, e->tgid, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3769,10 +3759,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(EVENT_EXIT)) {
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "exit", rname, exit_tags);
-			fill_proc_info_for_pid(&cev, e->tgid);
-			fill_pwd(&cev, e->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			fill_track_info_for_pid(&cev, e->tgid);
+			enrich_and_emit(&cev, e->tgid, cfg_hostname);
 		}
 		/* Карты и кэши НЕ удаляем — proc_info помечен status=EXITED,
 		 * snapshot запишет финальный слепок и зачистит всё.
@@ -3806,9 +3794,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 					  e->cmdline_len);
 			struct metric_event cev;
 			event_from_bpf(&cev, e, "oom_kill", rname, oom_tags);
-			fill_pwd(&cev, e->tgid);
-			fill_parent_pids(&cev);
-			ef_append(&cev, cfg_hostname);
+			fill_track_info_for_pid(&cev, e->tgid);
+			enrich_and_emit(&cev, e->tgid, cfg_hostname);
 		}
 		return 0;
 	}

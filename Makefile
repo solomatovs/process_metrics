@@ -74,7 +74,7 @@ MIN_CLANG_VER := 10
 TEST_EF_SRC    := tests/test_event_file.c
 TEST_EF_BIN    := $(BUILDDIR)/test_event_file
 
-.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum deps-pacman bpftool check-clang test test-unit test-http test-clickhouse test-net test-identity compat stress-http stress-soak stress-pid stress-ringbuf stress
+.PHONY: help all clean vmlinux bpf binary deps deps-apt deps-yum deps-pacman bpftool check-clang test test-unit test-http test-clickhouse test-net test-identity compat stress-http stress-soak stress-pid stress-ringbuf stress compile_commands
 
 help:
 	@echo "process_metrics — событийный BPF-коллектор метрик процессов"
@@ -251,6 +251,23 @@ stress-ringbuf:
 	bash tests/stress_ringbuf.sh
 
 stress: stress-http stress-pid stress-ringbuf
+
+# --- compile_commands.json для IDE ---
+
+compile_commands: | $(BUILDDIR)
+	@echo '[' > $(BUILDDIR)/compile_commands.json
+	@sep=""; \
+	for src in $(USER_SRCS); do \
+		printf '%s\n' "$$sep{" >> $(BUILDDIR)/compile_commands.json; \
+		printf '  "directory": "%s",\n' "$(CURDIR)" >> $(BUILDDIR)/compile_commands.json; \
+		printf '  "command": "%s %s -c %s",\n' "$(CC)" "$(CFLAGS)" "$$src" >> $(BUILDDIR)/compile_commands.json; \
+		printf '  "file": "%s/%s"\n' "$(CURDIR)" "$$src" >> $(BUILDDIR)/compile_commands.json; \
+		printf '}' >> $(BUILDDIR)/compile_commands.json; \
+		sep=","; \
+	done
+	@echo '' >> $(BUILDDIR)/compile_commands.json
+	@echo ']' >> $(BUILDDIR)/compile_commands.json
+	@echo "compile_commands.json создан: $(BUILDDIR)/compile_commands.json"
 
 # --- проверка совместимости с ядрами ---
 
