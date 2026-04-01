@@ -44,10 +44,19 @@ int should_emit_disk(void);
 void fill_parent_pids(struct metric_event *cev);
 void fill_rule(struct metric_event *cev, const char *rname);
 
+/* ── Cache removal (thread-safe wrappers) ────────────────────────── */
+void cpu_prev_remove(__u32 tgid);
+void pwd_remove_ts(__u32 tgid);
+void tags_remove_ts(__u32 tgid);
+void pidtree_remove_ts(__u32 pid);
+
 /* ── Dead keys flush ─────────────────────────────────────────────── */
 int flush_dead_keys(__u32 *keys, int count);
 
 /* ── Disk usage ──────────────────────────────────────────────────── */
 int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname);
+
+/* ── Refresh ─────────────────────────────────────────────────────── */
+void refresh_processes(void);
 
 #endif /* PM_FUNCTIONS_H */

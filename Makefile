@@ -25,7 +25,7 @@ BUILDDIR := build
 
 # Исходные файлы
 BPF_SRC    := $(SRCDIR)/process_metrics.bpf.c
-USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c $(SRCDIR)/csv_format.c
+USER_SRCS  := $(SRCDIR)/process_metrics.c $(SRCDIR)/refresh.c $(SRCDIR)/event_file.c $(SRCDIR)/http_server.c $(SRCDIR)/csv_format.c
 COMMON_H   := $(SRCDIR)/process_metrics_common.h
 EF_H       := $(SRCDIR)/event_file.h
 HS_H       := $(SRCDIR)/http_server.h
