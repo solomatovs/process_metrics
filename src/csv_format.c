@@ -40,8 +40,8 @@ static const char CSV_HEADER_STR[] =
     "file_path,file_new_path,file_flags,file_read_bytes,file_write_bytes,file_open_count,file_"
     "fsync_count,file_chmod_mode,file_chown_uid,file_chown_gid,"
     "net_local_addr,net_remote_addr,net_local_port,net_remote_port,"
-    "net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,"
-    "sig_num,sig_target_pid,sig_target_comm,sig_code,sig_result,"
+    "net_conn_tx_bytes,net_conn_rx_bytes,net_conn_tx_calls,net_conn_rx_calls,net_duration_ms,net_tcp_state,"
+    "sig_num,sig_name,sig_sender_pid,sig_sender_comm,sig_code,sig_result,"
     "sec_local_addr,sec_remote_addr,sec_local_port,sec_remote_port,"
     "sec_af,sec_tcp_state,sec_direction,open_tcp_conns,"
     "disk_total_bytes,disk_used_bytes,disk_avail_bytes\n";
@@ -539,11 +539,13 @@ int csv_format_row(char *buf, int buflen, const struct ef_record *rec,
 	U64(ev->net_conn_tx_calls);
 	U64(ev->net_conn_rx_calls);
 	U64(ev->net_duration_ms);
+	STR(ev->net_tcp_state, 16);
 
 	/* ── сигналы ────────────────────────────────────────────────── */
 	U32(ev->sig_num);
-	U32(ev->sig_target_pid);
-	STR(ev->sig_target_comm, COMM_LEN);
+	STR(ev->sig_name, 16);
+	U32(ev->sig_sender_pid);
+	STR(ev->sig_sender_comm, COMM_LEN);
 	I32(ev->sig_code);
 	I32(ev->sig_result);
 

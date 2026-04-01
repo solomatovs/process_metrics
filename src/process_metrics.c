@@ -211,11 +211,13 @@ static void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_l
 static void fast_strcpy(char *dst, int dstlen, const char *src);
 static const char *event_type_name(enum event_type type);
 static void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
+static void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
+static void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 static void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
 				 int tracked);
 static void fill_proc_info_from_event(struct proc_info *pi, const struct event *e);
-static int fill_proc_info_for_pid(struct metric_event *cev, __u32 tgid);
 static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
+static void fill_tags(struct metric_event *cev, __u32 tgid);
 static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
 static void fill_pwd(struct metric_event *cev, __u32 tgid);
 static void fill_parent_pids(struct metric_event *cev);
@@ -876,14 +878,82 @@ static int is_rst_event(enum event_type t)
 }
 
 /*
+ * Преобразует TCP state number в имя.
+ * Linux kernel TCP states (include/net/tcp_states.h).
+ */
+static const char *tcp_state_name(__u8 state)
+{
+	switch (state) {
+	case 1:  return "ESTABLISHED";
+	case 2:  return "SYN_SENT";
+	case 3:  return "SYN_RECV";
+	case 4:  return "FIN_WAIT1";
+	case 5:  return "FIN_WAIT2";
+	case 6:  return "TIME_WAIT";
+	case 7:  return "CLOSE";
+	case 8:  return "CLOSE_WAIT";
+	case 9:  return "LAST_ACK";
+	case 10: return "LISTEN";
+	case 11: return "CLOSING";
+	}
+	return "";
+}
+
+/*
+ * Преобразует номер сигнала в имя (SIGKILL, SIGTERM, ...).
+ * Linux x86_64 signal numbers.
+ */
+static const char *signal_name(int sig)
+{
+	switch (sig) {
+	case 1:  return "SIGHUP";
+	case 2:  return "SIGINT";
+	case 3:  return "SIGQUIT";
+	case 4:  return "SIGILL";
+	case 5:  return "SIGTRAP";
+	case 6:  return "SIGABRT";
+	case 7:  return "SIGBUS";
+	case 8:  return "SIGFPE";
+	case 9:  return "SIGKILL";
+	case 10: return "SIGUSR1";
+	case 11: return "SIGSEGV";
+	case 12: return "SIGUSR2";
+	case 13: return "SIGPIPE";
+	case 14: return "SIGALRM";
+	case 15: return "SIGTERM";
+	case 16: return "SIGSTKFLT";
+	case 17: return "SIGCHLD";
+	case 18: return "SIGCONT";
+	case 19: return "SIGSTOP";
+	case 20: return "SIGTSTP";
+	case 21: return "SIGTTIN";
+	case 22: return "SIGTTOU";
+	case 23: return "SIGURG";
+	case 24: return "SIGXCPU";
+	case 25: return "SIGXFSZ";
+	case 26: return "SIGVTALRM";
+	case 27: return "SIGPROF";
+	case 28: return "SIGWINCH";
+	case 29: return "SIGIO";
+	case 30: return "SIGPWR";
+	case 31: return "SIGSYS";
+	}
+	return "";
+}
+
+/*
  * Резолвит имя правила из rule_id.
  */
 /*
  * Инициализация metric_event: обнуление + установка event_type.
  */
-static void init_metric_event(struct metric_event *cev, enum event_type type)
+static void init_metric_event(struct metric_event *cev)
 {
 	memset(cev, 0, sizeof(*cev));
+}
+
+static void set_event_type(struct metric_event *cev, enum event_type type)
+{
 	fast_strcpy(cev->event_type, sizeof(cev->event_type), event_type_name(type));
 }
 
@@ -903,33 +973,51 @@ static void store_proc_info_from_event(const struct event *e)
 }
 
 /*
- * Общая подготовка metric_event для BPF-событий с tracked_map.
- * Инициализирует event, заполняет track_info + tags + proc_info + cgroup.
- *
- * После вызова остаётся добавить type-specific данные (fill_from_*_event)
- * и вызвать enrich_and_emit.
+ * Контекст события — общие поля, извлечённые из любого BPF event struct.
+ * Все BPF struct'ы содержат type, tgid (или sender_tgid), cgroup_id,
+ * но на разных смещениях — поэтому вызывающий код извлекает их.
  */
-static void prepare_metric_event(struct metric_event *cev, enum event_type type, __u32 tgid,
-				 __u64 cgroup_id, const struct track_info *ti, int tracked)
-{
-	init_metric_event(cev, type);
-	fill_from_track_info(cev, ti, tracked);
-	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
-	fill_proc_info_for_pid(cev, tgid);
-	fill_cgroup(cev, cgroup_id);
-}
+struct event_ctx {
+	enum event_type type;
+	__u32 tgid;
+	__u32 uid;
+	__u64 timestamp_ns;
+	__u64 cgroup_id;
+	const char *comm;         /* NULL если нет в BPF event */
+	const char *thread_name;  /* NULL если нет в BPF event */
+};
 
 /*
- * Вариант prepare_metric_event без внешнего track_info.
- * Делает lookup tracked_map самостоятельно.
+ * Общая подготовка metric_event: init + общие поля + track_info + tags + metrics + cgroup.
+ * После вызова остаётся: fill_from_*_event (специфика) + finalize + ef_append.
  */
-static void prepare_metric_event_simple(struct metric_event *cev, enum event_type type, __u32 tgid,
-					__u64 cgroup_id)
+static void prepare_metric_event(struct metric_event *cev, const struct event_ctx *ctx)
 {
-	init_metric_event(cev, type);
-	fill_track_info_for_pid(cev, tgid);
-	fill_proc_info_for_pid(cev, tgid);
-	fill_cgroup(cev, cgroup_id);
+	init_metric_event(cev);
+	set_event_type(cev, ctx->type);
+
+	/* Базовая идентификация из proc_map (baseline) */
+	cev->pid = ctx->tgid;
+	{
+		struct proc_info pi;
+		if (bpf_map_lookup_elem(proc_map_fd, &ctx->tgid, &pi) == 0) {
+			fill_identity_from_proc_info(cev, &pi);
+			fill_metrics_from_proc_info(cev, &pi);
+		}
+	}
+
+	/* Override из BPF события (актуальнее на момент события) */
+	cev->uid = ctx->uid;
+	cev->timestamp_ns = ctx->timestamp_ns + (__u64)g_boot_to_wall_ns;
+	if (ctx->comm)
+		memcpy(cev->comm, ctx->comm, COMM_LEN);
+	if (ctx->thread_name)
+		memcpy(cev->thread_name, ctx->thread_name, COMM_LEN);
+
+	/* Обогащение из BPF maps */
+	fill_track_info_for_pid(cev, ctx->tgid);
+	fill_tags(cev, ctx->tgid);
+	fill_cgroup(cev, ctx->cgroup_id);
 }
 
 /*
@@ -939,15 +1027,6 @@ static void finalize_metric_event(struct metric_event *cev, __u32 tgid)
 {
 	fill_pwd(cev, tgid);
 	fill_parent_pids(cev);
-}
-
-static int fill_proc_info_for_pid(struct metric_event *cev, __u32 tgid)
-{
-	struct proc_info pi;
-	if (bpf_map_lookup_elem(proc_map_fd, &tgid, &pi) != 0)
-		return 0;
-	fill_from_proc_info(cev, &pi);
-	return 1;
 }
 
 /*
@@ -976,25 +1055,21 @@ static void fill_rule(struct metric_event *cev, const char *rname)
 static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
 {
 	struct track_info ti;
-	if (is_pid_tracked(tgid, &ti)) {
+	if (is_pid_tracked(tgid, &ti))
 		fill_from_track_info(cev, &ti, 1);
-		ensure_tags(tgid, cev->tags, sizeof(cev->tags));
-	}
 }
 
 /*
- * Заполняет sig_target_comm из /proc/<pid>/comm.
+ * Заполняет теги в metric_event из proc_map cmdline → match_rules.
  */
-/*
- * Заполняет sig_target_comm из proc_map (comm процесса-получателя сигнала).
- */
-static void fill_target_comm(struct metric_event *cev, __u32 target_pid)
+static void fill_tags(struct metric_event *cev, __u32 tgid)
 {
-	struct proc_info pi;
-	if (bpf_map_lookup_elem(proc_map_fd, &target_pid, &pi) == 0)
-		memcpy(cev->sig_target_comm, pi.comm, COMM_LEN);
+	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
 }
 
+/*
+ * Резолвит имя правила из rule_id.
+ */
 static const char *resolve_rule_name(__u16 rule_id)
 {
 	return (rule_id < num_rules) ? rules[rule_id].name : RULE_NOT_MATCH;
@@ -1034,15 +1109,6 @@ static const char *resolve_rule_for_proc_event(const struct event *e)
 	return RULE_NOT_MATCH;
 }
 
-static const char *resolve_rule_with_fallback(__u32 tgid, __u32 ppid)
-{
-	struct track_info ti;
-	if (is_pid_tracked(tgid, &ti))
-		return resolve_rule_name(ti.rule_id);
-	if (ppid > 0 && is_pid_tracked(ppid, &ti))
-		return resolve_rule_name(ti.rule_id);
-	return RULE_NOT_MATCH;
-}
 
 static const char *event_type_name(enum event_type type)
 {
@@ -1173,7 +1239,38 @@ static void fill_proc_info_from_event(struct proc_info *pi, const struct event *
  *   - pwd, parent_pids — заполняются отдельными вызовами
  *   - exit_code — только при exit
  */
-static void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi)
+/*
+ * Заполняет идентификацию процесса из proc_info.
+ * Базовые значения — перезаписываются fill_from_*_event для BPF-событий.
+ * Для snapshot/conn_snapshot — финальные значения (нет BPF event override).
+ */
+static void fill_identity_from_proc_info(struct metric_event *cev,
+					 const struct proc_info *pi)
+{
+	cev->pid = pi->tgid;
+	cev->ppid = pi->ppid;
+	cev->uid = pi->uid;
+	memcpy(cev->comm, pi->comm, COMM_LEN);
+	memcpy(cev->thread_name, pi->thread_name, COMM_LEN);
+	cmdline_split(pi->cmdline, pi->cmdline_len,
+		      cev->exec_path, sizeof(cev->exec_path),
+		      cev->args, sizeof(cev->args));
+	cev->state = pi->state;
+	cev->loginuid = pi->loginuid;
+	cev->sessionid = pi->sessionid;
+	cev->euid = pi->euid;
+	cev->tty_nr = pi->tty_nr;
+	cev->sched_policy = pi->sched_policy;
+	cev->start_time_ns = pi->start_ns
+		? pi->start_ns + (__u64)g_boot_to_wall_ns : 0;
+}
+
+/*
+ * Заполняет метрики процесса из proc_info.
+ * Эти поля не перезаписываются fill_from_*_event — уникальный источник.
+ */
+static void fill_metrics_from_proc_info(struct metric_event *cev,
+					const struct proc_info *pi)
 {
 	static long cached_page_size = 0;
 	if (!cached_page_size) {
@@ -1181,24 +1278,6 @@ static void fill_from_proc_info(struct metric_event *cev, const struct proc_info
 		if (cached_page_size <= 0)
 			cached_page_size = FALLBACK_PAGE_SIZE;
 	}
-
-	/* ── идентификация ────────────────────────────────────── */
-	cev->ppid = pi->ppid;
-	cev->uid = pi->uid;
-	memcpy(cev->comm, pi->comm, COMM_LEN);
-	memcpy(cev->thread_name, pi->thread_name, COMM_LEN);
-	cmdline_split(pi->cmdline, pi->cmdline_len, cev->exec_path, sizeof(cev->exec_path),
-		      cev->args, sizeof(cev->args));
-	cev->is_root = (pi->uid == 0) ? 1 : 0;
-	cev->state = pi->state;
-	cev->loginuid = pi->loginuid;
-	cev->sessionid = pi->sessionid;
-	cev->euid = pi->euid;
-	cev->tty_nr = pi->tty_nr;
-	cev->sched_policy = pi->sched_policy;
-
-	/* ── время ────────────────────────────────────────────── */
-	cev->start_time_ns = pi->start_ns ? pi->start_ns + (__u64)g_boot_to_wall_ns : 0;
 
 	/* ── CPU ──────────────────────────────────────────────── */
 	cev->cpu_ns = pi->cpu_ns;
@@ -1247,6 +1326,17 @@ static void fill_from_proc_info(struct metric_event *cev, const struct proc_info
 	/* ── вытеснение ───────────────────────────────────────── */
 	cev->preempted_by_pid = pi->preempted_by_pid;
 	memcpy(cev->preempted_by_comm, pi->preempted_by_comm, COMM_LEN);
+}
+
+/*
+ * Заполняет ВСЕ поля из proc_info (идентификация + метрики).
+ * Используется для snapshot/conn_snapshot где нет BPF event override.
+ */
+static void fill_from_proc_info(struct metric_event *cev,
+				const struct proc_info *pi)
+{
+	fill_identity_from_proc_info(cev, pi);
+	fill_metrics_from_proc_info(cev, pi);
 }
 
 /*
@@ -1523,42 +1613,6 @@ static void ensure_tags(__u32 tgid, char *buf, int buflen)
 		return;
 
 	ensure_tags_from_cmdline(tgid, buf, buflen, pi.cmdline, pi.cmdline_len);
-}
-
-/*
- * ensure_tags_event — гарантирует наличие тегов для proc-события (fork/exit/oom).
- * Использует cmdline из struct event (всегда доступен), с fallback на proc_map.
- */
-static void ensure_tags_event(__u32 tgid, char *buf, int buflen, const char *ev_cmdline,
-			      __u16 ev_cmdline_len)
-{
-	tags_lookup_ts(tgid, buf, buflen);
-	if (buf[0])
-		return;
-
-	/* Сначала proc_map (может содержать обновлённый cmdline после refresh) */
-	if (proc_map_fd >= 0) {
-		struct proc_info pi;
-		if (bpf_map_lookup_elem(proc_map_fd, &tgid, &pi) == 0 && pi.cmdline_len > 0) {
-			ensure_tags_from_cmdline(tgid, buf, buflen, pi.cmdline, pi.cmdline_len);
-			if (buf[0])
-				return;
-		}
-	}
-
-	/* Fallback: cmdline из BPF ring buffer события */
-	ensure_tags_from_cmdline(tgid, buf, buflen, ev_cmdline, ev_cmdline_len);
-}
-
-/*
- * Заполняет теги в metric_event с fallback: tgid → fallback_tgid.
- * Используется для signal (sender → target).
- */
-static void fill_tags_with_fallback(struct metric_event *cev, __u32 tgid, __u32 fallback_tgid)
-{
-	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
-	if (!cev->tags[0] && fallback_tgid > 0)
-		ensure_tags(fallback_tgid, cev->tags, sizeof(cev->tags));
 }
 
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
@@ -2754,89 +2808,35 @@ static inline void fast_strcpy(char *dst, int cap, const char *src)
 	dst[i] = '\0';
 }
 
-/* log_ts — см. log.h */
-
-/* log_debug заменён макросом LOG_DEBUG(cfg_log_level, ...) из log.h */
-
 /* ── построитель событий ──────────────────────────────────────────── */
-
-/* Построение metric_event из события кольцевого буфера BPF */
 /*
- * Заполняет metric_event из BPF struct event (proc events: exec/fork/exit/oom).
+ * Заполняет поля metric_event, специфичные для proc events (struct event).
+ * cmdline из BPF-события (может отличаться от proc_map), exit_code, oom_killed.
  *
- * Автоматически резолвит rule (через resolve_rule_for_proc_event)
- * и tags (через ensure_tags_event из cmdline в BPF event).
+ * Общие поля (timestamp, uid, comm, thread_name) устанавливаются в
+ * prepare_metric_event через event_ctx.
  *
- * Для exec rule/tags уже вычислены через match_rules_all —
- * передать через override_rule/override_tags. NULL = авто-резолв.
+ * Вызывается ПОСЛЕ prepare_metric_event.
  */
-/*
- * Заполняет metric_event из BPF struct event (proc events: exec/fork/exit/oom).
- * Автоматически резолвит rule и tags.
- */
-static void event_from_bpf(struct metric_event *out, const struct event *e)
+static void fill_from_proc_event(struct metric_event *cev, const struct event *e)
 {
-	memset(out, 0, sizeof(*out));
-	out->timestamp_ns = e->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	fast_strcpy(out->event_type, sizeof(out->event_type), event_type_name(e->type));
-	fast_strcpy(out->rule, sizeof(out->rule), resolve_rule_for_proc_event(e));
-	{
-		char tags_buf[TAGS_MAX_LEN];
-		ensure_tags_event(e->tgid, tags_buf, sizeof(tags_buf), e->cmdline, e->cmdline_len);
-		fast_strcpy(out->tags, sizeof(out->tags), tags_buf);
-	}
-	out->root_pid = e->root_pid;
-	out->pid = e->tgid;
-	out->ppid = e->ppid;
-	out->uid = e->uid;
-	memcpy(out->comm, e->comm, COMM_LEN);
-	memcpy(out->thread_name, e->thread_name, COMM_LEN);
-	cmdline_split(e->cmdline, e->cmdline_len, out->exec_path, sizeof(out->exec_path), out->args,
-		      sizeof(out->args));
-	fill_cgroup(out, e->cgroup_id);
-	out->exit_code = exit_status(e->exit_code);
-	out->cpu_ns = e->cpu_ns;
-	{
-		long ps = sysconf(_SC_PAGESIZE);
-		if (ps <= 0)
-			ps = FALLBACK_PAGE_SIZE;
-		out->rss_bytes = e->rss_pages * ps;
-		out->rss_min_bytes = e->rss_min_pages * ps;
-		out->rss_max_bytes = e->rss_max_pages * ps;
-		out->vsize_bytes = e->vsize_pages * ps;
-	}
-	out->threads = e->threads;
-	out->oom_score_adj = e->oom_score_adj;
-	out->oom_killed = e->oom_killed;
-	out->net_tcp_tx_bytes = e->net_tcp_tx_bytes;
-	out->net_tcp_rx_bytes = e->net_tcp_rx_bytes;
-	out->net_udp_tx_bytes = e->net_udp_tx_bytes;
-	out->net_udp_rx_bytes = e->net_udp_rx_bytes;
-	out->start_time_ns = e->start_ns + (__u64)g_boot_to_wall_ns;
-	out->loginuid = e->loginuid;
-	out->sessionid = e->sessionid;
-	out->euid = e->euid;
-	out->tty_nr = e->tty_nr;
-	out->sched_policy = e->sched_policy;
-	out->io_rchar = e->io_rchar;
-	out->io_wchar = e->io_wchar;
-	out->io_syscr = e->io_syscr;
-	out->io_syscw = e->io_syscw;
-	out->mnt_ns_inum = e->mnt_ns_inum;
-	out->pid_ns_inum = e->pid_ns_inum;
-	out->net_ns_inum = e->net_ns_inum;
-	out->cgroup_ns_inum = e->cgroup_ns_inum;
+	/* cmdline из BPF-события (может отличаться от proc_map) */
+	cmdline_split(e->cmdline, e->cmdline_len,
+		      cev->exec_path, sizeof(cev->exec_path),
+		      cev->args, sizeof(cev->args));
+
+	/* Поля, уникальные для proc events (нет в proc_info) */
+	cev->exit_code = exit_status(e->exit_code);
+	cev->oom_killed = e->oom_killed;
 }
 
 /* ── fill-функции для типизированных BPF-событий ────────────────────
  *
- * Каждая функция копирует общие поля (timestamp, pid, uid, comm,
- * thread_name) и специфичные для типа события поля из BPF-структуры
- * в metric_event.
+ * Каждая функция копирует специфичные для типа события поля из
+ * BPF-структуры в metric_event.
  *
- * ВАЖНО: pid/uid/comm/thread_name устанавливаются из BPF-события и
- * ПЕРЕЗАПИСЫВАЮТ значения, которые мог установить fill_from_proc_info.
- * Поэтому fill_from_proc_info вызывается ДО этих функций.
+ * Общие поля (timestamp, pid, uid, comm, thread_name) устанавливаются
+ * в prepare_metric_event через event_ctx.
  */
 
 /* ── fill_sec_addrs: общий хелпер для sec_* адресов ───────────────── */
@@ -2862,12 +2862,6 @@ static void fill_sec_addrs(struct metric_event *cev, __u8 af, const void *local_
 static void fill_from_file_event(struct metric_event *cev, const struct file_event *fe,
 				 enum event_type type)
 {
-	cev->timestamp_ns = fe->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = fe->tgid;
-	cev->uid = fe->uid;
-	memcpy(cev->comm, fe->comm, COMM_LEN);
-	memcpy(cev->thread_name, fe->thread_name, COMM_LEN);
-
 	/* Общие файловые поля */
 	fast_strcpy(cev->file_path, sizeof(cev->file_path), fe->path);
 	cev->file_flags = (__u32)fe->flags;
@@ -2890,15 +2884,8 @@ static void fill_from_file_event(struct metric_event *cev, const struct file_eve
 }
 
 /* ── fill_from_net_event: NET_LISTEN/CONNECT/ACCEPT/CLOSE ─────────── */
-static void fill_from_net_event(struct metric_event *cev, const struct net_event *ne,
-				enum event_type type)
+static void fill_from_net_event(struct metric_event *cev, const struct net_event *ne)
 {
-	cev->timestamp_ns = ne->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = ne->tgid;
-	cev->uid = ne->uid;
-	memcpy(cev->comm, ne->comm, COMM_LEN);
-	memcpy(cev->thread_name, ne->thread_name, COMM_LEN);
-
 	if (ne->af == 2) {
 		fmt_ipv4(cev->net_local_addr, sizeof(cev->net_local_addr), ne->local_addr);
 		fmt_ipv4(cev->net_remote_addr, sizeof(cev->net_remote_addr), ne->remote_addr);
@@ -2918,43 +2905,33 @@ static void fill_from_net_event(struct metric_event *cev, const struct net_event
 	cev->net_duration_ms = ne->duration_ns / NS_PER_MS;
 
 	/* TCP state на момент close */
-	if (type == EVENT_NET_CLOSE && ne->tcp_state) {
-		if (ne->tcp_state == 1)
-			cev->state = 'I'; /* ESTABLISHED → Idle */
-		else if (ne->tcp_state == 8)
-			cev->state = 'R'; /* CLOSE_WAIT → Remote closed */
-		else
-			cev->state = '0' + (ne->tcp_state % 10);
-	}
+	if (ne->tcp_state)
+		fast_strcpy(cev->net_tcp_state, sizeof(cev->net_tcp_state),
+			    tcp_state_name(ne->tcp_state));
 }
 
 /* ── fill_from_signal_event: SIGNAL ───────────────────────────────── */
+/*
+ * Signal event привязан к ПОЛУЧАТЕЛЮ сигнала (target_pid).
+ * prepare_metric_event заполнил идентификацию target из proc_map + метрики.
+ * Здесь: сигнальные поля и информация об отправителе.
+ */
 static void fill_from_signal_event(struct metric_event *cev, const struct signal_event *se)
 {
-	cev->timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = se->sender_tgid;
-	cev->uid = se->sender_uid;
-	memcpy(cev->comm, se->sender_comm, COMM_LEN);
-	memcpy(cev->thread_name, se->sender_thread_name, COMM_LEN);
-
+	/* Информация о сигнале */
 	cev->sig_num = (__u32)se->sig;
-	cev->sig_target_pid = se->target_pid;
-	cev->sig_code = se->sig_code;
+	fast_strcpy(cev->sig_name, sizeof(cev->sig_name), signal_name(se->sig));
+	cev->sig_code   = se->sig_code;
 	cev->sig_result = se->sig_result;
 
-	/* Signal-специфика: tags fallback sender→target, comm получателя */
-	fill_tags_with_fallback(cev, se->sender_tgid, se->target_pid);
-	fill_target_comm(cev, se->target_pid);
+	/* Информация об отправителе */
+	cev->sig_sender_pid = se->sender_tgid;
+	memcpy(cev->sig_sender_comm, se->sender_comm, COMM_LEN);
 }
 
 /* ── fill_from_retransmit_event: TCP_RETRANSMIT ───────────────────── */
 static void fill_from_retransmit_event(struct metric_event *cev, const struct retransmit_event *re)
 {
-	cev->timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = re->tgid;
-	cev->uid = re->uid;
-	memcpy(cev->comm, re->comm, COMM_LEN);
-
 	fill_sec_addrs(cev, re->af, re->local_addr, re->remote_addr, re->local_port,
 		       re->remote_port);
 	cev->sec_tcp_state = re->state;
@@ -2963,23 +2940,19 @@ static void fill_from_retransmit_event(struct metric_event *cev, const struct re
 /* ── fill_from_syn_event: SYN_RECV ────────────────────────────────── */
 static void fill_from_syn_event(struct metric_event *cev, const struct syn_event *se)
 {
-	cev->timestamp_ns = se->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = se->tgid;
-	cev->uid = se->uid;
-	memcpy(cev->comm, se->comm, COMM_LEN);
-
-	fill_sec_addrs(cev, se->af, se->local_addr, se->remote_addr, se->local_port,
-		       se->remote_port);
+	fill_sec_addrs(
+		cev,
+		se->af,
+		se->local_addr,
+		se->remote_addr,
+		se->local_port,
+		se->remote_port
+	);
 }
 
 /* ── fill_from_rst_event: RST ─────────────────────────────────────── */
 static void fill_from_rst_event(struct metric_event *cev, const struct rst_event *re)
 {
-	cev->timestamp_ns = re->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	cev->pid = re->tgid;
-	cev->uid = re->uid;
-	memcpy(cev->comm, re->comm, COMM_LEN);
-
 	fill_sec_addrs(cev, re->af, re->local_addr, re->remote_addr, re->local_port,
 		       re->remote_port);
 	cev->sec_direction = re->direction;
@@ -3547,7 +3520,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event(&cev, type, fe->tgid, fe->cgroup_id, &ti, tracked);
+			struct event_ctx ctx = {type, fe->tgid, fe->uid, fe->timestamp_ns, fe->cgroup_id, fe->comm, fe->thread_name};
+			prepare_metric_event(&cev, &ctx);
 			fill_from_file_event(&cev, fe, type);
 			finalize_metric_event(&cev, fe->tgid);
 			ef_append(&cev, cfg_hostname);
@@ -3589,8 +3563,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  (unsigned long long)(ne->duration_ns / NS_PER_MS));
 
 			struct metric_event cev;
-			prepare_metric_event(&cev, type, ne->tgid, ne->cgroup_id, &ti, tracked);
-			fill_from_net_event(&cev, ne, type);
+			struct event_ctx ctx = {type, ne->tgid, ne->uid, ne->timestamp_ns, ne->cgroup_id, ne->comm, ne->thread_name};
+				prepare_metric_event(&cev, &ctx);
+			fill_from_net_event(&cev, ne);
 			finalize_metric_event(&cev, ne->tgid);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -3608,22 +3583,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct signal_event *se = data;
 
-		if (should_emit_event(type)) {
-			/* Определяем правило: сначала по отправителю, потом по получателю */
-			/* Fallback: sender → target */
-			const char *rname =
-			    resolve_rule_with_fallback(se->sender_tgid, se->target_pid);
-			LOG_DEBUG(cfg_log_level,
-				  "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
-				  "rule=%s comm=%.16s",
-				  se->sender_tgid, se->target_pid, se->sig, se->sig_code,
-				  se->sig_result, rname, se->sender_comm);
+		LOG_DEBUG(cfg_log_level,
+			  "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d",
+			  se->sender_tgid, se->target_pid, se->sig,
+			  se->sig_code, se->sig_result);
 
+		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_SIGNAL, se->sender_tgid,
-						    se->cgroup_id);
+			struct event_ctx ctx = {EVENT_SIGNAL, se->target_pid, se->sender_uid, se->timestamp_ns, se->cgroup_id, NULL, NULL};
+			prepare_metric_event(&cev, &ctx);
 			fill_from_signal_event(&cev, se);
-			finalize_metric_event(&cev, se->sender_tgid);
+			finalize_metric_event(&cev, se->target_pid);
 			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
@@ -3644,8 +3614,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_TCP_RETRANSMIT, re->tgid,
-						    re->cgroup_id);
+			struct event_ctx ctx = {EVENT_TCP_RETRANSMIT, re->tgid, re->uid, re->timestamp_ns, re->cgroup_id, re->comm, NULL};
+				prepare_metric_event(&cev, &ctx);
 			fill_from_retransmit_event(&cev, re);
 			finalize_metric_event(&cev, re->tgid);
 			ef_append(&cev, cfg_hostname);
@@ -3668,8 +3638,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_SYN_RECV, se_syn->tgid,
-						    se_syn->cgroup_id);
+			struct event_ctx ctx = {EVENT_SYN_RECV, se_syn->tgid, se_syn->uid, se_syn->timestamp_ns, se_syn->cgroup_id, se_syn->comm, NULL};
+				prepare_metric_event(&cev, &ctx);
 			fill_from_syn_event(&cev, se_syn);
 			finalize_metric_event(&cev, se_syn->tgid);
 			ef_append(&cev, cfg_hostname);
@@ -3694,7 +3664,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_RST, rste->tgid, rste->cgroup_id);
+			struct event_ctx ctx = {EVENT_RST, rste->tgid, rste->uid, rste->timestamp_ns, rste->cgroup_id, rste->comm, NULL};
+				prepare_metric_event(&cev, &ctx);
 			fill_from_rst_event(&cev, rste);
 			finalize_metric_event(&cev, rste->tgid);
 			ef_append(&cev, cfg_hostname);
@@ -3738,8 +3709,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
 			if (should_emit_event(EVENT_EXEC)) {
 				struct metric_event cev;
-				event_from_bpf(&cev, e);
-				fill_track_info_for_pid(&cev, e->tgid);
+				struct event_ctx ctx = {EVENT_EXEC, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+				prepare_metric_event(&cev, &ctx);
+				fill_from_proc_event(&cev, e);
 				finalize_metric_event(&cev, e->tgid);
 				ef_append(&cev, cfg_hostname);
 			}
@@ -3767,8 +3739,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Отправляем fork-событие в буферный файл */
 		if (should_emit_event(EVENT_FORK)) {
 			struct metric_event cev;
-			event_from_bpf(&cev, e);
-			fill_track_info_for_pid(&cev, e->tgid);
+			struct event_ctx ctx = {EVENT_FORK, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+				prepare_metric_event(&cev, &ctx);
+			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -3792,8 +3765,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  e->oom_killed ? " [OOM]" : "");
 
 			struct metric_event cev;
-			event_from_bpf(&cev, e);
-			fill_track_info_for_pid(&cev, e->tgid);
+			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+				prepare_metric_event(&cev, &ctx);
+			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg_hostname);
 		}
@@ -3825,8 +3799,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Отправляем oom_kill-событие в буферный файл */
 		if (should_emit_event(EVENT_OOM_KILL)) {
 			struct metric_event cev;
-			event_from_bpf(&cev, e);
-			fill_track_info_for_pid(&cev, e->tgid);
+			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+				prepare_metric_event(&cev, &ctx);
+			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg_hostname);
 		}

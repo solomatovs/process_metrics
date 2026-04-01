@@ -607,8 +607,12 @@ static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
  * Заполняет comm = group leader, thread_name = текущий поток.
  * Для главного потока (tid == tgid) оба совпадают.
  */
-static __always_inline void read_comm_and_thread(char *comm, int comm_sz, char *thread_name,
-						 int thread_sz)
+static __always_inline void read_comm_and_thread(
+	char *comm,
+	int comm_sz,
+	char *thread_name,
+	int thread_sz
+)
 {
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
@@ -1213,6 +1217,8 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
 		return 0;
 
+	/* Резервируем место в ring buffer для события.
+	 * Если буфер полон — событие дропается, счётчик drop_proc инкрементируется. */
 	RB_STAT_TOTAL_PROC();
 	struct signal_event *se = bpf_ringbuf_reserve(&events_proc, sizeof(*se), 0);
 	if (!se) {
@@ -1229,12 +1235,15 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	se->sig = sig;
 	se->sig_code = code;
 	se->sig_result = result;
-	read_comm_and_thread(se->sender_comm, sizeof(se->sender_comm), se->sender_thread_name,
-			     sizeof(se->sender_thread_name));
+	read_comm_and_thread(
+		se->sender_comm,
+		sizeof(se->sender_comm),
+		se->sender_thread_name,
+		sizeof(se->sender_thread_name)
+	);
 
-	/* cgroup id отправителя */
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	se->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
+	/* cgroup id получателя (target) — event привязан к target */
+	se->cgroup_id = BPF_CORE_READ(target, cgroups, dfl_cgrp, kn, id);
 
 	bpf_ringbuf_submit(se, 0);
 	return 0;

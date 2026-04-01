@@ -112,7 +112,8 @@ struct metric_event {
 	__u64 net_conn_rx_bytes; /* байт получено через это соединение */
 	__u64 net_conn_tx_calls; /* количество вызовов sendmsg */
 	__u64 net_conn_rx_calls; /* количество вызовов recvmsg */
-	__u64 net_duration_ms;	 /* длительность соединения в миллисекундах */
+	__u64 net_duration_ms;	    /* длительность соединения в миллисекундах */
+	char  net_tcp_state[16];    /* TCP state при close (ESTABLISHED, CLOSE_WAIT, ...) */
 
 	/* ── идентификация ───────────────────────────────────────── */
 	__u32 loginuid;	 /* audit loginuid (4294967295 = не задан) */
@@ -145,11 +146,12 @@ struct metric_event {
 	char pwd[EV_PWD_LEN]; /* текущий рабочий каталог */
 
 	/* ── отслеживание сигналов (только EVENT_SIGNAL) ─────────── */
-	__u32 sig_num;			/* номер сигнала (SIGKILL=9 и т.д.) */
-	__u32 sig_target_pid;		/* PID процесса-получателя сигнала */
-	char sig_target_comm[COMM_LEN]; /* comm процесса-получателя */
-	__s32 sig_code;			/* SI_USER=0, SI_KERNEL=0x80 и т.д. */
-	__s32 sig_result;		/* 0 = успешно доставлен */
+	__u32 sig_num;              /* номер сигнала (SIGKILL=9 и т.д.) */
+	char  sig_name[16];         /* имя сигнала (SIGKILL, SIGTERM, ...) */
+	__u32 sig_sender_pid;       /* PID процесса-отправителя сигнала */
+	char  sig_sender_comm[COMM_LEN]; /* comm процесса-отправителя */
+	__s32 sig_code;             /* SI_USER=0, SI_KERNEL=0x80 и т.д. */
+	__s32 sig_result;           /* 0 = успешно доставлен */
 
 	/* ── отслеживание безопасности ────────────────────────────── */
 	/* TCP-ретрансмиссия (EVENT_TCP_RETRANSMIT) */
