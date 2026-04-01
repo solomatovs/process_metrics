@@ -812,6 +812,15 @@ static int should_skip_untracked(enum event_type type, int tracked)
 	return !tracked && !is_close_event(type);
 }
 
+/*
+ * Извлекает тип события из сырых данных ring buffer.
+ * Все BPF event structs имеют __u32 type по смещению 0.
+ */
+static enum event_type event_type_from_data(const void *data)
+{
+	return (enum event_type)(*(const __u32 *)data);
+}
+
 static int is_exec_event(enum event_type t)
 {
 	return t == EVENT_EXEC;
@@ -924,13 +933,12 @@ static void prepare_metric_event_simple(struct metric_event *cev, enum event_typ
 }
 
 /*
- * Финализация metric_event: pwd, parent_pids, отправка в ring buffer.
+ * Финализация metric_event: pwd + parent_pids.
  */
-static void enrich_and_emit(struct metric_event *cev, __u32 tgid, const char *hostname)
+static void finalize_metric_event(struct metric_event *cev, __u32 tgid)
 {
 	fill_pwd(cev, tgid);
 	fill_parent_pids(cev);
-	ef_append(cev, hostname);
 }
 
 static int fill_proc_info_for_pid(struct metric_event *cev, __u32 tgid)
@@ -1109,6 +1117,18 @@ static const char *event_type_name(enum event_type type)
 /*
  * Преобразует RST direction (0=sent, 1=recv) в имя события.
  */
+/* Декодирование exit_code: статус (биты 8-15) */
+static int exit_status(int exit_code)
+{
+	return (exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
+}
+
+/* Декодирование exit_code: сигнал (биты 0-6) */
+static int exit_signal(int exit_code)
+{
+	return exit_code & EXIT_SIG_MASK;
+}
+
 static const char *rst_event_name(__u8 direction)
 {
 	return direction ? "rst_recv" : "rst_sent";
@@ -2741,15 +2761,30 @@ static inline void fast_strcpy(char *dst, int cap, const char *src)
 /* ── построитель событий ──────────────────────────────────────────── */
 
 /* Построение metric_event из события кольцевого буфера BPF */
-static void event_from_bpf(struct metric_event *out, const struct event *e, const char *event_type,
-			   const char *rule_name, const char *tags)
+/*
+ * Заполняет metric_event из BPF struct event (proc events: exec/fork/exit/oom).
+ *
+ * Автоматически резолвит rule (через resolve_rule_for_proc_event)
+ * и tags (через ensure_tags_event из cmdline в BPF event).
+ *
+ * Для exec rule/tags уже вычислены через match_rules_all —
+ * передать через override_rule/override_tags. NULL = авто-резолв.
+ */
+/*
+ * Заполняет metric_event из BPF struct event (proc events: exec/fork/exit/oom).
+ * Автоматически резолвит rule и tags.
+ */
+static void event_from_bpf(struct metric_event *out, const struct event *e)
 {
 	memset(out, 0, sizeof(*out));
 	out->timestamp_ns = e->timestamp_ns + (__u64)g_boot_to_wall_ns;
-	snprintf(out->event_type, sizeof(out->event_type), "%s", event_type);
-	snprintf(out->rule, sizeof(out->rule), "%s", rule_name);
-	if (tags)
-		snprintf(out->tags, sizeof(out->tags), "%s", tags);
+	fast_strcpy(out->event_type, sizeof(out->event_type), event_type_name(e->type));
+	fast_strcpy(out->rule, sizeof(out->rule), resolve_rule_for_proc_event(e));
+	{
+		char tags_buf[TAGS_MAX_LEN];
+		ensure_tags_event(e->tgid, tags_buf, sizeof(tags_buf), e->cmdline, e->cmdline_len);
+		fast_strcpy(out->tags, sizeof(out->tags), tags_buf);
+	}
 	out->root_pid = e->root_pid;
 	out->pid = e->tgid;
 	out->ppid = e->ppid;
@@ -2759,18 +2794,25 @@ static void event_from_bpf(struct metric_event *out, const struct event *e, cons
 	cmdline_split(e->cmdline, e->cmdline_len, out->exec_path, sizeof(out->exec_path), out->args,
 		      sizeof(out->args));
 	fill_cgroup(out, e->cgroup_id);
-	/* поля, специфичные для exit */
-	out->exit_code = (e->exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
+	out->exit_code = exit_status(e->exit_code);
 	out->cpu_ns = e->cpu_ns;
-	out->rss_max_bytes = e->rss_max_pages * (unsigned long)sysconf(_SC_PAGESIZE);
-	out->rss_min_bytes = e->rss_min_pages * (unsigned long)sysconf(_SC_PAGESIZE);
+	{
+		long ps = sysconf(_SC_PAGESIZE);
+		if (ps <= 0)
+			ps = FALLBACK_PAGE_SIZE;
+		out->rss_bytes = e->rss_pages * ps;
+		out->rss_min_bytes = e->rss_min_pages * ps;
+		out->rss_max_bytes = e->rss_max_pages * ps;
+		out->vsize_bytes = e->vsize_pages * ps;
+	}
+	out->threads = e->threads;
+	out->oom_score_adj = e->oom_score_adj;
 	out->oom_killed = e->oom_killed;
 	out->net_tcp_tx_bytes = e->net_tcp_tx_bytes;
 	out->net_tcp_rx_bytes = e->net_tcp_rx_bytes;
 	out->net_udp_tx_bytes = e->net_udp_tx_bytes;
 	out->net_udp_rx_bytes = e->net_udp_rx_bytes;
 	out->start_time_ns = e->start_ns + (__u64)g_boot_to_wall_ns;
-	/* новые поля */
 	out->loginuid = e->loginuid;
 	out->sessionid = e->sessionid;
 	out->euid = e->euid;
@@ -2941,6 +2983,9 @@ static void fill_from_rst_event(struct metric_event *cev, const struct rst_event
 	fill_sec_addrs(cev, re->af, re->local_addr, re->remote_addr, re->local_port,
 		       re->remote_port);
 	cev->sec_direction = re->direction;
+
+	/* Override event_type: rst_sent / rst_recv */
+	fast_strcpy(cev->event_type, sizeof(cev->event_type), rst_event_name(re->direction));
 }
 
 /* ── fill_from_sock_info: conn_snapshot ───────────────────────────── */
@@ -3476,10 +3521,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 {
 	(void)ctx;
 
-	/* Все структуры событий имеют __u32 type по смещению 0 */
 	if (size < sizeof(__u32))
 		return 0;
-	__u32 type = *(const __u32 *)data;
+	enum event_type type = event_type_from_data(data);
 
 	/* ── FILE events — file_open/close/rename/unlink/truncate/chmod/chown ── */
 	if (is_file_event(type)) {
@@ -3505,7 +3549,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			struct metric_event cev;
 			prepare_metric_event(&cev, type, fe->tgid, fe->cgroup_id, &ti, tracked);
 			fill_from_file_event(&cev, fe, type);
-			enrich_and_emit(&cev, fe->tgid, cfg_hostname);
+			finalize_metric_event(&cev, fe->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3533,20 +3578,21 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_skip_untracked(type, tracked))
 			return 0;
 
-		const char *rname = resolve_rule_tracked(&ti, tracked);
-		const char *net_evt = event_type_name(type);
-		LOG_DEBUG(cfg_log_level,
-			  "%s: pid=%u rule=%s port=%u→%u "
-			  "tx=%llu rx=%llu dur=%llums",
-			  net_evt, ne->tgid, rname, ne->local_port, ne->remote_port,
-			  (unsigned long long)ne->tx_bytes, (unsigned long long)ne->rx_bytes,
-			  (unsigned long long)(ne->duration_ns / NS_PER_MS));
-
 		if (should_emit_event(type)) {
+			const char *net_evt = event_type_name(type);
+			LOG_DEBUG(cfg_log_level,
+				  "%s: pid=%u rule=%s port=%u→%u "
+				  "tx=%llu rx=%llu dur=%llums",
+				  net_evt, ne->tgid, resolve_rule_tracked(&ti, tracked),
+				  ne->local_port, ne->remote_port, (unsigned long long)ne->tx_bytes,
+				  (unsigned long long)ne->rx_bytes,
+				  (unsigned long long)(ne->duration_ns / NS_PER_MS));
+
 			struct metric_event cev;
 			prepare_metric_event(&cev, type, ne->tgid, ne->cgroup_id, &ti, tracked);
 			fill_from_net_event(&cev, ne, type);
-			enrich_and_emit(&cev, ne->tgid, cfg_hostname);
+			finalize_metric_event(&cev, ne->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3562,21 +3608,23 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct signal_event *se = data;
 
-		/* Определяем правило: сначала по отправителю, потом по получателю */
-		/* Fallback: sender → target */
-		const char *rname = resolve_rule_with_fallback(se->sender_tgid, se->target_pid);
-		LOG_DEBUG(cfg_log_level,
-			  "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
-			  "rule=%s comm=%.16s",
-			  se->sender_tgid, se->target_pid, se->sig, se->sig_code, se->sig_result,
-			  rname, se->sender_comm);
-
 		if (should_emit_event(type)) {
+			/* Определяем правило: сначала по отправителю, потом по получателю */
+			/* Fallback: sender → target */
+			const char *rname =
+			    resolve_rule_with_fallback(se->sender_tgid, se->target_pid);
+			LOG_DEBUG(cfg_log_level,
+				  "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d "
+				  "rule=%s comm=%.16s",
+				  se->sender_tgid, se->target_pid, se->sig, se->sig_code,
+				  se->sig_result, rname, se->sender_comm);
+
 			struct metric_event cev;
 			prepare_metric_event_simple(&cev, EVENT_SIGNAL, se->sender_tgid,
 						    se->cgroup_id);
 			fill_from_signal_event(&cev, se);
-			enrich_and_emit(&cev, se->sender_tgid, cfg_hostname);
+			finalize_metric_event(&cev, se->sender_tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3599,7 +3647,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			prepare_metric_event_simple(&cev, EVENT_TCP_RETRANSMIT, re->tgid,
 						    re->cgroup_id);
 			fill_from_retransmit_event(&cev, re);
-			enrich_and_emit(&cev, re->tgid, cfg_hostname);
+			finalize_metric_event(&cev, re->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3622,7 +3671,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 			prepare_metric_event_simple(&cev, EVENT_SYN_RECV, se_syn->tgid,
 						    se_syn->cgroup_id);
 			fill_from_syn_event(&cev, se_syn);
-			enrich_and_emit(&cev, se_syn->tgid, cfg_hostname);
+			finalize_metric_event(&cev, se_syn->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3636,6 +3686,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	if (is_rst_event(type)) {
 		if (size < sizeof(struct rst_event))
 			return 0;
+
 		const struct rst_event *rste = data;
 
 		LOG_DEBUG(cfg_log_level, "RST: pid=%u port=%u↔%u dir=%s", rste->tgid,
@@ -3644,12 +3695,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(type)) {
 			struct metric_event cev;
 			prepare_metric_event_simple(&cev, EVENT_RST, rste->tgid, rste->cgroup_id);
-			/* Override: rst_sent / rst_recv */
-			fast_strcpy(cev.event_type, sizeof(cev.event_type),
-				    rst_event_name(rste->direction));
 			fill_from_rst_event(&cev, rste);
-			enrich_and_emit(&cev, rste->tgid, cfg_hostname);
+			finalize_metric_event(&cev, rste->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
+
 		return 0;
 	}
 
@@ -3688,9 +3738,10 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
 			if (should_emit_event(EVENT_EXEC)) {
 				struct metric_event cev;
-				event_from_bpf(&cev, e, "exec", rules[first].name, tags_buf);
+				event_from_bpf(&cev, e);
 				fill_track_info_for_pid(&cev, e->tgid);
-				enrich_and_emit(&cev, e->tgid, cfg_hostname);
+				finalize_metric_event(&cev, e->tgid);
+				ef_append(&cev, cfg_hostname);
 			}
 		}
 		return 0;
@@ -3709,19 +3760,17 @@ static int handle_event(void *ctx, void *data, size_t size)
 		struct track_info parent_ti;
 		if (!is_pid_tracked(e->ppid, &parent_ti))
 			return 0;
+
 		tags_inherit_ts(e->tgid, e->ppid);
 		pwd_inherit_ts(e->tgid, e->ppid);
 
 		/* Отправляем fork-событие в буферный файл */
 		if (should_emit_event(EVENT_FORK)) {
-			const char *rname = resolve_rule_name(parent_ti.rule_id);
-			char fork_tags[TAGS_MAX_LEN];
-			ensure_tags_event(e->tgid, fork_tags, sizeof(fork_tags), e->cmdline,
-					  e->cmdline_len);
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "fork", rname, fork_tags);
+			event_from_bpf(&cev, e);
 			fill_track_info_for_pid(&cev, e->tgid);
-			enrich_and_emit(&cev, e->tgid, cfg_hostname);
+			finalize_metric_event(&cev, e->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
@@ -3731,28 +3780,22 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (size < sizeof(struct event))
 			return 0;
 		const struct event *e = data;
-		const char *rname = resolve_rule_for_proc_event(e);
-
-		char exit_tags[TAGS_MAX_LEN];
-		ensure_tags_event(e->tgid, exit_tags, sizeof(exit_tags), e->cmdline,
-				  e->cmdline_len);
-
-		/* Декодирование кода завершения: сигнал (младшие 7 бит) + статус */
-		int sig = e->exit_code & EXIT_SIG_MASK;
-		int status = (e->exit_code >> EXIT_STATUS_SHIFT) & EXIT_STATUS_MASK;
-		LOG_DEBUG(cfg_log_level,
-			  "EXIT: pid=%u rule=%s exit_code=%d "
-			  "signal=%d cpu=%.2fs rss_max=%lluMB%s",
-			  e->tgid, rname, status, sig, (double)e->cpu_ns / 1e9,
-			  (unsigned long long)(e->rss_max_pages * 4 / 1024),
-			  e->oom_killed ? " [OOM]" : "");
 
 		/* Отправляем exit-событие в буферный файл */
 		if (should_emit_event(EVENT_EXIT)) {
+			LOG_DEBUG(cfg_log_level,
+				  "EXIT: pid=%u exit_code=%d signal=%d "
+				  "cpu=%.2fs rss_max=%lluMB%s",
+				  e->tgid, exit_status(e->exit_code), exit_signal(e->exit_code),
+				  (double)e->cpu_ns / 1e9,
+				  (unsigned long long)(e->rss_max_pages * 4 / 1024),
+				  e->oom_killed ? " [OOM]" : "");
+
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "exit", rname, exit_tags);
+			event_from_bpf(&cev, e);
 			fill_track_info_for_pid(&cev, e->tgid);
-			enrich_and_emit(&cev, e->tgid, cfg_hostname);
+			finalize_metric_event(&cev, e->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		/* Карты и кэши НЕ удаляем — proc_info помечен status=EXITED,
 		 * snapshot запишет финальный слепок и зачистит всё.
@@ -3781,13 +3824,11 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		/* Отправляем oom_kill-событие в буферный файл */
 		if (should_emit_event(EVENT_OOM_KILL)) {
-			char oom_tags[TAGS_MAX_LEN];
-			ensure_tags_event(e->tgid, oom_tags, sizeof(oom_tags), e->cmdline,
-					  e->cmdline_len);
 			struct metric_event cev;
-			event_from_bpf(&cev, e, "oom_kill", rname, oom_tags);
+			event_from_bpf(&cev, e);
 			fill_track_info_for_pid(&cev, e->tgid);
-			enrich_and_emit(&cev, e->tgid, cfg_hostname);
+			finalize_metric_event(&cev, e->tgid);
+			ef_append(&cev, cfg_hostname);
 		}
 		return 0;
 	}
