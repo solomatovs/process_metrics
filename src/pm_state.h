@@ -78,4 +78,27 @@ extern pthread_rwlock_t g_tags_lock;
 extern pthread_rwlock_t g_cgroup_lock;
 extern pthread_rwlock_t g_pidtree_lock;
 
+/* ── Tags hash table ────────────────────────────────────────────── */
+
+#define TAGS_MAX_LEN EV_TAGS_LEN
+
+extern __u32 tags_tgid[TAGS_HT_SIZE];
+extern char tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
+
+/* ── Pidtree arrays ─────────────────────────────────────────────── */
+
+extern __u32 pt_pid[PIDTREE_HT_SIZE];
+extern __u32 pt_ppid[PIDTREE_HT_SIZE];
+extern __u64 pt_generation;
+
+/* ── CPU prev cache ─────────────────────────────────────────────── */
+
+struct cpu_prev {
+	__u32 tgid;
+	__u64 cpu_ns;
+};
+
+extern struct cpu_prev cpu_prev_cache[MAX_CPU_PREV];
+extern int cpu_prev_count;
+
 #endif /* PM_STATE_H */

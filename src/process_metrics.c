@@ -72,6 +72,7 @@ struct pm_config cfg = {
 	.snapshot_interval = 30,
 	.refresh_interval = 0,
 	.cgroup_metrics = 1,
+	.refresh_enabled = 1,
 	.refresh_proc = 1,
 	.log_level = 1,
 	.heartbeat_interval = 30,
@@ -125,24 +126,23 @@ struct poll_thread_arg {
 };
 
 /* Предварительные объявления */
-static void write_snapshot(void);
 static void build_cgroup_cache(void);
-static void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_len, char *args_out,
-			  int args_len);
-static void fast_strcpy(char *dst, int dstlen, const char *src);
+void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_len, char *args_out,
+		   int args_len);
+void fast_strcpy(char *dst, int cap, const char *src);
 static const char *event_type_name(enum event_type type);
-static void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
-static void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
-static void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
-static void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
-				 int tracked);
+void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
+void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
+void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
+void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
+			  int tracked);
 static void fill_proc_info_from_event(struct proc_info *pi, const struct event *e);
-static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
-static void fill_tags(struct metric_event *cev, __u32 tgid);
-static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
-static void fill_pwd(struct metric_event *cev, __u32 tgid);
+void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
+void fill_tags(struct metric_event *cev, __u32 tgid);
+void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
+void fill_pwd(struct metric_event *cev, __u32 tgid);
 void fill_parent_pids(struct metric_event *cev);
-static void ensure_tags(__u32 tgid, char *buf, int buflen);
+void ensure_tags(__u32 tgid, char *buf, int buflen);
 /* log_ts определён в log.h */
 
 /* Смещение от boot-time к wall-clock (вычисляется однократно при старте,
@@ -212,10 +212,10 @@ void refresh_boot_to_wall(void)
  *   После: 418k events, 0 drops   (0%),  kernel syscalls = 4.7% CPU
  */
 
-#define TAGS_MAX_LEN EV_TAGS_LEN
+/* TAGS_MAX_LEN определён в pm_state.h */
 
-static __u32 tags_tgid[TAGS_HT_SIZE];		   /*  64 KB — компактный индекс */
-static char tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
+__u32 tags_tgid[TAGS_HT_SIZE];		   /*  64 KB — компактный индекс */
+char tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
 
 /*
  * Murmurhash3 finalizer (32-bit).
@@ -374,7 +374,7 @@ static void tags_store_ts(__u32 tgid, const char *tags)
 	pthread_rwlock_unlock(&g_tags_lock);
 }
 
-static void tags_inherit_ts(__u32 child, __u32 parent)
+void tags_inherit_ts(__u32 child, __u32 parent)
 {
 	pthread_rwlock_wrlock(&g_tags_lock);
 	tags_inherit(child, parent);
@@ -404,8 +404,8 @@ static void tags_clear_ts(void)
  * Память: pt_pid[65536] + pt_ppid[65536] = 512 КБ.
  */
 
-static __u32 pt_pid[PIDTREE_HT_SIZE];  /* ключи: pid   (0 = пустой слот) */
-static __u32 pt_ppid[PIDTREE_HT_SIZE]; /* значения: ppid                 */
+__u32 pt_pid[PIDTREE_HT_SIZE];  /* ключи: pid   (0 = пустой слот) */
+__u32 pt_ppid[PIDTREE_HT_SIZE]; /* значения: ppid                 */
 
 static inline __u32 pidtree_hash(__u32 h)
 {
@@ -431,7 +431,7 @@ static void pidtree_store(__u32 pid, __u32 ppid)
 }
 
 /* Lookup в массивах pid tree (работает и для живой таблицы, и для snapshot-копии) */
-static __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid, __u32 pid)
+__u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid, __u32 pid)
 {
 	__u32 idx = pidtree_hash(pid);
 	for (int i = 0; i < PIDTREE_HT_SIZE; i++) {
@@ -444,7 +444,7 @@ static __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid, __u32 pi
 	return 0;
 }
 
-static void pidtree_remove(__u32 pid)
+void pidtree_remove(__u32 pid)
 {
 	__u32 idx = pidtree_hash(pid);
 	__u32 slot = 0;
@@ -487,7 +487,7 @@ static void pidtree_remove(__u32 pid)
 
 /* Счётчик поколений: увеличивается при каждой мутации дерева (fork/exec/exit).
  * Используется для инвалидации кеша цепочек. */
-static __u64 pt_generation;
+__u64 pt_generation;
 
 void pidtree_store_ts(__u32 pid, __u32 ppid)
 {
@@ -531,8 +531,8 @@ static inline __u32 chain_cache_hash(__u32 h)
  * Обход pid tree вверх от pid, построение цепочки предков.
  * Работает на переданных массивах (живая таблица или snapshot-копия).
  */
-static int pidtree_walk_chain(const __u32 *p_pid, const __u32 *p_ppid, __u32 pid, __u32 *out,
-			      int max_depth)
+int pidtree_walk_chain(const __u32 *p_pid, const __u32 *p_ppid, __u32 pid, __u32 *out,
+		       int max_depth)
 {
 	int len = 0;
 	__u32 cur = pidtree_lookup_in(p_pid, p_ppid, pid);
@@ -586,17 +586,7 @@ static void pidtree_get_chain_ts(__u32 pid, __u32 *out, __u8 *out_len)
 	pthread_rwlock_unlock(&g_pidtree_lock);
 }
 
-/*
- * Получить цепочку предков из snapshot-копии pid tree (без lock).
- * Используется в write_snapshot() чтобы не держать g_pidtree_lock
- * на всю итерацию.
- */
-static void pidtree_get_chain_copy(const __u32 *snap_pid, const __u32 *snap_ppid, __u32 pid,
-				   __u32 *out, __u8 *out_len)
-{
-	int n = pidtree_walk_chain(snap_pid, snap_ppid, pid, out, EV_PARENT_PIDS_MAX);
-	*out_len = (__u8)n;
-}
+/* pidtree_get_chain_copy — moved to snapshot.c */
 
 /*
  * Заполнить parent_pids в metric_event (потокобезопасно, для обработчиков событий).
@@ -685,18 +675,7 @@ static int should_emit_event(enum event_type type)
 	return cfg.http.enabled && event_emit_enabled(type);
 }
 
-/*
- * Проверяет, нужно ли формировать snapshot событие.
- */
-static int should_emit_snapshot(void)
-{
-	return cfg.http.enabled;
-}
-
-static int should_emit_conn_snapshot(void)
-{
-	return cfg.net_tracking_enabled && cfg.http.enabled;
-}
+/* should_emit_snapshot, should_emit_conn_snapshot — moved to snapshot.c */
 
 int should_emit_icmp(void)
 {
@@ -708,14 +687,7 @@ int should_emit_disk(void)
 	return cfg.disk_tracking_enabled && cfg.http.enabled;
 }
 
-/*
- * Проверяет, нужно ли включать соединение в conn_snapshot.
- * CLOSED: записываем даже если процесс не в tracked_map (короткоживущий).
- */
-static int should_include_conn(int tracked, __u8 sock_status)
-{
-	return tracked || sock_status == SOCK_STATUS_CLOSED;
-}
+/* should_include_conn — moved to snapshot.c */
 
 /*
  * Close-события допускают неотслеживаемые процессы — процесс мог
@@ -960,7 +932,7 @@ static void finalize_metric_event(struct metric_event *cev, __u32 tgid)
  * Проверяет, отслеживается ли процесс. Заполняет ti если найден.
  * Возвращает 1 если tracked, 0 если нет.
  */
-static int is_pid_tracked(__u32 tgid, struct track_info *ti)
+int is_pid_tracked(__u32 tgid, struct track_info *ti)
 {
 	return bpf_map_lookup_elem(tracked_map_fd, &tgid, ti) == 0;
 }
@@ -973,7 +945,7 @@ void fill_rule(struct metric_event *cev, const char *rname)
 	fast_strcpy(cev->rule, sizeof(cev->rule), rname);
 }
 
-static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
+void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
 {
 	struct track_info ti;
 	if (is_pid_tracked(tgid, &ti))
@@ -983,7 +955,7 @@ static void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
 /*
  * Заполняет теги в metric_event из proc_map cmdline → match_rules.
  */
-static void fill_tags(struct metric_event *cev, __u32 tgid)
+void fill_tags(struct metric_event *cev, __u32 tgid)
 {
 	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
 }
@@ -999,7 +971,7 @@ static const char *resolve_rule_name(__u16 rule_id)
 /*
  * Резолвит имя правила из track_info, если процесс отслеживается.
  */
-static const char *resolve_rule_tracked(const struct track_info *ti, int tracked)
+const char *resolve_rule_tracked(const struct track_info *ti, int tracked)
 {
 	return tracked ? resolve_rule_name(ti->rule_id) : RULE_NOT_MATCH;
 }
@@ -1165,8 +1137,8 @@ static void fill_proc_info_from_event(struct proc_info *pi, const struct event *
  * Базовые значения — перезаписываются fill_from_*_event для BPF-событий.
  * Для snapshot/conn_snapshot — финальные значения (нет BPF event override).
  */
-static void fill_identity_from_proc_info(struct metric_event *cev,
-					 const struct proc_info *pi)
+void fill_identity_from_proc_info(struct metric_event *cev,
+				  const struct proc_info *pi)
 {
 	cev->pid = pi->tgid;
 	cev->ppid = pi->ppid;
@@ -1190,8 +1162,8 @@ static void fill_identity_from_proc_info(struct metric_event *cev,
  * Заполняет метрики процесса из proc_info.
  * Эти поля не перезаписываются fill_from_*_event — уникальный источник.
  */
-static void fill_metrics_from_proc_info(struct metric_event *cev,
-					const struct proc_info *pi)
+void fill_metrics_from_proc_info(struct metric_event *cev,
+				 const struct proc_info *pi)
 {
 	static long cached_page_size = 0;
 	if (!cached_page_size) {
@@ -1253,8 +1225,8 @@ static void fill_metrics_from_proc_info(struct metric_event *cev,
  * Заполняет ВСЕ поля из proc_info (идентификация + метрики).
  * Используется для snapshot/conn_snapshot где нет BPF event override.
  */
-static void fill_from_proc_info(struct metric_event *cev,
-				const struct proc_info *pi)
+void fill_from_proc_info(struct metric_event *cev,
+			 const struct proc_info *pi)
 {
 	fill_identity_from_proc_info(cev, pi);
 	fill_metrics_from_proc_info(cev, pi);
@@ -1265,7 +1237,7 @@ static void fill_from_proc_info(struct metric_event *cev,
  * Устанавливает rule, root_pid, is_root.
  * tracked=0 означает процесс не в tracked_map — rule остаётся RULE_NOT_MATCH.
  */
-static void fill_from_track_info(struct metric_event *cev, const struct track_info *ti, int tracked)
+void fill_from_track_info(struct metric_event *cev, const struct track_info *ti, int tracked)
 {
 	if (tracked && ti) {
 		cev->root_pid = ti->root_pid;
@@ -1400,7 +1372,7 @@ void pwd_remove_ts(__u32 tgid)
 	pthread_rwlock_unlock(&g_pwd_lock);
 }
 
-static void pwd_inherit_ts(__u32 child, __u32 parent)
+void pwd_inherit_ts(__u32 child, __u32 parent)
 {
 	pthread_rwlock_wrlock(&g_pwd_lock);
 	pwd_inherit(child, parent);
@@ -1520,7 +1492,7 @@ static void ensure_tags_from_cmdline(__u32 tgid, char *buf, int buflen, const ch
  * Источник cmdline: proc_map BPF-карта (O(1) hash lookup).
  * Используется для событий без встроенного cmdline (file, net, signal, snapshot).
  */
-static void ensure_tags(__u32 tgid, char *buf, int buflen)
+void ensure_tags(__u32 tgid, char *buf, int buflen)
 {
 	tags_lookup_ts(tgid, buf, buflen);
 	if (buf[0])
@@ -1537,17 +1509,12 @@ static void ensure_tags(__u32 tgid, char *buf, int buflen)
 }
 
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
+/* struct cpu_prev определён в pm_state.h */
 
-struct cpu_prev {
-	__u32 tgid;
-	__u64 cpu_ns;
-};
+struct cpu_prev cpu_prev_cache[MAX_CPU_PREV];
+int cpu_prev_count;
 
-static struct cpu_prev cpu_prev_cache[MAX_CPU_PREV];
-static int cpu_prev_count;
-static struct timespec prev_snapshot_ts;
-
-static __u64 cpu_prev_lookup(__u32 tgid)
+__u64 cpu_prev_lookup(__u32 tgid)
 {
 	for (int i = 0; i < cpu_prev_count; i++)
 		if (cpu_prev_cache[i].tgid == tgid)
@@ -1555,7 +1522,7 @@ static __u64 cpu_prev_lookup(__u32 tgid)
 	return 0;
 }
 
-static void cpu_prev_update(__u32 tgid, __u64 cpu_ns)
+void cpu_prev_update(__u32 tgid, __u64 cpu_ns)
 {
 	for (int i = 0; i < cpu_prev_count; i++) {
 		if (cpu_prev_cache[i].tgid == tgid) {
@@ -1997,7 +1964,7 @@ void resolve_cgroup_fs_ts(__u64 cgroup_id, char *buf, int buflen)
 /*
  * Резолвит cgroup_id → путь и заполняет cev->cgroup.
  */
-static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id)
+void fill_cgroup(struct metric_event *cev, __u64 cgroup_id)
 {
 	resolve_cgroup_fast_ts(cgroup_id, cev->cgroup, sizeof(cev->cgroup));
 }
@@ -2007,7 +1974,7 @@ static void fill_cgroup(struct metric_event *cev, __u64 cgroup_id)
  * Ищет по имени cgroup (cev->cgroup должен быть уже заполнен через fill_cgroup).
  * Используется только в snapshot — метрики читаются из /sys/fs/cgroup периодически.
  */
-static void fill_cgroup_metrics(struct metric_event *cev)
+void fill_cgroup_metrics(struct metric_event *cev)
 {
 	if (!cev->cgroup[0])
 		return;
@@ -2035,7 +2002,7 @@ static void fill_cgroup_metrics(struct metric_event *cev)
 /*
  * Заполняет pwd в metric_event: lookup из кэша, fallback на /proc/PID/cwd.
  */
-static void fill_pwd(struct metric_event *cev, __u32 tgid)
+void fill_pwd(struct metric_event *cev, __u32 tgid)
 {
 	pwd_lookup_ts(tgid, cev->pwd, sizeof(cev->pwd));
 	if (!cev->pwd[0]) {
@@ -2300,6 +2267,8 @@ static int load_config(const char *path)
 	int bool_val;
 	if (config_lookup_bool(&lc, "cgroup_metrics", &bool_val))
 		cfg.cgroup_metrics = bool_val;
+	if (config_lookup_bool(&lc, "refresh_enabled", &bool_val))
+		cfg.refresh_enabled = bool_val;
 	if (config_lookup_bool(&lc, "refresh_proc", &bool_val))
 		cfg.refresh_proc = bool_val;
 	if (config_lookup_int(&lc, "log_level", &int_val))
@@ -2623,8 +2592,8 @@ static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen)
  * Разделение сырой cmdline (argv, разделённых NUL) на exec_path и args.
  * exec_path = argv[0], args = argv[1..], объединённые пробелами.
  */
-static void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_len, char *args_out,
-			  int args_len)
+void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_len, char *args_out,
+		   int args_len)
 {
 	exec_out[0] = '\0';
 	args_out[0] = '\0';
@@ -2705,7 +2674,7 @@ static inline int fmt_ipv4(char *dst, int cap, const __u8 *a)
 }
 
 /* Копирование строки в поле фиксированного размера (замена snprintf("%s")) */
-static inline void fast_strcpy(char *dst, int cap, const char *src)
+void fast_strcpy(char *dst, int cap, const char *src)
 {
 	int i = 0;
 	while (i < cap - 1 && src[i]) {
@@ -2869,7 +2838,7 @@ static void fill_from_rst_event(struct metric_event *cev, const struct rst_event
 }
 
 /* ── fill_from_sock_info: conn_snapshot ───────────────────────────── */
-static void fill_from_sock_info(struct metric_event *cev, const struct sock_info *si, __u64 boot_ns)
+void fill_from_sock_info(struct metric_event *cev, const struct sock_info *si, __u64 boot_ns)
 {
 	cev->pid = si->tgid;
 	cev->uid = si->uid;
@@ -3217,8 +3186,7 @@ static void seed_sock_map(void)
 	int seeded = 0;
 	int seed_iter = 0;
 
-	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0 &&
-	       seed_iter++ < MAX_PROCS) {
+	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0 && seed_iter++ < MAX_PROCS) {
 		key = next_key;
 		__u32 pid = key;
 
@@ -3721,422 +3689,13 @@ static int handle_event(void *ctx, void *data, size_t size)
 /* read_cgroup_value, read_cgroup_cpu_max, read_cgroup_cpu_stat,
  * emit_disk_usage_events — moved to refresh.c */
 
-/*
- * Поиск тегов в локальной копии (без lock).
- * snap_tgid/snap_data — snapshot, сделанный через memcpy под кратким rdlock
- * в начале write_snapshot (см. ОПТИМИЗАЦИЯ 4).
- * Вызывается десятки раз за snapshot — без locks, т.к. работает с копией.
- */
-static const char *tags_lookup_copy(const __u32 *snap_tgid, const char snap_data[][TAGS_MAX_LEN],
-				    __u32 tgid)
-{
-	__u32 idx = tags_hash(tgid);
-	for (int i = 0; i < TAGS_HT_SIZE; i++) {
-		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (snap_tgid[slot] == tgid)
-			return snap_data[slot];
-		if (snap_tgid[slot] == 0)
-			return "";
-	}
-	return "";
-}
+/* tags_lookup_copy — moved to snapshot.c */
 
 /* refresh_processes — moved to refresh.c */
 
-/*
- * write_snapshot — лёгкий слепок: собрать из кэшей/карт, записать в event_file.
- *
- * Без файлового I/O. Все тяжёлые данные уже обновлены refresh_processes().
- * Единственные syscall: bpf_map_lookup_batch (1×), bpf_map_lookup_elem (per-PID),
- * ef_append (write в memory-mapped ring).
- */
+/* write_snapshot — moved to snapshot.c */
 
 /* flush_dead_keys — moved to refresh.c */
-
-static void write_snapshot(void)
-{
-	/* ── Восстановление после ring buffer drop на FORK ────────────
-	 * BPF handle_fork создаёт tracked_map + proc_map ДО резервирования
-	 * ring buffer. Если bpf_ringbuf_reserve не удался, userspace не
-	 * получил fork-событие и не вызвал pidtree_store_ts / tags_inherit_ts /
-	 * pwd_inherit_ts. Детектируем это по отсутствию pid в pidtree
-	 * и восстанавливаем наследование от родителя.
-	 */
-	{
-		__u32 key;
-		int fork_rec_iter = 0;
-		int err = bpf_map_get_next_key(tracked_map_fd, NULL, &key);
-		while (err == 0 && fork_rec_iter++ < MAX_PROCS) {
-			__u32 next;
-			int next_err = bpf_map_get_next_key(tracked_map_fd, &key, &next);
-
-			/* Быстрая проверка: есть ли pid в pidtree? */
-			pthread_rwlock_rdlock(&g_pidtree_lock);
-			__u32 ppid_in_tree = pidtree_lookup_in(pt_pid, pt_ppid, key);
-			pthread_rwlock_unlock(&g_pidtree_lock);
-
-			if (ppid_in_tree == 0) {
-				/* Нет в pidtree → fork-событие было потеряно.
-				 * Берём ppid из proc_info и восстанавливаем. */
-				struct proc_info pi;
-				if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) == 0 &&
-				    pi.ppid > 0) {
-					pidtree_store_ts(key, pi.ppid);
-					tags_inherit_ts(key, pi.ppid);
-					pwd_inherit_ts(key, pi.ppid);
-					LOG_DEBUG(cfg.log_level,
-						  "FORK_RECOVERY: pid=%u ppid=%u"
-						  " (ring buffer drop)",
-						  key, pi.ppid);
-				}
-			}
-
-			if (next_err != 0)
-				break;
-			key = next;
-		}
-	}
-
-	/* ОПТИМИЗАЦИЯ 4: копируем tags под кратким rdlock */
-	static __u32 snap_tgid[TAGS_HT_SIZE];
-	static char snap_data[TAGS_HT_SIZE][TAGS_MAX_LEN];
-	pthread_rwlock_rdlock(&g_tags_lock);
-	memcpy(snap_tgid, tags_tgid, sizeof(tags_tgid));
-	memcpy(snap_data, tags_data, sizeof(tags_data));
-	pthread_rwlock_unlock(&g_tags_lock);
-
-	/* Snapshot pid tree для цепочек предков (512 КБ, ~0.1ms) */
-	static __u32 snap_pt_pid[PIDTREE_HT_SIZE];
-	static __u32 snap_pt_ppid[PIDTREE_HT_SIZE];
-	pthread_rwlock_rdlock(&g_pidtree_lock);
-	memcpy(snap_pt_pid, pt_pid, sizeof(pt_pid));
-	memcpy(snap_pt_ppid, pt_ppid, sizeof(pt_ppid));
-	pthread_rwlock_unlock(&g_pidtree_lock);
-
-	long page_size = sysconf(_SC_PAGESIZE);
-	if (page_size <= 0)
-		page_size = FALLBACK_PAGE_SIZE;
-
-	struct timespec mono;
-	clock_gettime(CLOCK_MONOTONIC, &mono);
-	double mono_now = (double)mono.tv_sec + (double)mono.tv_nsec / 1e9;
-
-	double elapsed_ns = 0;
-	if (prev_snapshot_ts.tv_sec > 0) {
-		elapsed_ns = (double)(mono.tv_sec - prev_snapshot_ts.tv_sec) * 1e9 +
-			     (double)(mono.tv_nsec - prev_snapshot_ts.tv_nsec);
-	}
-	prev_snapshot_ts = mono;
-
-	struct timespec snap_ts;
-	clock_gettime(CLOCK_REALTIME, &snap_ts);
-	__u64 snap_timestamp_ns = (__u64)snap_ts.tv_sec * NS_PER_SEC + (__u64)snap_ts.tv_nsec;
-
-	__u32 dead_keys[DEAD_KEYS_CAP];
-	int dead_count = 0;
-	int dead_total = 0;
-	int pid_count = 0, snap_count = 0;
-
-	ef_batch_lock();
-
-	/* Пакетное чтение proc_map */
-	__u32 *all_keys = NULL;
-	struct proc_info *all_values = NULL;
-	int all_keys_count = 0;
-
-	{
-		__u32 batch_count = MAX_PROCS;
-		all_keys = malloc(batch_count * sizeof(__u32));
-		all_values = malloc(batch_count * sizeof(struct proc_info));
-
-		if (all_keys && all_values) {
-			DECLARE_LIBBPF_OPTS(bpf_map_batch_opts, opts, .elem_flags = 0,
-					    .flags = 0, );
-			__u32 out_batch = 0;
-			int ret = bpf_map_lookup_batch(proc_map_fd, NULL, &out_batch, all_keys,
-						       all_values, &batch_count, &opts);
-			if (ret == 0 || (ret < 0 && errno == ENOENT)) {
-				all_keys_count = (int)batch_count;
-			} else {
-				all_keys_count = 0;
-				__u32 iter_key;
-				int err2 = bpf_map_get_next_key(proc_map_fd, NULL, &iter_key);
-				while (err2 == 0 && all_keys_count < (int)MAX_PROCS) {
-					all_keys[all_keys_count++] = iter_key;
-					err2 =
-					    bpf_map_get_next_key(proc_map_fd, &iter_key, &iter_key);
-				}
-				free(all_values);
-				all_values = NULL;
-			}
-		}
-	}
-
-	for (int ki = 0; ki < all_keys_count; ki++) {
-		__u32 key = all_keys[ki];
-		struct proc_info pi;
-
-		if (all_values) {
-			pi = all_values[ki];
-		} else {
-			if (bpf_map_lookup_elem(proc_map_fd, &key, &pi) != 0)
-				continue;
-		}
-
-		struct track_info ti;
-		int tracked = is_pid_tracked(key, &ti);
-
-		int is_exited = (pi.status != PROC_STATUS_ALIVE);
-
-		/* EXITED: записываем snapshot даже если handle_exit
-		 * уже удалил из tracked_map (короткоживущий процесс). */
-		if (!tracked && !is_exited)
-			continue;
-
-		/* Завершённые → в dead_keys, но НЕ пропускаются.
-		 * При переполнении буфера — flush и продолжаем сбор. */
-		if (is_exited) {
-			if (dead_count >= DEAD_KEYS_CAP) {
-				dead_total += flush_dead_keys(dead_keys, dead_count);
-				dead_count = 0;
-			}
-			dead_keys[dead_count++] = key;
-		}
-
-		const char *rule_name = resolve_rule_tracked(&ti, tracked);
-
-		/* Вычисление времён */
-		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
-		if (uptime_sec < 0)
-			uptime_sec = 0;
-		double cpu_ratio = 0;
-		if (elapsed_ns > 0) {
-			__u64 prev_ns = cpu_prev_lookup(key);
-			cpu_ratio = (prev_ns > 0 && pi.cpu_ns >= prev_ns)
-					? (double)(pi.cpu_ns - prev_ns) / elapsed_ns
-					: 0;
-		}
-		cpu_prev_update(key, pi.cpu_ns);
-
-		/* Формирование события snapshot */
-		if (should_emit_snapshot()) {
-			struct metric_event cev;
-			memset(&cev, 0, sizeof(cev));
-			cev.timestamp_ns = snap_timestamp_ns;
-			snprintf(cev.event_type, sizeof(cev.event_type), "snapshot");
-			fill_rule(&cev, rule_name);
-			{
-				const char *snap_tags = tags_lookup_copy(snap_tgid, snap_data, key);
-				if (snap_tags[0])
-					snprintf(cev.tags, sizeof(cev.tags), "%s", snap_tags);
-				else
-					ensure_tags(key, cev.tags, sizeof(cev.tags));
-			}
-			fill_from_track_info(&cev, &ti, tracked);
-			fill_from_proc_info(&cev, &pi);
-			fill_cgroup(&cev, pi.cgroup_id);
-			fill_cgroup_metrics(&cev);
-			cev.cpu_usage_ratio = cpu_ratio;
-			cev.uptime_seconds = (__u64)(uptime_sec > 0 ? uptime_sec : 0);
-
-			fill_pwd(&cev, pi.tgid);
-
-			/* open_conn_map — BPF map lookup, не файловый I/O */
-			if (cfg.tcp_open_conns) {
-				__u64 conn_cnt = 0;
-				int occ_fd = bpf_map__fd(skel->maps.open_conn_map);
-				__u32 occ_key = pi.tgid;
-				if (bpf_map_lookup_elem(occ_fd, &occ_key, &conn_cnt) == 0)
-					cev.open_tcp_conns = conn_cnt;
-			}
-
-			pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid, cev.pid, cev.parent_pids,
-					       &cev.parent_pids_len);
-			ef_append(&cev, cfg.hostname);
-			snap_count++;
-		}
-		pid_count++;
-	}
-	free(all_keys);
-	free(all_values);
-
-	/* boot_ns — для вычисления длительности в conn_snapshot и file_snapshot */
-	struct timespec boot_ts;
-	clock_gettime(CLOCK_BOOTTIME, &boot_ts);
-	__u64 boot_ns = (__u64)boot_ts.tv_sec * NS_PER_SEC + (__u64)boot_ts.tv_nsec;
-
-	/* ── conn_snapshot: метрики живых TCP-соединений ──────────────── */
-	int conn_count = 0;
-	if (should_emit_conn_snapshot()) {
-		int sm_fd = bpf_map__fd(skel->maps.sock_map);
-
-		int closed_sock_count = 0;
-
-		__u64 sk_key;
-		int sk_iter = 0;
-		int sk_err = bpf_map_get_next_key(sm_fd, NULL, &sk_key);
-		while (sk_err == 0 && sk_iter++ < NET_MAX_SOCKETS) {
-			__u64 sk_next;
-			int sk_next_err = bpf_map_get_next_key(sm_fd, &sk_key, &sk_next);
-			struct sock_info si;
-			if (bpf_map_lookup_elem(sm_fd, &sk_key, &si) == 0) {
-
-				struct track_info ti;
-				int tracked =
-				    bpf_map_lookup_elem(tracked_map_fd, &si.tgid, &ti) == 0;
-				if (should_include_conn(tracked, si.status)) {
-					struct metric_event cev;
-					memset(&cev, 0, sizeof(cev));
-					cev.timestamp_ns = snap_timestamp_ns;
-					fast_strcpy(cev.event_type, sizeof(cev.event_type),
-						    "conn_snapshot");
-					fill_from_track_info(&cev, &ti, tracked);
-					{
-						const char *cs_tags =
-						    tags_lookup_copy(snap_tgid, snap_data, si.tgid);
-						if (cs_tags[0])
-							fast_strcpy(cev.tags, sizeof(cev.tags),
-								    cs_tags);
-						else
-							ensure_tags(si.tgid, cev.tags,
-								    sizeof(cev.tags));
-					}
-					struct proc_info cpi;
-					if (bpf_map_lookup_elem(proc_map_fd, &si.tgid, &cpi) == 0)
-						fill_from_proc_info(&cev, &cpi);
-
-					fill_from_sock_info(&cev, &si, boot_ns);
-
-					pidtree_get_chain_copy(snap_pt_pid, snap_pt_ppid, si.tgid,
-							       cev.parent_pids,
-							       &cev.parent_pids_len);
-					ef_append(&cev, cfg.hostname);
-					conn_count++;
-				}
-
-				/* CLOSED → удаляем ПОСЛЕ snapshot записи */
-				if (si.status == SOCK_STATUS_CLOSED) {
-					bpf_map_delete_elem(sm_fd, &sk_key);
-					closed_sock_count++;
-				}
-			}
-
-			if (sk_next_err != 0)
-				break;
-			sk_key = sk_next;
-		}
-
-		if (closed_sock_count > 0)
-			LOG_DEBUG(cfg.log_level, "conn_snapshot: cleaned %d closed socks",
-				  closed_sock_count);
-	}
-
-	/* file_snapshot убран: file_open/file_close events через ring buffer
-	 * полностью покрывают файловый I/O, включая короткоживущие fd. */
-
-	ef_batch_unlock();
-
-	/* Очистка завершённых процессов — BPF-карты + все userspace-кэши */
-	dead_total += flush_dead_keys(dead_keys, dead_count);
-
-	if (cfg.log_snapshot)
-		LOG_INFO("snapshot: %d PIDs (%d exited), %d events, %d conns", pid_count,
-			 dead_total, snap_count, conn_count);
-
-	/* Обновляем глобальные счётчики для heartbeat */
-	g_last_conn_count = conn_count;
-
-	/* Статистика ring buffer'ов — логируем только НОВЫЕ drops */
-	{
-		static struct ringbuf_stats prev_rs;
-		__u32 key = 0;
-		struct ringbuf_stats rs = {0};
-		int stats_fd = bpf_map__fd(skel->maps.ringbuf_stats);
-		if (stats_fd >= 0 && bpf_map_lookup_elem(stats_fd, &key, &rs) == 0) {
-			__u64 new_drops = (rs.drop_proc - prev_rs.drop_proc) +
-					  (rs.drop_file - prev_rs.drop_file) +
-					  (rs.drop_file_ops - prev_rs.drop_file_ops) +
-					  (rs.drop_net - prev_rs.drop_net) +
-					  (rs.drop_sec - prev_rs.drop_sec) +
-					  (rs.drop_cgroup - prev_rs.drop_cgroup) +
-					  (rs.drop_missed_exec - prev_rs.drop_missed_exec);
-			if (new_drops > 0) {
-				LOG_WARN("ringbuf drops: proc=%llu/%llu file=%llu/%llu "
-					 "file_ops=%llu/%llu net=%llu/%llu sec=%llu/%llu "
-					 "cgroup=%llu/%llu missed_exec_overflow=%llu",
-					 (unsigned long long)rs.drop_proc,
-					 (unsigned long long)rs.total_proc,
-					 (unsigned long long)rs.drop_file,
-					 (unsigned long long)rs.total_file,
-					 (unsigned long long)rs.drop_file_ops,
-					 (unsigned long long)rs.total_file_ops,
-					 (unsigned long long)rs.drop_net,
-					 (unsigned long long)rs.total_net,
-					 (unsigned long long)rs.drop_sec,
-					 (unsigned long long)rs.total_sec,
-					 (unsigned long long)rs.drop_cgroup,
-					 (unsigned long long)rs.total_cgroup,
-					 (unsigned long long)rs.drop_missed_exec);
-			} else if (cfg.log_level >= 2) {
-				LOG_DEBUG(cfg.log_level,
-					  "ringbuf totals: proc=%llu file=%llu net=%llu sec=%llu "
-					  "cgroup=%llu",
-					  (unsigned long long)rs.total_proc,
-					  (unsigned long long)rs.total_file,
-					  (unsigned long long)rs.total_net,
-					  (unsigned long long)rs.total_sec,
-					  (unsigned long long)rs.total_cgroup);
-			}
-			prev_rs = rs;
-		}
-	}
-
-	/* ── GC pidtree: удаляем записи мёртвых неотслеживаемых PID ────
-	 * При начальном сканировании /proc ВСЕ процессы попадают в pidtree,
-	 * но EXIT-событие приходит только для tracked процессов. Без GC
-	 * записи неотслеживаемых мёртвых PID утекают и забивают хеш-таблицу.
-	 * Запускаем каждые 10 snapshot'ов чтобы не нагружать kill() syscall. */
-	{
-		static int gc_counter;
-		if (++gc_counter >= 10) {
-			gc_counter = 0;
-
-			/* Фаза 1: собираем кандидатов на удаление БЕЗ lock.
-			 * bpf_map_lookup + kill() — тяжёлые syscall, нельзя
-			 * держать wrlock на всё время (блокирует poll-потоки). */
-			__u32 gc_pids[DEAD_KEYS_CAP];
-			int gc_count = 0;
-
-			pthread_rwlock_rdlock(&g_pidtree_lock);
-			for (int i = 0; i < PIDTREE_HT_SIZE && gc_count < DEAD_KEYS_CAP; i++) {
-				__u32 pid = pt_pid[i];
-				if (pid == 0)
-					continue;
-				struct track_info ti_gc;
-				if (is_pid_tracked(pid, &ti_gc))
-					continue;
-				if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
-					continue;
-				gc_pids[gc_count++] = pid;
-			}
-			pthread_rwlock_unlock(&g_pidtree_lock);
-
-			/* Фаза 2: удаляем под wrlock (быстро — только delete). */
-			if (gc_count > 0) {
-				pthread_rwlock_wrlock(&g_pidtree_lock);
-				for (int i = 0; i < gc_count; i++) {
-					pidtree_remove(gc_pids[i]);
-					pt_generation++;
-				}
-				pthread_rwlock_unlock(&g_pidtree_lock);
-				LOG_DEBUG(cfg.log_level,
-					  "PIDTREE_GC: removed %d dead"
-					  " untracked entries",
-					  gc_count);
-			}
-		}
-	}
-}
 
 /* ── сигналы ──────────────────────────────────────────────────────── */
 
@@ -4472,7 +4031,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	/* Передача конфигурац��и отслеживания файлов в BPF-карты */
+	/* Передача конфигурации отслеживания файлов в BPF-карты */
 	if (cfg.file_tracking_enabled) {
 		int file_cfg_fd = bpf_map__fd(skel->maps.file_cfg);
 		__u32 key0 = 0;
@@ -4670,7 +4229,7 @@ int main(int argc, char *argv[])
 			build_cgroup_cache_ts();
 
 			cpu_prev_count = 0;
-			prev_snapshot_ts = (struct timespec){0};
+			snapshot_reset();
 			initial_scan();
 			if (cfg.need_sock_map)
 				seed_sock_map();
@@ -4688,20 +4247,13 @@ int main(int argc, char *argv[])
 		 * Адаптивный интервал: при высокой заполненности tracked_map
 		 * увеличиваем интервал, чтобы дать write_snapshot время
 		 * на cleanup и не тратить CPU на итерацию мёртвых записей. */
-		{
+		if (cfg.refresh_enabled) {
 			int effective_refresh = cfg.refresh_interval;
-
-			/* Быстрая проверка заполненности tracked_map:
-			 * пробуем get_next_key с позиции NULL —
-			 * дёшево (1 syscall), даёт ключ если карта не пуста.
-			 * Для точной оценки используем all_keys_count из
-			 * последнего refresh. */
 			int fill_pct = g_last_map_count * 100 / MAX_PROCS;
 			if (fill_pct > REFRESH_FILL_HIGH_PCT)
 				effective_refresh = cfg.refresh_interval * REFRESH_MULT_HIGH;
 			else if (fill_pct > REFRESH_FILL_MED_PCT)
 				effective_refresh = cfg.refresh_interval * REFRESH_MULT_MED;
-			/* Не превышаем snapshot_interval */
 			if (effective_refresh > cfg.snapshot_interval)
 				effective_refresh = cfg.snapshot_interval;
 
