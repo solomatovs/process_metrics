@@ -878,7 +878,6 @@ static void init_metric_event(struct metric_event *cev, enum event_type type)
 	fast_strcpy(cev->event_type, sizeof(cev->event_type), event_type_name(type));
 }
 
-
 /*
  * Lookup proc_info по tgid и заполнить metric_event.
  * Возвращает 1 если найден, 0 если нет.
@@ -901,10 +900,8 @@ static void store_proc_info_from_event(const struct event *e)
  * После вызова остаётся добавить type-specific данные (fill_from_*_event)
  * и вызвать enrich_and_emit.
  */
-static void prepare_metric_event(struct metric_event *cev,
-				 enum event_type type, __u32 tgid,
-				 __u64 cgroup_id,
-				 const struct track_info *ti, int tracked)
+static void prepare_metric_event(struct metric_event *cev, enum event_type type, __u32 tgid,
+				 __u64 cgroup_id, const struct track_info *ti, int tracked)
 {
 	init_metric_event(cev, type);
 	fill_from_track_info(cev, ti, tracked);
@@ -917,8 +914,7 @@ static void prepare_metric_event(struct metric_event *cev,
  * Вариант prepare_metric_event без внешнего track_info.
  * Делает lookup tracked_map самостоятельно.
  */
-static void prepare_metric_event_simple(struct metric_event *cev,
-					enum event_type type, __u32 tgid,
+static void prepare_metric_event_simple(struct metric_event *cev, enum event_type type, __u32 tgid,
 					__u64 cgroup_id)
 {
 	init_metric_event(cev, type);
@@ -930,8 +926,7 @@ static void prepare_metric_event_simple(struct metric_event *cev,
 /*
  * Финализация metric_event: pwd, parent_pids, отправка в ring buffer.
  */
-static void enrich_and_emit(struct metric_event *cev, __u32 tgid,
-			    const char *hostname)
+static void enrich_and_emit(struct metric_event *cev, __u32 tgid, const char *hostname)
 {
 	fill_pwd(cev, tgid);
 	fill_parent_pids(cev);
@@ -3508,8 +3503,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event(&cev, type, fe->tgid,
-					     fe->cgroup_id, &ti, tracked);
+			prepare_metric_event(&cev, type, fe->tgid, fe->cgroup_id, &ti, tracked);
 			fill_from_file_event(&cev, fe, type);
 			enrich_and_emit(&cev, fe->tgid, cfg_hostname);
 		}
@@ -3550,8 +3544,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event(&cev, type, ne->tgid,
-					     ne->cgroup_id, &ti, tracked);
+			prepare_metric_event(&cev, type, ne->tgid, ne->cgroup_id, &ti, tracked);
 			fill_from_net_event(&cev, ne, type);
 			enrich_and_emit(&cev, ne->tgid, cfg_hostname);
 		}
@@ -3580,8 +3573,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_SIGNAL,
-						    se->sender_tgid, se->cgroup_id);
+			prepare_metric_event_simple(&cev, EVENT_SIGNAL, se->sender_tgid,
+						    se->cgroup_id);
 			fill_from_signal_event(&cev, se);
 			enrich_and_emit(&cev, se->sender_tgid, cfg_hostname);
 		}
@@ -3603,8 +3596,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_TCP_RETRANSMIT,
-						    re->tgid, re->cgroup_id);
+			prepare_metric_event_simple(&cev, EVENT_TCP_RETRANSMIT, re->tgid,
+						    re->cgroup_id);
 			fill_from_retransmit_event(&cev, re);
 			enrich_and_emit(&cev, re->tgid, cfg_hostname);
 		}
@@ -3626,8 +3619,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_SYN_RECV,
-						    se_syn->tgid, se_syn->cgroup_id);
+			prepare_metric_event_simple(&cev, EVENT_SYN_RECV, se_syn->tgid,
+						    se_syn->cgroup_id);
 			fill_from_syn_event(&cev, se_syn);
 			enrich_and_emit(&cev, se_syn->tgid, cfg_hostname);
 		}
@@ -3650,8 +3643,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			prepare_metric_event_simple(&cev, EVENT_RST,
-						    rste->tgid, rste->cgroup_id);
+			prepare_metric_event_simple(&cev, EVENT_RST, rste->tgid, rste->cgroup_id);
 			/* Override: rst_sent / rst_recv */
 			fast_strcpy(cev.event_type, sizeof(cev.event_type),
 				    rst_event_name(rste->direction));
