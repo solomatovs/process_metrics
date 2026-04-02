@@ -654,8 +654,12 @@ int handle_exec(void *ctx)
 	 * Это экономит место в ring buffer при интенсивном fork+exec. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info) {
-		read_comm_and_thread(info->comm, sizeof(info->comm), info->thread_name,
-				     sizeof(info->thread_name));
+		read_comm_and_thread(
+			info->comm,
+			sizeof(info->comm),
+			info->thread_name,
+			sizeof(info->thread_name)
+		);
 		info->cgroup_id = bpf_get_current_cgroup_id();
 		info->cmdline_len = read_cmdline(task, info->cmdline);
 		read_identity(task, &info->loginuid, &info->sessionid, &info->euid);

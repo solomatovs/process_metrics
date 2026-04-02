@@ -19,7 +19,7 @@ struct pm_config {
 	int         refresh_interval;       /* секунды между refresh (0 = snapshot_interval) */
 	int         exec_rate_limit;        /* макс exec/сек (0 = без ограничений) */
 	int         cgroup_metrics;         /* 1 = читать файлы cgroup */
-	int         refresh_enabled;         /* 1 = вызывать refresh_processes (по умолчанию включён) */
+	int         refresh_enabled;         /* 0 = событийная модель (по умолчанию), 1 = периодический /proc polling */
 	int         refresh_proc;           /* 1 = обновлять cmdline/comm из /proc */
 	int         max_cgroups;            /* макс записей в cgroup cache */
 

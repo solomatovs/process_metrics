@@ -72,7 +72,7 @@ struct pm_config cfg = {
 	.snapshot_interval = 30,
 	.refresh_interval = 0,
 	.cgroup_metrics = 1,
-	.refresh_enabled = 1,
+	.refresh_enabled = 0,
 	.refresh_proc = 1,
 	.log_level = 1,
 	.heartbeat_interval = 30,
@@ -3439,7 +3439,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			struct metric_event cev;
 			struct event_ctx ctx = {type, ne->tgid, ne->uid, ne->timestamp_ns, ne->cgroup_id, ne->comm, ne->thread_name};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_net_event(&cev, ne);
 			finalize_metric_event(&cev, ne->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3490,7 +3490,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(type)) {
 			struct metric_event cev;
 			struct event_ctx ctx = {EVENT_TCP_RETRANSMIT, re->tgid, re->uid, re->timestamp_ns, re->cgroup_id, re->comm, NULL};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_retransmit_event(&cev, re);
 			finalize_metric_event(&cev, re->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3514,7 +3514,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(type)) {
 			struct metric_event cev;
 			struct event_ctx ctx = {EVENT_SYN_RECV, se_syn->tgid, se_syn->uid, se_syn->timestamp_ns, se_syn->cgroup_id, se_syn->comm, NULL};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_syn_event(&cev, se_syn);
 			finalize_metric_event(&cev, se_syn->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3540,7 +3540,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(type)) {
 			struct metric_event cev;
 			struct event_ctx ctx = {EVENT_RST, rste->tgid, rste->uid, rste->timestamp_ns, rste->cgroup_id, rste->comm, NULL};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_rst_event(&cev, rste);
 			finalize_metric_event(&cev, rste->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3615,7 +3615,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(EVENT_FORK)) {
 			struct metric_event cev;
 			struct event_ctx ctx = {EVENT_FORK, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3641,7 +3641,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 			struct metric_event cev;
 			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg.hostname);
@@ -3675,7 +3675,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (should_emit_event(EVENT_OOM_KILL)) {
 			struct metric_event cev;
 			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
-				prepare_metric_event(&cev, &ctx);
+			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
 			ef_append(&cev, cfg.hostname);
