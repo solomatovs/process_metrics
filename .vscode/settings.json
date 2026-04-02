@@ -1,0 +1,21 @@
+{
+    "editor.formatOnSave": true,
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "clangd.path": "/usr/bin/clangd",
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--background-index",
+        "--clang-tidy=false",
+        "--header-insertion=never"
+    ],
+    "files.associations": {
+        "*.h": "c",
+        "*.bpf.c": "c"
+    },
+    "[c]": {
+        "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+        "editor.tabSize": 8,
+        "editor.insertSpaces": false,
+        "editor.detectIndentation": false
+    }
+}

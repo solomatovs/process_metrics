@@ -1,0 +1,61 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug process_metrics",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/process_metrics",
+            "args": ["-c", "${workspaceFolder}/examples/process_metrics.conf"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "Build Debug",
+            "miDebuggerPath": "${workspaceFolder}/.vscode/sudo-gdb.sh"
+        },
+        {
+            "name": "Debug process_metrics (sudo)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/process_metrics",
+            "args": ["-c", "${workspaceFolder}/examples/process_metrics.conf"],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "Build Debug",
+            "miDebuggerPath": "${workspaceFolder}/.vscode/sudo-gdb.sh"
+        },
+        {
+            "name": "Attach to process_metrics",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "${workspaceFolder}/build/process_metrics",
+            "processId": "${command:pickProcess}",
+            "MIMode": "gdb",
+            "miDebuggerPath": "${workspaceFolder}/.vscode/sudo-gdb.sh"
+        }
+    ]
+}

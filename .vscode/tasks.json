@@ -1,0 +1,62 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build All",
+            "type": "shell",
+            "command": "make",
+            "args": ["all"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"],
+            "detail": "Full build: vmlinux + bpftool + BPF + binary"
+        },
+        {
+            "label": "Build Binary",
+            "type": "shell",
+            "command": "make",
+            "args": ["binary"],
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Compile userspace binary only"
+        },
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "make",
+            "args": ["debug"],
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Debug build: -Og -g3 for comfortable debugging"
+        },
+        {
+            "label": "Build BPF",
+            "type": "shell",
+            "command": "make",
+            "args": ["bpf"],
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Compile BPF object + generate skeleton"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "problemMatcher": []
+        },
+        {
+            "label": "Run Tests",
+            "type": "shell",
+            "command": "make",
+            "args": ["test"],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}
