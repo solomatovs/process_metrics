@@ -100,7 +100,7 @@ int g_last_conn_count = 0;
 volatile sig_atomic_t g_running = 1;
 volatile sig_atomic_t g_reload = 0;
 struct process_metrics_bpf *skel;
-int tracked_map_fd, proc_map_fd, missed_exec_fd;
+int proc_map_fd, missed_exec_fd;
 
 /*
  * Две гранулярные RW-блокировки для общих данных:
@@ -134,10 +134,7 @@ static const char *event_type_name(enum event_type type);
 void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
-void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
-			  int tracked);
 static void fill_proc_info_from_event(struct proc_info *pi, const struct event *e);
-void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
 void fill_tags(struct metric_event *cev, __u32 tgid);
 void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
 void fill_pwd(struct metric_event *cev, __u32 tgid);
@@ -689,23 +686,6 @@ int should_emit_disk(void)
 
 /* should_include_conn — moved to snapshot.c */
 
-/*
- * Close-события допускают неотслеживаемые процессы — процесс мог
- * завершиться до обработки close из ring buffer.
- */
-static int is_close_event(enum event_type t)
-{
-	return t == EVENT_FILE_CLOSE || t == EVENT_NET_CLOSE;
-}
-
-/*
- * Проверяет, нужно ли пропустить событие от неотслеживаемого процесса.
- * Возвращает 1 (пропустить) если процесс не tracked и это не close-событие.
- */
-static int should_skip_untracked(enum event_type type, int tracked)
-{
-	return !tracked && !is_close_event(type);
-}
 
 /*
  * Извлекает тип события из сырых данных ring buffer.
@@ -881,7 +861,7 @@ struct event_ctx {
 };
 
 /*
- * Общая подготовка metric_event: init + общие поля + track_info + tags + metrics + cgroup.
+ * Общая подготовка metric_event: init + общие поля + tracking + tags + metrics + cgroup.
  * После вызова остаётся: fill_from_*_event (специфика) + finalize + ef_append.
  */
 static void prepare_metric_event(struct metric_event *cev, const struct event_ctx *ctx)
@@ -896,6 +876,12 @@ static void prepare_metric_event(struct metric_event *cev, const struct event_ct
 		if (bpf_map_lookup_elem(proc_map_fd, &ctx->tgid, &pi) == 0) {
 			fill_identity_from_proc_info(cev, &pi);
 			fill_metrics_from_proc_info(cev, &pi);
+			/* Tracking-поля */
+			cev->root_pid = pi.root_pid;
+			cev->is_root = pi.is_root;
+			if (pi.rule_id < num_rules)
+				fast_strcpy(cev->rule, sizeof(cev->rule),
+					    rules[pi.rule_id].name);
 		}
 	}
 
@@ -908,7 +894,6 @@ static void prepare_metric_event(struct metric_event *cev, const struct event_ct
 		memcpy(cev->thread_name, ctx->thread_name, COMM_LEN);
 
 	/* Обогащение из BPF maps */
-	fill_track_info_for_pid(cev, ctx->tgid);
 	fill_tags(cev, ctx->tgid);
 	fill_cgroup(cev, ctx->cgroup_id);
 }
@@ -923,18 +908,15 @@ static void finalize_metric_event(struct metric_event *cev, __u32 tgid)
 }
 
 /*
- * Заполняет rule/tags из tracked_map для процесса.
- * Если процесс не отслеживается — rule остаётся RULE_NOT_MATCH (из init_metric_event).
- * Используется для sec events (retransmit, syn_recv, rst) где tracked_map
- * может не содержать запись.
+ * Проверяет, есть ли процесс в proc_map.
+ * Если pi != NULL — заполняет его.
  */
-/*
- * Проверяет, отслеживается ли процесс. Заполняет ti если найден.
- * Возвращает 1 если tracked, 0 если нет.
- */
-int is_pid_tracked(__u32 tgid, struct track_info *ti)
+int is_pid_in_proc_map(__u32 tgid, struct proc_info *pi)
 {
-	return bpf_map_lookup_elem(tracked_map_fd, &tgid, ti) == 0;
+	if (pi)
+		return bpf_map_lookup_elem(proc_map_fd, &tgid, pi) == 0;
+	struct proc_info tmp;
+	return bpf_map_lookup_elem(proc_map_fd, &tgid, &tmp) == 0;
 }
 
 /*
@@ -945,12 +927,6 @@ void fill_rule(struct metric_event *cev, const char *rname)
 	fast_strcpy(cev->rule, sizeof(cev->rule), rname);
 }
 
-void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid)
-{
-	struct track_info ti;
-	if (is_pid_tracked(tgid, &ti))
-		fill_from_track_info(cev, &ti, 1);
-}
 
 /*
  * Заполняет теги в metric_event из proc_map cmdline → match_rules.
@@ -969,20 +945,23 @@ static const char *resolve_rule_name(__u16 rule_id)
 }
 
 /*
- * Резолвит имя правила из track_info, если процесс отслеживается.
+ * Резолвит имя правила для pid из proc_map.
  */
-const char *resolve_rule_tracked(const struct track_info *ti, int tracked)
+const char *resolve_rule_for_pid(__u32 tgid)
 {
-	return tracked ? resolve_rule_name(ti->rule_id) : RULE_NOT_MATCH;
+	struct proc_info pi;
+	if (is_pid_in_proc_map(tgid, &pi))
+		return resolve_rule_name(pi.rule_id);
+	return RULE_NOT_MATCH;
 }
 
 /*
  * Резолвит имя правила для процесса с fallback на родителя.
- * Используется для OOM/signal когда процесс может быть не в tracked_map.
+ * Используется для OOM/signal когда процесс может быть не в proc_map.
  */
 /*
  * Резолвит правило для proc event (exit/oom).
- * Порядок: BPF rule_id → tracked_map → try_track → fallback ppid.
+ * Порядок: BPF rule_id → proc_map → try_track → fallback ppid.
  */
 static const char *resolve_rule_for_proc_event(const struct event *e)
 {
@@ -994,11 +973,11 @@ static const char *resolve_rule_for_proc_event(const struct event *e)
 	try_track_pid(e->tgid);
 
 	/* Lookup tgid → fallback ppid */
-	struct track_info ti;
-	if (is_pid_tracked(e->tgid, &ti))
-		return resolve_rule_name(ti.rule_id);
-	if (e->ppid > 0 && is_pid_tracked(e->ppid, &ti))
-		return resolve_rule_name(ti.rule_id);
+	struct proc_info pi;
+	if (is_pid_in_proc_map(e->tgid, &pi))
+		return resolve_rule_name(pi.rule_id);
+	if (e->ppid > 0 && is_pid_in_proc_map(e->ppid, &pi))
+		return resolve_rule_name(pi.rule_id);
 	return RULE_NOT_MATCH;
 }
 
@@ -1126,7 +1105,7 @@ static void fill_proc_info_from_event(struct proc_info *pi, const struct event *
  *
  * Поля, которые НЕ заполняются (специфичны для типа события):
  *   - timestamp_ns, event_type, rule, tags — заполняются обработчиком
- *   - pid, root_pid — заполняются из BPF-события или tracked_map
+ *   - pid, root_pid — заполняются из BPF-события или proc_map
  *   - cgroup — резолвится отдельно через resolve_cgroup_*
  *   - file_*, net_local/remote_*, sig_*, sec_* — специфичны для типа
  *   - pwd, parent_pids — заполняются отдельными вызовами
@@ -1232,20 +1211,6 @@ void fill_from_proc_info(struct metric_event *cev,
 	fill_metrics_from_proc_info(cev, pi);
 }
 
-/*
- * Заполняет metric_event из track_info (tracked_map).
- * Устанавливает rule, root_pid, is_root.
- * tracked=0 означает процесс не в tracked_map — rule остаётся RULE_NOT_MATCH.
- */
-void fill_from_track_info(struct metric_event *cev, const struct track_info *ti, int tracked)
-{
-	if (tracked && ti) {
-		cev->root_pid = ti->root_pid;
-		cev->is_root = ti->is_root;
-		if (ti->rule_id < num_rules)
-			snprintf(cev->rule, sizeof(cev->rule), "%s", rules[ti->rule_id].name);
-	}
-}
 
 /* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
  *
@@ -1433,8 +1398,8 @@ static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid, __u8 is_
 /*
  * Попытка начать отслеживание неизвестного PID через чтение /proc/<pid>/cmdline.
  * Вызывается, когда file_close/net_close/oom_kill/exit приходит для PID,
- * которого нет в tracked_map. Читает cmdline, сопоставляет со всеми правилами
- * и добавляет в tracked_map + хеш-таблицу тегов при совпадении.
+ * которого нет в proc_map. Читает cmdline, сопоставляет со всеми правилами
+ * и добавляет в proc_map + хеш-таблицу тегов при совпадении.
  * Возвращает индекс первого совпавшего правила или -1, если нет совпадения / процесс завершён.
  */
 int try_track_pid(__u32 pid)
@@ -3118,16 +3083,18 @@ struct scan_entry {
 };
 
 /*
- * Начать отслеживание процесса: создать запись в tracked_map.
+ * Начать отслеживание процесса: обновить tracking-поля в proc_map.
+ * Если запись в proc_map уже есть — обновляет поля.
  */
 static void start_tracking(__u32 pid, int rule_id, __u32 root_pid, __u8 is_root)
 {
-	struct track_info ti = {
-	    .root_pid = root_pid,
-	    .rule_id = (__u16)rule_id,
-	    .is_root = is_root,
-	};
-	bpf_map_update_elem(tracked_map_fd, &pid, &ti, BPF_ANY);
+	struct proc_info pi;
+	if (bpf_map_lookup_elem(proc_map_fd, &pid, &pi) == 0) {
+		pi.root_pid = root_pid;
+		pi.rule_id = (__u16)rule_id;
+		pi.is_root = is_root;
+		bpf_map_update_elem(proc_map_fd, &pid, &pi, BPF_ANY);
+	}
 }
 
 static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid, __u8 is_root)
@@ -3141,6 +3108,9 @@ static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid, __u8 is_
 	pi.cmdline_len = (__u16)read_proc_cmdline(pid, pi.cmdline, CMDLINE_MAX);
 	pi.cgroup_id = read_proc_cgroup_id(pid);
 	pi.oom_score_adj = read_proc_oom(pid);
+	pi.root_pid = root_pid;
+	pi.rule_id = (__u16)rule_id;
+	pi.is_root = is_root;
 	bpf_map_update_elem(proc_map_fd, &pid, &pi, BPF_ANY);
 
 	/* Заполняем pwd-кэш через readlink /proc/PID/cwd */
@@ -3154,9 +3124,8 @@ static void add_descendants(struct scan_entry *entries, int count, __u32 parent,
 		if (entries[i].ppid != parent)
 			continue;
 		__u32 child = entries[i].pid;
-		/* Пропускаем, если уже отслеживается */
-		struct track_info ti;
-		if (is_pid_tracked(child, &ti))
+		/* Пропускаем, если уже в proc_map */
+		if (is_pid_in_proc_map(child, NULL))
 			continue;
 		track_pid_from_proc(child, rule_id, root_pid, 0);
 		tags_inherit_ts(child, parent);
@@ -3167,7 +3136,7 @@ static void add_descendants(struct scan_entry *entries, int count, __u32 parent,
 
 /* ── seed_sock_map: заполнение sock_map существующими сокетами ─────── */
 /*
- * После initial_scan tracked_map содержит все отслеживаемые PID.
+ * После initial_scan proc_map содержит все отслеживаемые PID.
  * Для каждого из них сканируем /proc/<pid>/fd/ и находим socket-inode'ы.
  * Затем запускаем BPF iter/tcp, который для каждого TCP-сокета ядра
  * проверяет inode в seed_inode_map и добавляет найденные в sock_map.
@@ -3181,12 +3150,12 @@ static void seed_sock_map(void)
 	if (seed_fd < 0)
 		return;
 
-	/* Проход по tracked_map → для каждого PID сканируем /proc/<pid>/fd/ */
+	/* Проход по proc_map → для каждого PID сканируем /proc/<pid>/fd/ */
 	__u32 key = 0, next_key;
 	int seeded = 0;
 	int seed_iter = 0;
 
-	while (bpf_map_get_next_key(tracked_map_fd, &key, &next_key) == 0 && seed_iter++ < MAX_PROCS) {
+	while (bpf_map_get_next_key(proc_map_fd, &key, &next_key) == 0 && seed_iter++ < MAX_PROCS) {
 		key = next_key;
 		__u32 pid = key;
 
@@ -3379,13 +3348,6 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct file_event *fe = data;
 
-		/* Lookup tracked_map. Для FILE_CLOSE допускаем отсутствие —
-		 * процесс мог завершиться до обработки close из ring buffer. */
-		struct track_info ti;
-		int tracked = is_pid_tracked(fe->tgid, &ti);
-		if (should_skip_untracked(type, tracked))
-			return 0;
-
 		LOG_DEBUG(cfg.log_level,
 			  "FILE: pid=%u type=%s path=%.60s "
 			  "read=%llu write=%llu opens=%u",
@@ -3408,9 +3370,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 	 *
 	 * Второе по частоте событие (~9/сек). Оптимизирован аналогично FILE_CLOSE.
 	 *
-	 * ВАЖНО: BPF-сторона (tcp_connect/accept) НЕ фильтрует по tracked_map —
+	 * ВАЖНО: BPF-сторона (tcp_connect/accept) НЕ фильтрует по proc_map —
 	 * события приходят для ВСЕХ процессов на хосте. Фильтрация выполняется
-	 * здесь одним bpf_map_lookup_elem: если PID не в tracked_map — пропускаем.
+	 * здесь одним bpf_map_lookup_elem: если PID не в proc_map — пропускаем.
 	 */
 	if (is_net_event(type)) {
 		/* emit guard */
@@ -3419,20 +3381,12 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct net_event *ne = data;
 
-		/* Lookup tracked_map. Для NET_CLOSE допускаем отсутствие —
-		 * процесс мог завершиться (handle_exit удалил tracked_map)
-		 * до обработки net_close из ring buffer. */
-		struct track_info ti;
-		int tracked = is_pid_tracked(ne->tgid, &ti);
-		if (should_skip_untracked(type, tracked))
-			return 0;
-
 		if (should_emit_event(type)) {
 			const char *net_evt = event_type_name(type);
 			LOG_DEBUG(cfg.log_level,
 				  "%s: pid=%u rule=%s port=%u→%u "
 				  "tx=%llu rx=%llu dur=%llums",
-				  net_evt, ne->tgid, resolve_rule_tracked(&ti, tracked),
+				  net_evt, ne->tgid, resolve_rule_for_pid(ne->tgid),
 				  ne->local_port, ne->remote_port, (unsigned long long)ne->tx_bytes,
 				  (unsigned long long)ne->rx_bytes,
 				  (unsigned long long)(ne->duration_ns / NS_PER_MS));
@@ -3477,7 +3431,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	/* ── TCP_RETRANSMIT — повторная передача TCP-сегмента ────────────
 	 *
 	 * Редкое событие. Симптом потери пакетов, перегрузки сети или DDoS.
-	 * НЕ фильтруется по tracked_map — захватывает ВСЕ соединения на хосте.
+	 * НЕ фильтруется по proc_map — захватывает ВСЕ соединения на хосте.
 	 */
 	if (is_retransmit_event(type)) {
 		if (size < sizeof(struct retransmit_event))
@@ -3501,7 +3455,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	/* ── SYN_RECV — входящий SYN-запрос (полу-открытое соединение) ───
 	 *
 	 * Редкое событие. Полезно для обнаружения SYN flood атак.
-	 * НЕ фильтруется по tracked_map — захватывает ВСЕ входящие SYN.
+	 * НЕ фильтруется по proc_map — захватывает ВСЕ входящие SYN.
 	 */
 	if (is_syn_event(type)) {
 		if (size < sizeof(struct syn_event))
@@ -3525,7 +3479,7 @@ static int handle_event(void *ctx, void *data, size_t size)
 	/* ── RST — отправка/получение TCP RST пакета ────────────────────
 	 *
 	 * Редкое событие. Много RST = сканирование портов или обрыв соединений.
-	 * НЕ фильтруется по tracked_map — захватывает ВСЕ RST на хосте.
+	 * НЕ фильтруется по proc_map — захватывает ВСЕ RST на хосте.
 	 * Поле direction: 0 = отправлен (sent), 1 = получен (recv).
 	 */
 	if (is_rst_event(type)) {
@@ -3557,9 +3511,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Обновляем глобальное дерево pid (exec может быть первым появлением) */
 		pidtree_store_ts(e->tgid, e->ppid);
 
-		/* Уже отслеживается? BPF обновил proc_info, нам делать нечего */
-		struct track_info ti;
-		if (is_pid_tracked(e->tgid, &ti))
+		/* Уже в proc_map? BPF обновил proc_info, нам делать нечего */
+		if (is_pid_in_proc_map(e->tgid, NULL))
 			return 0;
 
 		/* Преобразуем cmdline из BPF (нуль-разделённые аргументы) в строку */
@@ -3602,11 +3555,8 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Обновляем глобальное дерево pid (покрывает ВСЕ процессы) */
 		pidtree_store_ts(e->tgid, e->ppid);
 
-		/* BPF handle_fork уже создал tracked_map и proc_info записи.
-		 * Здесь только наследуем tags (они живут в userspace hash table). */
-		struct track_info parent_ti;
-		if (!is_pid_tracked(e->ppid, &parent_ti))
-			return 0;
+		/* BPF handle_fork уже создал proc_info запись.
+		 * Здесь наследуем tags (они живут в userspace hash table). */
 
 		tags_inherit_ts(e->tgid, e->ppid);
 		pwd_inherit_ts(e->tgid, e->ppid);
@@ -3983,7 +3933,7 @@ int main(int argc, char *argv[])
 
 	/* ── Условное отключение process_tracking emit_* ───────────── *
 	 * exec/fork/exit/sched_switch НЕЛЬЗЯ отключать: они управляют
-	 * proc_map/tracked_map (core tracking pipeline).
+	 * proc_map/proc_map (core tracking pipeline).
 	 * signal и chdir не имеют побочных эффектов — безопасны. */
 	if (!cfg.emit.signal)
 		BPF_PROG_DISABLE(skel->progs.handle_signal_generate);
@@ -4092,7 +4042,6 @@ int main(int argc, char *argv[])
 	}
 
 	/* Получение файловых дескрипторов карт */
-	tracked_map_fd = bpf_map__fd(skel->maps.tracked_map);
 	proc_map_fd = bpf_map__fd(skel->maps.proc_map);
 	missed_exec_fd = bpf_map__fd(skel->maps.missed_exec_map);
 
@@ -4141,8 +4090,7 @@ int main(int argc, char *argv[])
 	{
 		__u32 del_key;
 		int cleaned = 0;
-		while (bpf_map_get_next_key(tracked_map_fd, NULL, &del_key) == 0) {
-			bpf_map_delete_elem(tracked_map_fd, &del_key);
+		while (bpf_map_get_next_key(proc_map_fd, NULL, &del_key) == 0) {
 			bpf_map_delete_elem(proc_map_fd, &del_key);
 			cleaned++;
 		}
@@ -4218,8 +4166,7 @@ int main(int argc, char *argv[])
 
 			/* Очистка всего отслеживания — удаляем с начала каждый раз */
 			__u32 del_key;
-			while (bpf_map_get_next_key(tracked_map_fd, NULL, &del_key) == 0) {
-				bpf_map_delete_elem(tracked_map_fd, &del_key);
+			while (bpf_map_get_next_key(proc_map_fd, NULL, &del_key) == 0) {
 				bpf_map_delete_elem(proc_map_fd, &del_key);
 			}
 
@@ -4244,7 +4191,7 @@ int main(int argc, char *argv[])
 		/* Периодическое обновление: тяжёлый I/O (cmdline, cgroup sysfs,
 		 * kill-проверка, flush udp/icmp/disk).
 		 *
-		 * Адаптивный интервал: при высокой заполненности tracked_map
+		 * Адаптивный интервал: при высокой заполненности proc_map
 		 * увеличиваем интервал, чтобы дать write_snapshot время
 		 * на cleanup и не тратить CPU на итерацию мёртвых записей. */
 		if (cfg.refresh_enabled) {

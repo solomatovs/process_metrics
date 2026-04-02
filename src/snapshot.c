@@ -48,14 +48,7 @@ static int should_emit_conn_snapshot(void)
 	return cfg.net_tracking_enabled && cfg.http.enabled;
 }
 
-/*
- * Проверяет, нужно ли включать соединение в conn_snapshot.
- * CLOSED: записываем даже если процесс не в tracked_map (короткоживущий).
- */
-static int should_include_conn(int tracked, __u8 sock_status)
-{
-	return tracked || sock_status == SOCK_STATUS_CLOSED;
-}
+
 
 /* ── snapshot-only helpers ───────────────────────────────────────── */
 
@@ -125,7 +118,7 @@ void snapshot_reset(void)
 void write_snapshot(void)
 {
 	/* ── Восстановление после ring buffer drop на FORK ────────────
-	 * BPF handle_fork создаёт tracked_map + proc_map ДО резервирования
+	 * BPF handle_fork создаёт proc_map запись ДО резервирования
 	 * ring buffer. Если bpf_ringbuf_reserve не удался, userspace не
 	 * получил fork-событие и не вызвал pidtree_store_ts / tags_inherit_ts /
 	 * pwd_inherit_ts. Детектируем это по отсутствию pid в pidtree
@@ -134,10 +127,10 @@ void write_snapshot(void)
 	{
 		__u32 key;
 		int fork_rec_iter = 0;
-		int err = bpf_map_get_next_key(tracked_map_fd, NULL, &key);
+		int err = bpf_map_get_next_key(proc_map_fd, NULL, &key);
 		while (err == 0 && fork_rec_iter++ < MAX_PROCS) {
 			__u32 next;
-			int next_err = bpf_map_get_next_key(tracked_map_fd, &key, &next);
+			int next_err = bpf_map_get_next_key(proc_map_fd, &key, &next);
 
 			/* Быстрая проверка: есть ли pid в pidtree? */
 			pthread_rwlock_rdlock(&g_pidtree_lock);
@@ -252,15 +245,8 @@ void write_snapshot(void)
 				continue;
 		}
 
-		struct track_info ti;
-		int tracked = is_pid_tracked(key, &ti);
-
+		int tracked = (pi.rule_id != RULE_ID_NONE);
 		int is_exited = (pi.status != PROC_STATUS_ALIVE);
-
-		/* EXITED: записываем snapshot даже если handle_exit
-		 * уже удалил из tracked_map (короткоживущий процесс). */
-		if (!tracked && !is_exited)
-			continue;
 
 		/* Завершённые → в dead_keys, но НЕ пропускаются.
 		 * При переполнении буфера — flush и продолжаем сбор. */
@@ -272,7 +258,9 @@ void write_snapshot(void)
 			dead_keys[dead_count++] = key;
 		}
 
-		const char *rule_name = resolve_rule_tracked(&ti, tracked);
+		const char *rule_name = (tracked && pi.rule_id < num_rules)
+					    ? rules[pi.rule_id].name
+					    : RULE_NOT_MATCH;
 
 		/* Вычисление времён */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
@@ -301,7 +289,8 @@ void write_snapshot(void)
 				else
 					ensure_tags(key, cev.tags, sizeof(cev.tags));
 			}
-			fill_from_track_info(&cev, &ti, tracked);
+			cev.root_pid = pi.root_pid;
+			cev.is_root = pi.is_root;
 			fill_from_proc_info(&cev, &pi);
 			fill_cgroup(&cev, pi.cgroup_id);
 			fill_cgroup_metrics(&cev);
@@ -350,16 +339,20 @@ void write_snapshot(void)
 			struct sock_info si;
 			if (bpf_map_lookup_elem(sm_fd, &sk_key, &si) == 0) {
 
-				struct track_info ti;
-				int tracked =
-				    bpf_map_lookup_elem(tracked_map_fd, &si.tgid, &ti) == 0;
-				if (should_include_conn(tracked, si.status)) {
+				{
 					struct metric_event cev;
 					memset(&cev, 0, sizeof(cev));
 					cev.timestamp_ns = snap_timestamp_ns;
 					fast_strcpy(cev.event_type, sizeof(cev.event_type),
 						    "conn_snapshot");
-					fill_from_track_info(&cev, &ti, tracked);
+					struct proc_info conn_pi;
+					if (bpf_map_lookup_elem(proc_map_fd, &si.tgid, &conn_pi) == 0) {
+						cev.root_pid = conn_pi.root_pid;
+						cev.is_root = conn_pi.is_root;
+						if (conn_pi.rule_id < num_rules)
+							fill_rule(&cev, rules[conn_pi.rule_id].name);
+						fill_from_proc_info(&cev, &conn_pi);
+					}
 					{
 						const char *cs_tags =
 						    tags_lookup_copy(snap_tgid, snap_data, si.tgid);
@@ -370,9 +363,6 @@ void write_snapshot(void)
 							ensure_tags(si.tgid, cev.tags,
 								    sizeof(cev.tags));
 					}
-					struct proc_info cpi;
-					if (bpf_map_lookup_elem(proc_map_fd, &si.tgid, &cpi) == 0)
-						fill_from_proc_info(&cev, &cpi);
 
 					fill_from_sock_info(&cev, &si, boot_ns);
 
@@ -481,8 +471,7 @@ void write_snapshot(void)
 				__u32 pid = pt_pid[i];
 				if (pid == 0)
 					continue;
-				struct track_info ti_gc;
-				if (is_pid_tracked(pid, &ti_gc))
+				if (is_pid_in_proc_map(pid, NULL))
 					continue;
 				if (kill((pid_t)pid, 0) == 0 || errno != ESRCH)
 					continue;

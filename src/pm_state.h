@@ -31,7 +31,6 @@ extern int num_rules;
 
 struct process_metrics_bpf;
 extern struct process_metrics_bpf *skel;
-extern int tracked_map_fd;
 extern int proc_map_fd;
 extern int missed_exec_fd;
 

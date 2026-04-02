@@ -46,10 +46,7 @@ void fill_rule(struct metric_event *cev, const char *rname);
 void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
-void fill_from_track_info(struct metric_event *cev, const struct track_info *ti,
-			  int tracked);
 void fill_from_sock_info(struct metric_event *cev, const struct sock_info *si, __u64 boot_ns);
-void fill_track_info_for_pid(struct metric_event *cev, __u32 tgid);
 void fill_tags(struct metric_event *cev, __u32 tgid);
 void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
 void fill_cgroup_metrics(struct metric_event *cev);
@@ -73,9 +70,9 @@ void pidtree_remove(__u32 pid);
 /* ── PWD ─────────────────────────────────────────────────────────── */
 void pwd_inherit_ts(__u32 child, __u32 parent);
 
-/* ── Tracked ─────────────────────────────────────────────────────── */
-int is_pid_tracked(__u32 tgid, struct track_info *ti);
-const char *resolve_rule_tracked(const struct track_info *ti, int tracked);
+/* ── Proc map ────────────────────────────────────────────────────── */
+int is_pid_in_proc_map(__u32 tgid, struct proc_info *pi);
+const char *resolve_rule_for_pid(__u32 tgid);
 
 /* ── CPU prev cache ──────────────────────────────────────────────── */
 __u64 cpu_prev_lookup(__u32 tgid);

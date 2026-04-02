@@ -11,7 +11,7 @@
  *
  * Карты (maps):
  *   proc_map    — метрики процессов в реальном времени (hash: tgid → proc_info)
- *   tracked_map — метаданные отслеживания            (hash: tgid → track_info)
+ *   (tracked_map удалена — tracking-поля перенесены в proc_info)
  *   events_proc — кольцевой буфер событий жизненного цикла процессов
  *
  * Пространство пользователя управляет решениями об отслеживании (сопоставление правил exec).
@@ -91,13 +91,6 @@ struct {
 	__type(value, struct proc_info);
 } proc_map SEC(".maps");
 
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, MAX_PROCS);
-	__type(key, __u32);
-	__type(value, struct track_info);
-} tracked_map SEC(".maps");
-
 /* Ring buffer для событий процессов: fork/exec/exit/oom_kill (struct event) */
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -153,7 +146,7 @@ struct {
  * tid_tgid_map: TID → {TGID, comm} mapping для резолвинга имён потоков
  * в имена основных процессов при preemption tracking.
  *
- * Заполняется в sched_switch для ВСЕХ процессов (до проверки tracked_map),
+ * Заполняется в sched_switch для ВСЕХ процессов (до проверки proc_map),
  * позволяя определить реального владельца потока-вытеснителя.
  * Например: ThreadPool(TID) → clickhouse-serv(TGID).
  *
@@ -642,10 +635,6 @@ int handle_exec(void *ctx)
 	if (tgid == 0)
 		return 0;
 
-	/* Ограничение частоты событий exec во избежание переполнения кольцевого буфера */
-	if (!exec_rate_check())
-		return 0;
-
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
 	/* Если уже отслеживается (унаследовано через fork), обновляем
@@ -732,30 +721,10 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 
 	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
 
-	/* Уведомляем пространство пользователя только если родитель отслеживается */
-	struct track_info *parent_ti = bpf_map_lookup_elem(&tracked_map, &parent_tgid);
-	if (!parent_ti)
-		return 0;
-
-	/* Создаём tracked_map запись для потомка прямо в BPF,
-	 * чтобы handle_exec мог найти proc_info до обработки в userspace.
-	 * Без этого возникает гонка: exec потомка может сработать раньше,
-	 * чем userspace прочитает fork-событие из ring buffer и добавит
-	 * запись в tracked_map — тогда exec будет пропущен. */
-	struct track_info child_ti;
-	BPF_ZERO(child_ti);
-	child_ti.root_pid = parent_ti->root_pid;
-	child_ti.rule_id = parent_ti->rule_id;
-	child_ti.is_root = 0;
-	/* BPF_NOEXIST: если карта полна (-E2BIG) — не отслеживаем ребёнка.
-	 * Это защита от fork storm'ов: при переполнении tracked_map
-	 * новые короткоживущие процессы не добавляются, что позволяет
-	 * userspace cleanup дренировать карту. */
-	if (bpf_map_update_elem(&tracked_map, &child_tgid, &child_ti, BPF_NOEXIST) != 0)
-		return 0;
-
 	/* Создаём proc_info для потомка через per-CPU scratch buffer
-	 * (proc_info превышает 512-байтовый лимит стека BPF) */
+	 * (proc_info превышает 512-байтовый лимит стека BPF).
+	 * BPF_NOEXIST на proc_map — защита от fork storm'ов:
+	 * при переполнении новые процессы не добавляются. */
 	__u32 scratch_key = 0;
 	struct proc_info *child_pi = bpf_map_lookup_elem(&scratch_pi, &scratch_key);
 	if (!child_pi)
@@ -767,6 +736,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	child_pi->uid = (__u32)bpf_get_current_uid_gid();
 	child_pi->cgroup_id = bpf_get_current_cgroup_id();
 	child_pi->start_ns = BPF_CORE_READ(child, start_time);
+	child_pi->rule_id = RULE_ID_NONE;
 	read_comm_and_thread(child_pi->comm, sizeof(child_pi->comm), child_pi->thread_name,
 			     sizeof(child_pi->thread_name));
 
@@ -777,11 +747,16 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	read_ns_inums(parent, &child_pi->mnt_ns_inum, &child_pi->pid_ns_inum,
 		      &child_pi->net_ns_inum, &child_pi->cgroup_ns_inum);
 
+	/* Наследуем tracking-метаданные и cmdline из proc_info родителя (если есть) */
 	struct proc_info *parent_pi = bpf_map_lookup_elem(&proc_map, &parent_tgid);
 	if (parent_pi) {
+		child_pi->root_pid = parent_pi->root_pid;
+		child_pi->rule_id = parent_pi->rule_id;
+		child_pi->is_root = 0;
 		_bpf_copy(child_pi->cmdline, parent_pi->cmdline, CMDLINE_MAX);
 		child_pi->cmdline_len = parent_pi->cmdline_len;
 	}
+
 	bpf_map_update_elem(&proc_map, &child_tgid, child_pi, BPF_NOEXIST);
 
 	RB_STAT_TOTAL_PROC();
@@ -802,7 +777,8 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
 	e->cgroup_id = child_pi->cgroup_id;
 	e->start_ns = child_pi->start_ns;
-	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
+	__builtin_memcpy(e->comm, child_pi->comm, sizeof(e->comm));
+	__builtin_memcpy(e->thread_name, child_pi->thread_name, sizeof(e->thread_name));
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -842,7 +818,7 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 
 	/*
 	 * Обновляем tid_tgid_map для текущего (prev) процесса ДО проверки
-	 * tracked_map: нужно знать TGID+comm всех процессов в системе,
+	 * proc_map: нужно знать TGID+comm всех процессов в системе,
 	 * чтобы резолвить имена потоков-вытеснителей.
 	 *
 	 * Обновляем только если TID != TGID (т.е. это дочерний поток),
@@ -865,15 +841,37 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		}
 	}
 
-	/* Быстрый выход для неотслеживаемых PID */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
-
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (!info)
-		return 0;
-
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* Если процесса нет в proc_map — создаём минимальную запись.
+	 * Это catch-all: процессы, пропущенные fork/exec/initial_scan,
+	 * попадают в proc_map при первом sched_switch. */
+	if (!info) {
+		__u32 sk = 0;
+		struct proc_info *new_pi = bpf_map_lookup_elem(&scratch_pi, &sk);
+		if (!new_pi)
+			return 0;
+		BPF_ZERO_PTR(new_pi, sizeof(*new_pi));
+		new_pi->tgid = tgid;
+		new_pi->ppid = BPF_CORE_READ(task, real_parent, tgid);
+		new_pi->uid = (__u32)bpf_get_current_uid_gid();
+		new_pi->cgroup_id = bpf_get_current_cgroup_id();
+		new_pi->start_ns = BPF_CORE_READ(task, start_time);
+		new_pi->rule_id = RULE_ID_NONE;
+		read_comm_and_thread(new_pi->comm, sizeof(new_pi->comm),
+				     new_pi->thread_name, sizeof(new_pi->thread_name));
+		read_identity(task, &new_pi->loginuid, &new_pi->sessionid, &new_pi->euid);
+		new_pi->tty_nr = read_tty_nr(task);
+		new_pi->sched_policy = BPF_CORE_READ(task, policy);
+		read_ns_inums(task, &new_pi->mnt_ns_inum, &new_pi->pid_ns_inum,
+			      &new_pi->net_ns_inum, &new_pi->cgroup_ns_inum);
+		if (bpf_map_update_elem(&proc_map, &tgid, new_pi, BPF_NOEXIST) != 0)
+			return 0;
+		info = bpf_map_lookup_elem(&proc_map, &tgid);
+		if (!info)
+			return 0;
+	}
 
 	/* Память (страницы) — RSS, разделяемая, подкачка */
 	struct mem_info mi = read_mem_pages(task);
@@ -999,11 +997,6 @@ int handle_exit(void *ctx)
 	if (pid != tgid)
 		bpf_map_delete_elem(&tid_tgid_map, &pid);
 
-	/* Только для отслеживаемых процессов */
-	struct track_info *ti = bpf_map_lookup_elem(&tracked_map, &tgid);
-	if (!ti)
-		return 0;
-
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
 	/* Финальная дельта CPU для этого потока + cleanup thread_cpu_map */
@@ -1030,26 +1023,19 @@ int handle_exit(void *ctx)
 	__u32 final_exit_code = BPF_CORE_READ(task, exit_code);
 	__u64 exit_ts = bpf_ktime_get_boot_ns();
 
-	/* Финальные метрики из proc_info. Карты удаляются ПОСЛЕ отправки
-	 * exit-события, чтобы не инвалидировать указатель info. */
+	/* Safety: без proc_info нет данных для exit-события.
+	 * В нормальном режиме не срабатывает — sched_switch создаёт
+	 * proc_info для всех процессов. */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (info) {
-		info->status = PROC_STATUS_EXITED;
-		info->exit_ns = exit_ts;
-		info->exit_code = final_exit_code;
-		info->rss_pages = exit_mi.rss_pages;
-		info->vsize_pages = final_vsize;
-		info->threads = final_threads;
-		info->oom_score_adj = final_oom_adj;
-	}
-
-	/* Удаляем карты ДО резервирования ring buffer.
-	 * При fork storm ring buffer переполняется, reserve возвращает NULL,
-	 * и если delete после reserve — записи остаются навсегда (65K EXITED).
-	 * Указатель info (из proc_map lookup) остаётся валидным до delete,
-	 * поэтому удаляем tracked_map первой, а proc_map — после заполнения
-	 * события данными из info. */
-	bpf_map_delete_elem(&tracked_map, &tgid);
+	if (!info)
+		return 0;
+	info->status = PROC_STATUS_EXITED;
+	info->exit_ns = exit_ts;
+	info->exit_code = final_exit_code;
+	info->rss_pages = exit_mi.rss_pages;
+	info->vsize_pages = final_vsize;
+	info->threads = final_threads;
+	info->oom_score_adj = final_oom_adj;
 
 	/* Отправляем событие EXIT в ring buffer */
 	RB_STAT_TOTAL_PROC();
@@ -1067,9 +1053,9 @@ int handle_exit(void *ctx)
 	e->timestamp_ns = exit_ts;
 	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
 
-	/* Данные отслеживания */
-	e->root_pid = ti->root_pid;
-	e->rule_id = ti->rule_id;
+	/* Данные отслеживания (из proc_info) */
+	e->root_pid = info->root_pid;
+	e->rule_id = info->rule_id;
 
 	/* Финальные метрики */
 	e->rss_pages = exit_mi.rss_pages;
@@ -1079,40 +1065,37 @@ int handle_exit(void *ctx)
 	e->exit_code = final_exit_code;
 
 	/* Накопленные метрики из proc_info */
-	if (info) {
-		e->cpu_ns = info->cpu_ns;
-		e->rss_min_pages = info->rss_min_pages;
-		e->rss_max_pages = info->rss_max_pages;
-		e->start_ns = info->start_ns;
-		e->cgroup_id = info->cgroup_id;
-		e->ppid = info->ppid;
-		e->cmdline_len = info->cmdline_len;
-		e->oom_killed = info->oom_killed;
-		e->net_tcp_tx_bytes = info->net_tcp_tx_bytes;
-		e->net_tcp_rx_bytes = info->net_tcp_rx_bytes;
-		e->net_udp_tx_bytes = info->net_udp_tx_bytes;
-		e->net_udp_rx_bytes = info->net_udp_rx_bytes;
-		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
+	e->cpu_ns = info->cpu_ns;
+	e->rss_min_pages = info->rss_min_pages;
+	e->rss_max_pages = info->rss_max_pages;
+	e->start_ns = info->start_ns;
+	e->cgroup_id = info->cgroup_id;
+	e->ppid = info->ppid;
+	e->cmdline_len = info->cmdline_len;
+	e->oom_killed = info->oom_killed;
+	e->net_tcp_tx_bytes = info->net_tcp_tx_bytes;
+	e->net_tcp_rx_bytes = info->net_tcp_rx_bytes;
+	e->net_udp_tx_bytes = info->net_udp_tx_bytes;
+	e->net_udp_rx_bytes = info->net_udp_rx_bytes;
+	_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
 
-		e->loginuid = info->loginuid;
-		e->sessionid = info->sessionid;
-		e->euid = info->euid;
-		e->tty_nr = info->tty_nr;
-		e->sched_policy = info->sched_policy;
-		e->io_rchar = info->io_rchar;
-		e->io_wchar = info->io_wchar;
-		e->io_syscr = info->io_syscr;
-		e->io_syscw = info->io_syscw;
-		e->mnt_ns_inum = info->mnt_ns_inum;
-		e->pid_ns_inum = info->pid_ns_inum;
-		e->net_ns_inum = info->net_ns_inum;
-		e->cgroup_ns_inum = info->cgroup_ns_inum;
-	}
+	e->loginuid = info->loginuid;
+	e->sessionid = info->sessionid;
+	e->euid = info->euid;
+	e->tty_nr = info->tty_nr;
+	e->sched_policy = info->sched_policy;
+	e->io_rchar = info->io_rchar;
+	e->io_wchar = info->io_wchar;
+	e->io_syscr = info->io_syscr;
+	e->io_syscw = info->io_syscw;
+	e->mnt_ns_inum = info->mnt_ns_inum;
+	e->pid_ns_inum = info->pid_ns_inum;
+	e->net_ns_inum = info->net_ns_inum;
+	e->cgroup_ns_inum = info->cgroup_ns_inum;
 
 	bpf_ringbuf_submit(e, 0);
 
-	/* proc_map удаляем после submit — info указатель использовался выше.
-	 * tracked_map уже удалена перед reserve. */
+	/* proc_map удаляем после submit — info указатель использовался выше. */
 	bpf_map_delete_elem(&proc_map, &tgid);
 
 	return 0;
@@ -1130,11 +1113,6 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	struct task_struct *task = (struct task_struct *)ctx->args[0];
 	__u32 tgid = BPF_CORE_READ(task, tgid);
 
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
-
-	/* Помечаем в proc_info */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (info)
 		info->oom_killed = 1;
@@ -1216,11 +1194,6 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	__u32 sender_tgid = (__u32)(pid_tgid >> 32);
 	__u32 target_tgid = (__u32)target_pid;
 
-	/* Отправляем событие, если отправитель ИЛИ получатель отслеживается */
-	if (!bpf_map_lookup_elem(&tracked_map, &sender_tgid) &&
-	    !bpf_map_lookup_elem(&tracked_map, &target_tgid))
-		return 0;
-
 	/* Резервируем место в ring buffer для события.
 	 * Если буфер полон — событие дропается, счётчик drop_proc инкрементируется. */
 	RB_STAT_TOTAL_PROC();
@@ -1266,8 +1239,6 @@ int handle_sys_exit_chdir(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
@@ -1289,8 +1260,6 @@ int handle_sys_exit_fchdir(struct trace_event_raw_sys_exit *ctx)
 		return 0;
 
 	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
@@ -1479,11 +1448,7 @@ int handle_openat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
-
-	/* Кумулятивный счётчик file_opens — считаем ВСЕ openat
-	 * tracked-процесса, до фильтров (характеристика нагрузки). */
+	/* Кумулятивный счётчик file_opens (характеристика нагрузки). */
 	{
 		struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
 		if (pi)
@@ -1589,8 +1554,6 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -1653,8 +1616,6 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -1718,8 +1679,6 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -1770,8 +1729,6 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -2260,8 +2217,6 @@ int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	const char *filename = (const char *)ctx->args[1];
 	__u32 mode = (__u32)ctx->args[2];
@@ -2297,8 +2252,6 @@ int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	const char *filename = (const char *)ctx->args[1];
 	__u32 uid = (__u32)ctx->args[2];
@@ -2522,9 +2475,6 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	struct sock_info si;
 	BPF_ZERO(si);
@@ -2576,9 +2526,6 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	struct sock_info si;
 	BPF_ZERO(si);
@@ -2614,9 +2561,6 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u64 sk_ptr = (__u64)sk;
 
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	struct sock_info si;
 	BPF_ZERO(si);
@@ -2648,9 +2592,6 @@ int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Только для отслеживаемых процессов */
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	__u64 sk_ptr = (__u64)sk;
 	struct sock_info si;
@@ -3482,9 +3423,6 @@ SEC("tracepoint/syscalls/sys_enter_socket")
 int handle_socket_enter(struct trace_event_raw_sys_enter *ctx)
 {
 	__u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-
-	if (!bpf_map_lookup_elem(&tracked_map, &tgid))
-		return 0;
 
 	struct proc_info *pi = bpf_map_lookup_elem(&proc_map, &tgid);
 	if (pi)

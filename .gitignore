@@ -15,5 +15,3 @@ src/*.skel.h
 *.swp
 *.swo
 *~
-.vscode/
-.idea/

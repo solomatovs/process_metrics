@@ -249,7 +249,7 @@ int emit_disk_usage_events(__u64 timestamp_ns, const char *hostname)
 /*
  * flush_dead_keys — пакетное удаление мёртвых процессов из BPF-карт и userspace-кэшей.
  *
- * Использует bpf_map_delete_batch для удаления из tracked_map и proc_map
+ * Использует bpf_map_delete_batch для удаления из proc_map и proc_map
  * за 2 syscall вместо 2*count. Если batch delete не поддерживается ядром
  * (< 5.6), fallback на поштучное удаление.
  *
@@ -265,16 +265,11 @@ int flush_dead_keys(__u32 *keys, int count)
 	 * BPF handle_exit) batch может вернуть частичный результат —
 	 * это нормально, дочищаем остаток поштучно.
 	 *
-	 * Порядок: сначала proc_map, потом tracked_map.
+	 * Порядок: сначала proc_map, потом proc_map.
 	 * proc_map — источник ключей для refresh iteration (batch read),
-	 * tracked_map — lookup по ключу. Если proc_map удалён а
-	 * tracked_map нет — tracked_map "сирота" без последствий
-	 * (cleanup через write_snapshot). Если наоборот — proc_map
-	 * запись без tracked_map вызывает kill→ESRCH→delete loop. */
+	 * proc_map — единственная карта отслеживания. */
 	for (int i = 0; i < count; i++)
 		bpf_map_delete_elem(proc_map_fd, &keys[i]);
-	for (int i = 0; i < count; i++)
-		bpf_map_delete_elem(tracked_map_fd, &keys[i]);
 
 	/* Userspace-кэши */
 	for (int i = 0; i < count; i++) {
@@ -318,7 +313,7 @@ void refresh_processes(void)
 				pidtree_store_ts(tgid, ppid);
 				/* try_track_pid читает /proc/pid/cmdline,
 				 * сопоставляет с правилами и при совпадении
-				 * создаёт tracked_map + proc_info + tags */
+				 * создаёт proc_map + proc_info + tags */
 				int rule = try_track_pid(tgid);
 				if (rule >= 0) {
 					pwd_read_and_store(tgid);

@@ -261,14 +261,13 @@ stress: stress-http stress-pid stress-ringbuf
 
 compile_commands: | $(BUILDDIR)
 	@echo '[' > $(BUILDDIR)/compile_commands.json
-	@sep=""; \
-	for src in $(USER_SRCS); do \
-		printf '%s\n' "$$sep{" >> $(BUILDDIR)/compile_commands.json; \
-		printf '  "directory": "%s",\n' "$(CURDIR)" >> $(BUILDDIR)/compile_commands.json; \
-		printf '  "command": "%s %s -c %s",\n' "$(CC)" "$(CFLAGS)" "$$src" >> $(BUILDDIR)/compile_commands.json; \
-		printf '  "file": "%s/%s"\n' "$(CURDIR)" "$$src" >> $(BUILDDIR)/compile_commands.json; \
-		printf '}' >> $(BUILDDIR)/compile_commands.json; \
-		sep=","; \
+	@printf '{\n  "directory": "%s",\n  "command": "%s %s -c %s",\n  "file": "%s/%s"\n}' \
+		"$(CURDIR)" "$(CLANG)" "$(BPF_CFLAGS)" "$(BPF_SRC)" "$(CURDIR)" "$(BPF_SRC)" \
+		>> $(BUILDDIR)/compile_commands.json
+	@for src in $(USER_SRCS); do \
+		printf ',\n{\n  "directory": "%s",\n  "command": "%s %s -c %s",\n  "file": "%s/%s"\n}' \
+			"$(CURDIR)" "$(CC)" "$(CFLAGS)" "$$src" "$(CURDIR)" "$$src" \
+			>> $(BUILDDIR)/compile_commands.json; \
 	done
 	@echo '' >> $(BUILDDIR)/compile_commands.json
 	@echo ']' >> $(BUILDDIR)/compile_commands.json
