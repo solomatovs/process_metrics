@@ -52,45 +52,10 @@
  * даже на верификатор). Astra Linux поставляет libbpf 0.7, в котором есть
  * set_autoload, но нет set_autoattach.
  */
-/*
- * BPF_PROG_DISABLE: полностью отключает BPF-программу (не загружать,
- * не подключать). Используем set_autoload(false), а не set_autoattach(false),
- * потому что set_autoattach всё равно загружает программу в ядро (верификатор,
- * создание prog fd) — и при destroy close(fd) вызывает synchronize_rcu,
- * что добавляет ~0.15с на каждую программу к времени завершения.
- * set_autoload полностью пропускает программу — нет fd, нет задержки.
- */
-#define BPF_PROG_DISABLE(prog) bpf_program__set_autoload((prog), false)
+/* event_ctl infrastructure, cfg, load_config — moved to pm_config.c */
 
-/* ── конфигурация ─────────────────────────────────────────────────── */
-
-/* rule, num_rules — определены здесь, объявлены в pm_state.h */
-struct rule rules[MAX_RULES];
-int num_rules;
-
-struct pm_config cfg = {
-	.snapshot_interval = 30,
-	.refresh_interval = 0,
-	.cgroup_metrics = 1,
-	.refresh_enabled = 0,
-	.refresh_proc = 1,
-	.log_level = 1,
-	.heartbeat_interval = 30,
-	.log_snapshot = 1,
-	.log_refresh = 1,
-	.max_data_size = (long long)EF_DEFAULT_SIZE_BYTES,
-	.file_absolute_paths_only = 1,
-	.disk_tracking_enabled = 1,
-	.max_cgroups = MAX_CGROUPS,
-	.emit = {
-		.exec = 1, .fork = 1, .exit = 1, .oom_kill = 1,
-		.signal = 1, .chdir = 1,
-		.file_open = 1, .file_close = 1, .file_rename = 1,
-		.file_unlink = 1, .file_truncate = 1, .file_chmod = 1, .file_chown = 1,
-		.net_listen = 1, .net_connect = 1, .net_accept = 1, .net_close = 1,
-		.tcp_retransmit = 1, .syn_recv = 1, .rst = 1, .cgroup = 1,
-	},
-};
+/* init_event_ctl, apply_event_ctl_disable, compute_need_sock_map,
+ * cfg, rules[], num_rules — moved to pm_config.c */
 
 /* Последние известные размеры BPF map'ов (обновляются refresh/snapshot).
  * Используется для адаптивного refresh_interval и heartbeat диагностики. */
@@ -100,7 +65,7 @@ int g_last_conn_count = 0;
 volatile sig_atomic_t g_running = 1;
 volatile sig_atomic_t g_reload = 0;
 struct process_metrics_bpf *skel;
-int proc_map_fd, missed_exec_fd;
+int proc_map_fd;
 
 /*
  * Две гранулярные RW-блокировки для общих данных:
@@ -211,7 +176,7 @@ void refresh_boot_to_wall(void)
 
 /* TAGS_MAX_LEN определён в pm_state.h */
 
-__u32 tags_tgid[TAGS_HT_SIZE];		   /*  64 KB — компактный индекс */
+__u32 tags_tgid[TAGS_HT_SIZE];		    /*  64 KB — компактный индекс */
 char tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
 
 /*
@@ -401,7 +366,7 @@ static void tags_clear_ts(void)
  * Память: pt_pid[65536] + pt_ppid[65536] = 512 КБ.
  */
 
-__u32 pt_pid[PIDTREE_HT_SIZE];  /* ключи: pid   (0 = пустой слот) */
+__u32 pt_pid[PIDTREE_HT_SIZE];	/* ключи: pid   (0 = пустой слот) */
 __u32 pt_ppid[PIDTREE_HT_SIZE]; /* значения: ppid                 */
 
 static inline __u32 pidtree_hash(__u32 h)
@@ -601,91 +566,21 @@ void fill_parent_pids(struct metric_event *cev)
  * Возвращает 1 если разрешена, 0 если отключена в конфиге.
  * Без default — clang -Wswitch предупредит при добавлении нового enum.
  */
-static int event_emit_enabled(enum event_type type)
-{
-	switch (type) {
-	case EVENT_FORK:
-		return cfg.emit.fork;
-	case EVENT_EXEC:
-		return cfg.emit.exec;
-	case EVENT_EXIT:
-		return cfg.emit.exit;
-	case EVENT_OOM_KILL:
-		return cfg.emit.oom_kill;
-	case EVENT_FILE_CLOSE:
-		return cfg.emit.file_close;
-	case EVENT_FILE_OPEN:
-		return cfg.emit.file_open;
-	case EVENT_FILE_RENAME:
-		return cfg.emit.file_rename;
-	case EVENT_FILE_UNLINK:
-		return cfg.emit.file_unlink;
-	case EVENT_FILE_TRUNCATE:
-		return cfg.emit.file_truncate;
-	case EVENT_FILE_CHMOD:
-		return cfg.emit.file_chmod;
-	case EVENT_FILE_CHOWN:
-		return cfg.emit.file_chown;
-	case EVENT_NET_CLOSE:
-		return cfg.emit.net_close;
-	case EVENT_NET_LISTEN:
-		return cfg.emit.net_listen;
-	case EVENT_NET_CONNECT:
-		return cfg.emit.net_connect;
-	case EVENT_NET_ACCEPT:
-		return cfg.emit.net_accept;
-	case EVENT_SIGNAL:
-		return cfg.emit.signal;
-	case EVENT_TCP_RETRANSMIT:
-		return cfg.emit.tcp_retransmit;
-	case EVENT_SYN_RECV:
-		return cfg.emit.syn_recv;
-	case EVENT_RST:
-		return cfg.emit.rst;
-	case EVENT_CHDIR:
-		return cfg.emit.chdir;
-	case EVENT_CGROUP_MKDIR:
-	case EVENT_CGROUP_RMDIR:
-	case EVENT_CGROUP_RENAME:
-	case EVENT_CGROUP_RELEASE:
-	case EVENT_CGROUP_ATTACH_TASK:
-	case EVENT_CGROUP_TRANSFER_TASKS:
-	case EVENT_CGROUP_POPULATED:
-	case EVENT_CGROUP_FREEZE:
-	case EVENT_CGROUP_UNFREEZE:
-	case EVENT_CGROUP_FROZEN:
-		return cfg.emit.cgroup;
-	}
-	return 0;
-}
-
-/*
- * Классификаторы типов событий.
- * Каждая функция — одна группа, используется вместо цепочек if (type == X || ...).
- */
-/*
- * Проверяет, нужно ли формировать metric_event и отправлять в CSV.
- * Объединяет: тип разрешён в конфиге + HTTP-сервер включён.
- */
-static int should_emit_event(enum event_type type)
-{
-	return cfg.http.enabled && event_emit_enabled(type);
-}
+/* event_emit_enabled, should_emit_event — moved to pm_config.c */
 
 /* should_emit_snapshot, should_emit_conn_snapshot — moved to snapshot.c */
 
 int should_emit_icmp(void)
 {
-	return cfg.icmp_tracking && cfg.http.enabled;
+	return cfg.syscall.icmp_rcv >= EVENT_CTL_EVENT_ENABLE && cfg.http.enabled;
 }
 
 int should_emit_disk(void)
 {
-	return cfg.disk_tracking_enabled && cfg.http.enabled;
+	return cfg.disk_metrics && cfg.http.enabled;
 }
 
 /* should_include_conn — moved to snapshot.c */
-
 
 /*
  * Извлекает тип события из сырых данных ring buffer.
@@ -757,17 +652,28 @@ static int is_rst_event(enum event_type t)
 static const char *tcp_state_name(__u8 state)
 {
 	switch (state) {
-	case 1:  return "ESTABLISHED";
-	case 2:  return "SYN_SENT";
-	case 3:  return "SYN_RECV";
-	case 4:  return "FIN_WAIT1";
-	case 5:  return "FIN_WAIT2";
-	case 6:  return "TIME_WAIT";
-	case 7:  return "CLOSE";
-	case 8:  return "CLOSE_WAIT";
-	case 9:  return "LAST_ACK";
-	case 10: return "LISTEN";
-	case 11: return "CLOSING";
+	case 1:
+		return "ESTABLISHED";
+	case 2:
+		return "SYN_SENT";
+	case 3:
+		return "SYN_RECV";
+	case 4:
+		return "FIN_WAIT1";
+	case 5:
+		return "FIN_WAIT2";
+	case 6:
+		return "TIME_WAIT";
+	case 7:
+		return "CLOSE";
+	case 8:
+		return "CLOSE_WAIT";
+	case 9:
+		return "LAST_ACK";
+	case 10:
+		return "LISTEN";
+	case 11:
+		return "CLOSING";
 	}
 	return "";
 }
@@ -779,37 +685,68 @@ static const char *tcp_state_name(__u8 state)
 static const char *signal_name(int sig)
 {
 	switch (sig) {
-	case 1:  return "SIGHUP";
-	case 2:  return "SIGINT";
-	case 3:  return "SIGQUIT";
-	case 4:  return "SIGILL";
-	case 5:  return "SIGTRAP";
-	case 6:  return "SIGABRT";
-	case 7:  return "SIGBUS";
-	case 8:  return "SIGFPE";
-	case 9:  return "SIGKILL";
-	case 10: return "SIGUSR1";
-	case 11: return "SIGSEGV";
-	case 12: return "SIGUSR2";
-	case 13: return "SIGPIPE";
-	case 14: return "SIGALRM";
-	case 15: return "SIGTERM";
-	case 16: return "SIGSTKFLT";
-	case 17: return "SIGCHLD";
-	case 18: return "SIGCONT";
-	case 19: return "SIGSTOP";
-	case 20: return "SIGTSTP";
-	case 21: return "SIGTTIN";
-	case 22: return "SIGTTOU";
-	case 23: return "SIGURG";
-	case 24: return "SIGXCPU";
-	case 25: return "SIGXFSZ";
-	case 26: return "SIGVTALRM";
-	case 27: return "SIGPROF";
-	case 28: return "SIGWINCH";
-	case 29: return "SIGIO";
-	case 30: return "SIGPWR";
-	case 31: return "SIGSYS";
+	case 1:
+		return "SIGHUP";
+	case 2:
+		return "SIGINT";
+	case 3:
+		return "SIGQUIT";
+	case 4:
+		return "SIGILL";
+	case 5:
+		return "SIGTRAP";
+	case 6:
+		return "SIGABRT";
+	case 7:
+		return "SIGBUS";
+	case 8:
+		return "SIGFPE";
+	case 9:
+		return "SIGKILL";
+	case 10:
+		return "SIGUSR1";
+	case 11:
+		return "SIGSEGV";
+	case 12:
+		return "SIGUSR2";
+	case 13:
+		return "SIGPIPE";
+	case 14:
+		return "SIGALRM";
+	case 15:
+		return "SIGTERM";
+	case 16:
+		return "SIGSTKFLT";
+	case 17:
+		return "SIGCHLD";
+	case 18:
+		return "SIGCONT";
+	case 19:
+		return "SIGSTOP";
+	case 20:
+		return "SIGTSTP";
+	case 21:
+		return "SIGTTIN";
+	case 22:
+		return "SIGTTOU";
+	case 23:
+		return "SIGURG";
+	case 24:
+		return "SIGXCPU";
+	case 25:
+		return "SIGXFSZ";
+	case 26:
+		return "SIGVTALRM";
+	case 27:
+		return "SIGPROF";
+	case 28:
+		return "SIGWINCH";
+	case 29:
+		return "SIGIO";
+	case 30:
+		return "SIGPWR";
+	case 31:
+		return "SIGSYS";
 	}
 	return "";
 }
@@ -856,8 +793,8 @@ struct event_ctx {
 	__u32 uid;
 	__u64 timestamp_ns;
 	__u64 cgroup_id;
-	const char *comm;         /* NULL если нет в BPF event */
-	const char *thread_name;  /* NULL если нет в BPF event */
+	const char *comm;	 /* NULL если нет в BPF event */
+	const char *thread_name; /* NULL если нет в BPF event */
 };
 
 /*
@@ -880,8 +817,7 @@ static void prepare_metric_event(struct metric_event *cev, const struct event_ct
 			cev->root_pid = pi.root_pid;
 			cev->is_root = pi.is_root;
 			if (pi.rule_id < num_rules)
-				fast_strcpy(cev->rule, sizeof(cev->rule),
-					    rules[pi.rule_id].name);
+				fast_strcpy(cev->rule, sizeof(cev->rule), rules[pi.rule_id].name);
 		}
 	}
 
@@ -926,7 +862,6 @@ void fill_rule(struct metric_event *cev, const char *rname)
 {
 	fast_strcpy(cev->rule, sizeof(cev->rule), rname);
 }
-
 
 /*
  * Заполняет теги в metric_event из proc_map cmdline → match_rules.
@@ -980,7 +915,6 @@ static const char *resolve_rule_for_proc_event(const struct event *e)
 		return resolve_rule_name(pi.rule_id);
 	return RULE_NOT_MATCH;
 }
-
 
 static const char *event_type_name(enum event_type type)
 {
@@ -1116,16 +1050,14 @@ static void fill_proc_info_from_event(struct proc_info *pi, const struct event *
  * Базовые значения — перезаписываются fill_from_*_event для BPF-событий.
  * Для snapshot/conn_snapshot — финальные значения (нет BPF event override).
  */
-void fill_identity_from_proc_info(struct metric_event *cev,
-				  const struct proc_info *pi)
+void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi)
 {
 	cev->pid = pi->tgid;
 	cev->ppid = pi->ppid;
 	cev->uid = pi->uid;
 	memcpy(cev->comm, pi->comm, COMM_LEN);
 	memcpy(cev->thread_name, pi->thread_name, COMM_LEN);
-	cmdline_split(pi->cmdline, pi->cmdline_len,
-		      cev->exec_path, sizeof(cev->exec_path),
+	cmdline_split(pi->cmdline, pi->cmdline_len, cev->exec_path, sizeof(cev->exec_path),
 		      cev->args, sizeof(cev->args));
 	cev->state = pi->state;
 	cev->loginuid = pi->loginuid;
@@ -1133,16 +1065,14 @@ void fill_identity_from_proc_info(struct metric_event *cev,
 	cev->euid = pi->euid;
 	cev->tty_nr = pi->tty_nr;
 	cev->sched_policy = pi->sched_policy;
-	cev->start_time_ns = pi->start_ns
-		? pi->start_ns + (__u64)g_boot_to_wall_ns : 0;
+	cev->start_time_ns = pi->start_ns ? pi->start_ns + (__u64)g_boot_to_wall_ns : 0;
 }
 
 /*
  * Заполняет метрики процесса из proc_info.
  * Эти поля не перезаписываются fill_from_*_event — уникальный источник.
  */
-void fill_metrics_from_proc_info(struct metric_event *cev,
-				 const struct proc_info *pi)
+void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi)
 {
 	static long cached_page_size = 0;
 	if (!cached_page_size) {
@@ -1204,13 +1134,11 @@ void fill_metrics_from_proc_info(struct metric_event *cev,
  * Заполняет ВСЕ поля из proc_info (идентификация + метрики).
  * Используется для snapshot/conn_snapshot где нет BPF event override.
  */
-void fill_from_proc_info(struct metric_event *cev,
-			 const struct proc_info *pi)
+void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi)
 {
 	fill_identity_from_proc_info(cev, pi);
 	fill_metrics_from_proc_info(cev, pi);
 }
-
 
 /* ── pwd hash table (userspace-only, per-tgid) ───────────────────────
  *
@@ -2131,414 +2059,8 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 	return 0;
 }
 
-/* ── парсер правил (из libconfig) ─────────────────────────────────── */
-
-static void free_rules(void)
-{
-	for (int i = 0; i < num_rules; i++)
-		regfree(&rules[i].regex);
-	num_rules = 0;
-}
-
-static int parse_rules_from_config(const char *path)
-{
-	config_t lc;
-	config_init(&lc);
-
-	if (!config_read_file(&lc, path)) {
-		LOG_FATAL("%s:%d - %s", config_error_file(&lc) ? config_error_file(&lc) : path,
-			  config_error_line(&lc), config_error_text(&lc));
-		config_destroy(&lc);
-		return -1;
-	}
-
-	config_setting_t *rs = config_lookup(&lc, "rules");
-	if (!rs || !config_setting_is_list(rs)) {
-		LOG_FATAL("'rules' list not found in %s", path);
-		config_destroy(&lc);
-		return -1;
-	}
-
-	free_rules();
-
-	int count = config_setting_length(rs);
-	for (int i = 0; i < count && num_rules < MAX_RULES; i++) {
-		config_setting_t *entry = config_setting_get_elem(rs, i);
-		if (!entry)
-			continue;
-
-		const char *name = NULL, *regex = NULL;
-		if (!config_setting_lookup_string(entry, "name", &name) ||
-		    !config_setting_lookup_string(entry, "regex", &regex)) {
-			LOG_WARN("rules[%d]: missing 'name' or 'regex'", i);
-			continue;
-		}
-
-		if (regcomp(&rules[num_rules].regex, regex, REG_EXTENDED | REG_NOSUB) != 0) {
-			LOG_WARN("rules[%d]: bad regex: %s", i, regex);
-			continue;
-		}
-		snprintf(rules[num_rules].name, sizeof(rules[0].name), "%s", name);
-
-		int ignore_val = 0;
-		config_setting_lookup_bool(entry, "ignore", &ignore_val);
-		rules[num_rules].ignore = ignore_val;
-
-		num_rules++;
-	}
-
-	config_destroy(&lc);
-	LOG_INFO("loaded %d rules from %s", num_rules, path);
-	return num_rules;
-}
-
-/* ── загрузчик конфигурации libconfig ─────────────────────────────── */
-
-static int load_config(const char *path)
-{
-	config_t lc;
-	config_init(&lc);
-
-	if (!config_read_file(&lc, path)) {
-		LOG_FATAL("%s:%d - %s", config_error_file(&lc) ? config_error_file(&lc) : path,
-			  config_error_line(&lc), config_error_text(&lc));
-		config_destroy(&lc);
-		return -1;
-	}
-
-	const char *str_val;
-	int int_val;
-
-	/* Общие настройки */
-	if (config_lookup_string(&lc, "hostname", &str_val))
-		snprintf(cfg.hostname, sizeof(cfg.hostname), "%s", str_val);
-	if (!cfg.hostname[0])
-		gethostname(cfg.hostname, sizeof(cfg.hostname));
-	if (config_lookup_int(&lc, "snapshot_interval", &int_val))
-		cfg.snapshot_interval = int_val;
-	if (config_lookup_int(&lc, "refresh_interval", &int_val))
-		cfg.refresh_interval = int_val;
-
-	/* refresh_interval: если не задан — берётся snapshot_interval;
-	 * если больше snapshot_interval — приравнивается */
-	if (cfg.refresh_interval <= 0)
-		cfg.refresh_interval = cfg.snapshot_interval;
-	if (cfg.refresh_interval > cfg.snapshot_interval)
-		cfg.refresh_interval = cfg.snapshot_interval;
-
-	if (config_lookup_int(&lc, "exec_rate_limit", &int_val))
-		cfg.exec_rate_limit = int_val;
-
-	int bool_val;
-	if (config_lookup_bool(&lc, "cgroup_metrics", &bool_val))
-		cfg.cgroup_metrics = bool_val;
-	if (config_lookup_bool(&lc, "refresh_enabled", &bool_val))
-		cfg.refresh_enabled = bool_val;
-	if (config_lookup_bool(&lc, "refresh_proc", &bool_val))
-		cfg.refresh_proc = bool_val;
-	if (config_lookup_int(&lc, "log_level", &int_val))
-		cfg.log_level = int_val;
-	if (config_lookup_int(&lc, "max_cgroups", &int_val) && int_val > 0)
-		cfg.max_cgroups = int_val;
-	if (config_lookup_int(&lc, "heartbeat_interval", &int_val))
-		cfg.heartbeat_interval = int_val;
-	if (config_lookup_bool(&lc, "log_snapshot", &bool_val))
-		cfg.log_snapshot = bool_val;
-	if (config_lookup_bool(&lc, "log_refresh", &bool_val))
-		cfg.log_refresh = bool_val;
-
-	/* Настройки HTTP-сервера (включается при наличии секции с портом) */
-	memset(&cfg.http, 0, sizeof(cfg.http));
-	cfg.http.port = HTTP_DEFAULT_PORT;
-	cfg.http.max_connections = HTTP_DEFAULT_MAX_CONNS;
-	cfg.http.log_requests = 1;
-	snprintf(cfg.http.bind, sizeof(cfg.http.bind), HTTP_DEFAULT_BIND);
-
-	config_setting_t *hs = config_lookup(&lc, "http_server");
-	if (hs) {
-		if (config_setting_lookup_int(hs, "port", &int_val)) {
-			cfg.http.port = int_val;
-			cfg.http.enabled = 1;
-		}
-		if (config_setting_lookup_string(hs, "bind", &str_val))
-			snprintf(cfg.http.bind, sizeof(cfg.http.bind), "%s", str_val);
-		if (config_setting_lookup_int(hs, "max_connections", &int_val))
-			cfg.http.max_connections = int_val;
-		if (config_setting_lookup_bool(hs, "log_requests", &bool_val))
-			cfg.http.log_requests = bool_val;
-
-		/* allow = ("10.0.0.0/8", "192.168.1.0/24", "127.0.0.1"); */
-		config_setting_t *allow = config_setting_get_member(hs, "allow");
-		if (allow) {
-			int cnt = config_setting_length(allow);
-			if (cnt > HTTP_MAX_ALLOW) {
-				LOG_WARN("http_server: allow list truncated to %d entries",
-					 HTTP_MAX_ALLOW);
-				cnt = HTTP_MAX_ALLOW;
-			}
-			for (int i = 0; i < cnt; i++) {
-				const char *cidr = config_setting_get_string_elem(allow, i);
-				if (!cidr)
-					continue;
-
-				char ip_buf[64];
-				snprintf(ip_buf, sizeof(ip_buf), "%s", cidr);
-
-				int prefix = 32;
-				char *slash = strchr(ip_buf, '/');
-				if (slash) {
-					*slash = '\0';
-					prefix = atoi(slash + 1);
-					if (prefix < 0 || prefix > 32) {
-						LOG_ERROR("http_server: invalid prefix /%d in '%s'",
-							  prefix, cidr);
-						config_destroy(&lc);
-						return 1;
-					}
-				}
-
-				struct in_addr parsed;
-				if (inet_pton(AF_INET, ip_buf, &parsed) != 1) {
-					LOG_ERROR("http_server: invalid IP in '%s'", cidr);
-					config_destroy(&lc);
-					return 1;
-				}
-
-				in_addr_t mask =
-				    (prefix == 0) ? 0 : htonl(~((1U << (32 - prefix)) - 1));
-				cfg.http.allow[cfg.http.allow_count].mask = ntohl(mask);
-				cfg.http.allow[cfg.http.allow_count].network =
-				    ntohl(parsed.s_addr) & ntohl(mask);
-				cfg.http.allow_count++;
-			}
-		}
-
-		long long ll_val;
-		if (config_setting_lookup_int64(hs, "max_buffer_size", &ll_val))
-			cfg.max_data_size = ll_val;
-	}
-
-	/* Размеры BPF ring buffer'ов */
-	config_setting_t *rb = config_lookup(&lc, "ring_buffers");
-	if (rb) {
-		long long ll_val;
-		if (config_setting_lookup_int64(rb, "proc", &ll_val))
-			cfg.ringbuf_proc = ll_val;
-		if (config_setting_lookup_int64(rb, "file", &ll_val))
-			cfg.ringbuf_file = ll_val;
-		if (config_setting_lookup_int64(rb, "file_ops", &ll_val))
-			cfg.ringbuf_file_ops = ll_val;
-		if (config_setting_lookup_int64(rb, "net", &ll_val))
-			cfg.ringbuf_net = ll_val;
-		if (config_setting_lookup_int64(rb, "sec", &ll_val))
-			cfg.ringbuf_sec = ll_val;
-		if (config_setting_lookup_int64(rb, "cgroup", &ll_val))
-			cfg.ringbuf_cgroup = ll_val;
-	}
-
-	/* Настройки отслеживания сети (включая security TCP/UDP) */
-	config_setting_t *nt = config_lookup(&lc, "net_tracking");
-	if (nt) {
-		if (config_setting_lookup_bool(nt, "enabled", &bool_val))
-			cfg.net_tracking_enabled = bool_val;
-		if (config_setting_lookup_bool(nt, "tcp_bytes", &bool_val))
-			cfg.net_track_bytes = bool_val;
-
-		if (config_setting_lookup_bool(nt, "tcp_retransmit", &bool_val))
-			cfg.tcp_retransmit = bool_val;
-		if (config_setting_lookup_bool(nt, "tcp_syn", &bool_val))
-			cfg.tcp_syn = bool_val;
-		if (config_setting_lookup_bool(nt, "tcp_rst", &bool_val))
-			cfg.tcp_rst = bool_val;
-		if (config_setting_lookup_bool(nt, "tcp_open_conns", &bool_val))
-			cfg.tcp_open_conns = bool_val;
-
-		/* emit-флаги: какие сетевые события отправлять в CSV */
-		if (config_setting_lookup_bool(nt, "emit_listen", &bool_val))
-			cfg.emit.net_listen = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_connect", &bool_val))
-			cfg.emit.net_connect = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_accept", &bool_val))
-			cfg.emit.net_accept = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_close", &bool_val))
-			cfg.emit.net_close = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_retransmit", &bool_val))
-			cfg.emit.tcp_retransmit = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_syn_recv", &bool_val))
-			cfg.emit.syn_recv = bool_val;
-		if (config_setting_lookup_bool(nt, "emit_rst", &bool_val))
-			cfg.emit.rst = bool_val;
-	}
-
-	/* Настройки отслеживания файлов */
-	config_setting_t *ft = config_lookup(&lc, "file_tracking");
-	if (ft) {
-		if (config_setting_lookup_bool(ft, "enabled", &bool_val))
-			cfg.file_tracking_enabled = bool_val;
-		if (config_setting_lookup_bool(ft, "track_bytes", &bool_val))
-			cfg.file_track_bytes = bool_val;
-		if (config_setting_lookup_bool(ft, "absolute_paths_only", &bool_val))
-			cfg.file_absolute_paths_only = bool_val;
-
-		/* emit-флаги: какие файловые события отправлять в CSV */
-		if (config_setting_lookup_bool(ft, "emit_open", &bool_val))
-			cfg.emit.file_open = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_close", &bool_val))
-			cfg.emit.file_close = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_rename", &bool_val))
-			cfg.emit.file_rename = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_unlink", &bool_val))
-			cfg.emit.file_unlink = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_truncate", &bool_val))
-			cfg.emit.file_truncate = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_chmod", &bool_val))
-			cfg.emit.file_chmod = bool_val;
-		if (config_setting_lookup_bool(ft, "emit_chown", &bool_val))
-			cfg.emit.file_chown = bool_val;
-
-		/* Включающие префиксы */
-		config_setting_t *inc = config_setting_lookup(ft, "include");
-		if (inc && config_setting_is_list(inc)) {
-			int n = config_setting_length(inc);
-			if (n > FILE_MAX_PREFIXES)
-				n = FILE_MAX_PREFIXES;
-			for (int i = 0; i < n; i++) {
-				const char *s = config_setting_get_string_elem(inc, i);
-				if (s) {
-					int slen = (int)strlen(s);
-					if (slen > FILE_PREFIX_CAP - 1)
-						slen = FILE_PREFIX_CAP - 1;
-					memcpy(cfg.file_include[i].prefix, s, slen);
-					cfg.file_include[i].prefix[slen] = '\0';
-					cfg.file_include[i].len = (__u8)slen;
-					cfg.file_include_count++;
-				}
-			}
-		}
-
-		/* Исключающие префиксы */
-		config_setting_t *exc = config_setting_lookup(ft, "exclude");
-		if (exc && config_setting_is_list(exc)) {
-			int n = config_setting_length(exc);
-			if (n > FILE_MAX_PREFIXES)
-				n = FILE_MAX_PREFIXES;
-			for (int i = 0; i < n; i++) {
-				const char *s = config_setting_get_string_elem(exc, i);
-				if (s) {
-					int slen = (int)strlen(s);
-					if (slen > FILE_PREFIX_CAP - 1)
-						slen = FILE_PREFIX_CAP - 1;
-					memcpy(cfg.file_exclude[i].prefix, s, slen);
-					cfg.file_exclude[i].prefix[slen] = '\0';
-					cfg.file_exclude[i].len = (__u8)slen;
-					cfg.file_exclude_count++;
-				}
-			}
-		}
-	}
-
-	/* Настройки определения имён Docker */
-	config_setting_t *dk = config_lookup(&lc, "docker");
-	if (dk) {
-		if (config_setting_lookup_bool(dk, "resolve_names", &bool_val))
-			cfg.docker_resolve_names = bool_val;
-		if (config_setting_lookup_string(dk, "data_root", &str_val))
-			snprintf(cfg.docker_data_root, sizeof(cfg.docker_data_root), "%s", str_val);
-		if (config_setting_lookup_string(dk, "daemon_json", &str_val))
-			snprintf(cfg.docker_daemon_json, sizeof(cfg.docker_daemon_json), "%s",
-				 str_val);
-	}
-
-	/* ICMP — верхнеуровневая опция (не привязана к процессам) */
-	if (config_lookup_bool(&lc, "icmp_tracking", &bool_val))
-		cfg.icmp_tracking = bool_val;
-
-	/* emit-флаг cgroup событий */
-	if (config_lookup_bool(&lc, "emit_cgroup_events", &bool_val))
-		cfg.emit.cgroup = bool_val;
-
-	/* process_tracking — emit-флаги процессных событий */
-	config_setting_t *pt = config_lookup(&lc, "process_tracking");
-	if (pt) {
-		if (config_setting_lookup_bool(pt, "emit_exec", &bool_val))
-			cfg.emit.exec = bool_val;
-		if (config_setting_lookup_bool(pt, "emit_fork", &bool_val))
-			cfg.emit.fork = bool_val;
-		if (config_setting_lookup_bool(pt, "emit_exit", &bool_val))
-			cfg.emit.exit = bool_val;
-		if (config_setting_lookup_bool(pt, "emit_oom_kill", &bool_val))
-			cfg.emit.oom_kill = bool_val;
-		if (config_setting_lookup_bool(pt, "emit_signal", &bool_val))
-			cfg.emit.signal = bool_val;
-		if (config_setting_lookup_bool(pt, "emit_chdir", &bool_val))
-			cfg.emit.chdir = bool_val;
-	}
-
-	/* Настройки отслеживания дисков */
-	config_setting_t *dt = config_lookup(&lc, "disk_tracking");
-	if (dt) {
-		if (config_setting_lookup_bool(dt, "enabled", &bool_val))
-			cfg.disk_tracking_enabled = bool_val;
-
-		/* Типы файловых систем для включения (переопределяют встроенный список) */
-		config_setting_t *fst = config_setting_lookup(dt, "fs_types");
-		if (fst && config_setting_is_list(fst)) {
-			int n = config_setting_length(fst);
-			if (n > DISK_MAX_PREFIXES)
-				n = DISK_MAX_PREFIXES;
-			for (int i = 0; i < n; i++) {
-				const char *s = config_setting_get_string_elem(fst, i);
-				if (s)
-					snprintf(cfg.disk_fs_types[cfg.disk_fs_types_count++], 32,
-						 "%s", s);
-			}
-		}
-
-		/* Включающие префиксы точек монтирования */
-		config_setting_t *inc = config_setting_lookup(dt, "include");
-		if (inc && config_setting_is_list(inc)) {
-			int n = config_setting_length(inc);
-			if (n > DISK_MAX_PREFIXES)
-				n = DISK_MAX_PREFIXES;
-			for (int i = 0; i < n; i++) {
-				const char *s = config_setting_get_string_elem(inc, i);
-				if (s)
-					snprintf(cfg.disk_include[cfg.disk_include_count++],
-						 DISK_PREFIX_MAX, "%s", s);
-			}
-		}
-
-		/* Исключающие префиксы точек монтирования */
-		config_setting_t *exc = config_setting_lookup(dt, "exclude");
-		if (exc && config_setting_is_list(exc)) {
-			int n = config_setting_length(exc);
-			if (n > DISK_MAX_PREFIXES)
-				n = DISK_MAX_PREFIXES;
-			for (int i = 0; i < n; i++) {
-				const char *s = config_setting_get_string_elem(exc, i);
-				if (s)
-					snprintf(cfg.disk_exclude[cfg.disk_exclude_count++],
-						 DISK_PREFIX_MAX, "%s", s);
-			}
-		}
-	}
-
-	config_destroy(&lc);
-
-	/* Нормализация: секционный enabled — master-switch.
-	 * Если net_tracking.enabled=false, все net-подопции принудительно 0,
-	 * чтобы соответствующие BPF-программы не загружались в ядро. */
-	if (!cfg.net_tracking_enabled) {
-		cfg.tcp_retransmit = 0;
-		cfg.tcp_syn = 0;
-		cfg.tcp_rst = 0;
-		cfg.tcp_open_conns = 0;
-		cfg.icmp_tracking = 0;
-		cfg.net_track_bytes = 0;
-	}
-
-	return 0;
-}
+/* free_rules, parse_rules_from_config, cfg_lookup_emit,
+ * CFG_EMIT, load_config — moved to pm_config.c */
 
 /* ── вспомогательные функции ──────────────────────────────────────── */
 
@@ -2662,9 +2184,8 @@ void fast_strcpy(char *dst, int cap, const char *src)
 static void fill_from_proc_event(struct metric_event *cev, const struct event *e)
 {
 	/* cmdline из BPF-события (может отличаться от proc_map) */
-	cmdline_split(e->cmdline, e->cmdline_len,
-		      cev->exec_path, sizeof(cev->exec_path),
-		      cev->args, sizeof(cev->args));
+	cmdline_split(e->cmdline, e->cmdline_len, cev->exec_path, sizeof(cev->exec_path), cev->args,
+		      sizeof(cev->args));
 
 	/* Поля, уникальные для proc events (нет в proc_info) */
 	cev->exit_code = exit_status(e->exit_code);
@@ -2762,7 +2283,7 @@ static void fill_from_signal_event(struct metric_event *cev, const struct signal
 	/* Информация о сигнале */
 	cev->sig_num = (__u32)se->sig;
 	fast_strcpy(cev->sig_name, sizeof(cev->sig_name), signal_name(se->sig));
-	cev->sig_code   = se->sig_code;
+	cev->sig_code = se->sig_code;
 	cev->sig_result = se->sig_result;
 
 	/* Информация об отправителе */
@@ -2781,14 +2302,8 @@ static void fill_from_retransmit_event(struct metric_event *cev, const struct re
 /* ── fill_from_syn_event: SYN_RECV ────────────────────────────────── */
 static void fill_from_syn_event(struct metric_event *cev, const struct syn_event *se)
 {
-	fill_sec_addrs(
-		cev,
-		se->af,
-		se->local_addr,
-		se->remote_addr,
-		se->local_port,
-		se->remote_port
-	);
+	fill_sec_addrs(cev, se->af, se->local_addr, se->remote_addr, se->local_port,
+		       se->remote_port);
 }
 
 /* ── fill_from_rst_event: RST ─────────────────────────────────────── */
@@ -3141,9 +2656,11 @@ static void add_descendants(struct scan_entry *entries, int count, __u32 parent,
  * Затем запускаем BPF iter/tcp, который для каждого TCP-сокета ядра
  * проверяет inode в seed_inode_map и добавляет найденные в sock_map.
  */
+/* g_need_sock_map — moved to pm_config.c */
+
 static void seed_sock_map(void)
 {
-	if (!cfg.need_sock_map)
+	if (!g_need_sock_map)
 		return;
 
 	int seed_fd = bpf_map__fd(skel->maps.seed_inode_map);
@@ -3357,7 +2874,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {type, fe->tgid, fe->uid, fe->timestamp_ns, fe->cgroup_id, fe->comm, fe->thread_name};
+			struct event_ctx ctx = {
+			    type,	   fe->tgid, fe->uid,	     fe->timestamp_ns,
+			    fe->cgroup_id, fe->comm, fe->thread_name};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_file_event(&cev, fe, type);
 			finalize_metric_event(&cev, fe->tgid);
@@ -3386,13 +2905,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 			LOG_DEBUG(cfg.log_level,
 				  "%s: pid=%u rule=%s port=%u→%u "
 				  "tx=%llu rx=%llu dur=%llums",
-				  net_evt, ne->tgid, resolve_rule_for_pid(ne->tgid),
-				  ne->local_port, ne->remote_port, (unsigned long long)ne->tx_bytes,
+				  net_evt, ne->tgid, resolve_rule_for_pid(ne->tgid), ne->local_port,
+				  ne->remote_port, (unsigned long long)ne->tx_bytes,
 				  (unsigned long long)ne->rx_bytes,
 				  (unsigned long long)(ne->duration_ns / NS_PER_MS));
 
 			struct metric_event cev;
-			struct event_ctx ctx = {type, ne->tgid, ne->uid, ne->timestamp_ns, ne->cgroup_id, ne->comm, ne->thread_name};
+			struct event_ctx ctx = {
+			    type,	   ne->tgid, ne->uid,	     ne->timestamp_ns,
+			    ne->cgroup_id, ne->comm, ne->thread_name};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_net_event(&cev, ne);
 			finalize_metric_event(&cev, ne->tgid);
@@ -3412,14 +2933,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 			return 0;
 		const struct signal_event *se = data;
 
-		LOG_DEBUG(cfg.log_level,
-			  "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d",
-			  se->sender_tgid, se->target_pid, se->sig,
-			  se->sig_code, se->sig_result);
+		LOG_DEBUG(cfg.log_level, "SIGNAL: sender=%u→target=%u sig=%d code=%d result=%d",
+			  se->sender_tgid, se->target_pid, se->sig, se->sig_code, se->sig_result);
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {EVENT_SIGNAL, se->target_pid, se->sender_uid, se->timestamp_ns, se->cgroup_id, NULL, NULL};
+			struct event_ctx ctx = {EVENT_SIGNAL,
+						se->target_pid,
+						se->sender_uid,
+						se->timestamp_ns,
+						se->cgroup_id,
+						NULL,
+						NULL};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_signal_event(&cev, se);
 			finalize_metric_event(&cev, se->target_pid);
@@ -3443,7 +2968,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {EVENT_TCP_RETRANSMIT, re->tgid, re->uid, re->timestamp_ns, re->cgroup_id, re->comm, NULL};
+			struct event_ctx ctx = {
+			    EVENT_TCP_RETRANSMIT, re->tgid, re->uid, re->timestamp_ns,
+			    re->cgroup_id,	  re->comm, NULL};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_retransmit_event(&cev, re);
 			finalize_metric_event(&cev, re->tgid);
@@ -3467,7 +2994,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {EVENT_SYN_RECV, se_syn->tgid, se_syn->uid, se_syn->timestamp_ns, se_syn->cgroup_id, se_syn->comm, NULL};
+			struct event_ctx ctx = {
+			    EVENT_SYN_RECV,    se_syn->tgid, se_syn->uid, se_syn->timestamp_ns,
+			    se_syn->cgroup_id, se_syn->comm, NULL};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_syn_event(&cev, se_syn);
 			finalize_metric_event(&cev, se_syn->tgid);
@@ -3493,7 +3022,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
 		if (should_emit_event(type)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {EVENT_RST, rste->tgid, rste->uid, rste->timestamp_ns, rste->cgroup_id, rste->comm, NULL};
+			struct event_ctx ctx = {
+			    EVENT_RST,	     rste->tgid, rste->uid, rste->timestamp_ns,
+			    rste->cgroup_id, rste->comm, NULL};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_rst_event(&cev, rste);
 			finalize_metric_event(&cev, rste->tgid);
@@ -3537,7 +3068,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
 			if (should_emit_event(EVENT_EXEC)) {
 				struct metric_event cev;
-				struct event_ctx ctx = {EVENT_EXEC, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+				struct event_ctx ctx = {EVENT_EXEC,	 e->tgid,      e->uid,
+							e->timestamp_ns, e->cgroup_id, e->comm,
+							e->thread_name};
 				prepare_metric_event(&cev, &ctx);
 				fill_from_proc_event(&cev, e);
 				finalize_metric_event(&cev, e->tgid);
@@ -3564,7 +3097,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Отправляем fork-событие в буферный файл */
 		if (should_emit_event(EVENT_FORK)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {EVENT_FORK, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+			struct event_ctx ctx = {EVENT_FORK,	 e->tgid,      e->uid,
+						e->timestamp_ns, e->cgroup_id, e->comm,
+						e->thread_name};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
@@ -3590,7 +3125,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 				  e->oom_killed ? " [OOM]" : "");
 
 			struct metric_event cev;
-			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+			struct event_ctx ctx = {e->type,	 e->tgid,      e->uid,
+						e->timestamp_ns, e->cgroup_id, e->comm,
+						e->thread_name};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
@@ -3624,7 +3161,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 		/* Отправляем oom_kill-событие в буферный файл */
 		if (should_emit_event(EVENT_OOM_KILL)) {
 			struct metric_event cev;
-			struct event_ctx ctx = {e->type, e->tgid, e->uid, e->timestamp_ns, e->cgroup_id, e->comm, e->thread_name};
+			struct event_ctx ctx = {e->type,	 e->tgid,      e->uid,
+						e->timestamp_ns, e->cgroup_id, e->comm,
+						e->thread_name};
 			prepare_metric_event(&cev, &ctx);
 			fill_from_proc_event(&cev, e);
 			finalize_metric_event(&cev, e->tgid);
@@ -3759,8 +3298,8 @@ int main(int argc, char *argv[])
 	}
 
 	/* Инициализация значений по умолчанию, которые нельзя задать в struct init */
-	snprintf(cfg.docker_daemon_json, sizeof(cfg.docker_daemon_json),
-		 "%s", DOCKER_DEFAULT_DAEMON_JSON);
+	snprintf(cfg.docker_daemon_json, sizeof(cfg.docker_daemon_json), "%s",
+		 DOCKER_DEFAULT_DAEMON_JSON);
 
 	/* Загрузка конфигурации (libconfig) */
 	if (load_config(cfg.config_file) < 0)
@@ -3837,142 +3376,20 @@ int main(int argc, char *argv[])
 	SET_RINGBUF_SIZE(events_cgroup, cfg.ringbuf_cgroup);
 #undef SET_RINGBUF_SIZE
 
-	/*
-	 * sock_map необходим для: net_tracking (net_close, conn_snapshot,
-	 * track_bytes) и TCP security (retransmit, syn, rst, open_conn_count).
-	 * Если любая из этих опций включена — инфраструктура сокетов нужна.
-	 */
-	cfg.need_sock_map = cfg.net_tracking_enabled || cfg.tcp_retransmit || cfg.tcp_syn ||
-			    cfg.tcp_rst || cfg.tcp_open_conns;
-	int need_sock_map = cfg.need_sock_map;
+	/* ── Единая таблица управления BPF-программами ────────────────── */
+	if (init_event_ctl(skel) < 0) {
+		process_metrics_bpf__destroy(skel);
+		return 1;
+	}
+	apply_event_ctl_disable();
 
-	/* iter/tcp запускается вручную из seed_sock_map(), не через autoattach.
-	 * При need_sock_map: загружаем, но не attach'им (ручной attach позже).
-	 * Без need_sock_map: полностью отключаем (не загружать). */
-	if (need_sock_map)
+	/* seed_sock_map_iter — спецпрограмма, manual attach.
+	 * Нужна если любой net/security emit > BPF_ENABLE или tcp_open_conns. */
+	g_need_sock_map = compute_need_sock_map();
+	if (g_need_sock_map)
 		bpf_program__set_autoattach(skel->progs.seed_sock_map_iter, false);
 	else
-		BPF_PROG_DISABLE(skel->progs.seed_sock_map_iter);
-
-	/* ── Условное отключение программ отслеживания сети ─────────── */
-	if (!need_sock_map) {
-		/* Жизненный цикл соединения: connect/accept/close/listen */
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_v4_connect);
-		BPF_PROG_DISABLE(skel->progs.krp_tcp_v4_connect);
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_v6_connect);
-		BPF_PROG_DISABLE(skel->progs.krp_tcp_v6_connect);
-		BPF_PROG_DISABLE(skel->progs.krp_inet_csk_accept);
-		BPF_PROG_DISABLE(skel->progs.kp_inet_csk_listen_start);
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_close);
-		BPF_PROG_DISABLE(skel->progs.kretp_tcp_close);
-		/* Агрегированный подсчёт байтов на процесс (TCP + UDP) */
-		BPF_PROG_DISABLE(skel->progs.ret_tcp_sendmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_tcp_recvmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_sendmsg);
-		BPF_PROG_DISABLE(skel->progs.ret_udp_recvmsg);
-	}
-	if (!need_sock_map || !cfg.net_track_bytes) {
-		/* Подсчёт байтов на соединение (kprobe enter + kretprobe) */
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_sendmsg);
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_recvmsg);
-	}
-
-	/* ── Условное отключение программ отслеживания файлов ──────── */
-	if (!cfg.file_tracking_enabled) {
-		/* file_tracking.enabled=false — отключаем всю группу целиком.
-		 * open/close/read/write образуют единый pipeline через fd_map
-		 * и не могут отключаться по отдельности. */
-		BPF_PROG_DISABLE(skel->progs.handle_openat_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_openat_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_close_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_read_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_read_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_write_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_write_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_pread_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_pread_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_pwrite_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_pwrite_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_readv_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_readv_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_writev_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_writev_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_sendfile_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_sendfile_exit);
-		BPF_PROG_DISABLE(skel->progs.handle_fsync_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_fdatasync_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_rename);
-		BPF_PROG_DISABLE(skel->progs.handle_renameat2);
-		BPF_PROG_DISABLE(skel->progs.handle_unlink);
-		BPF_PROG_DISABLE(skel->progs.handle_unlinkat);
-		BPF_PROG_DISABLE(skel->progs.handle_truncate);
-		BPF_PROG_DISABLE(skel->progs.handle_ftruncate);
-		BPF_PROG_DISABLE(skel->progs.handle_fchmodat_enter);
-		BPF_PROG_DISABLE(skel->progs.handle_fchownat_enter);
-	} else {
-		/* file_tracking.enabled=true — гранулярное отключение по emit_*.
-		 * Программы, независимые от fd_map pipeline (rename, unlink,
-		 * truncate, chmod, chown), безопасно отключаются по отдельности. */
-		if (!cfg.emit.file_rename) {
-			BPF_PROG_DISABLE(skel->progs.handle_rename);
-			BPF_PROG_DISABLE(skel->progs.handle_renameat2);
-		}
-		if (!cfg.emit.file_unlink) {
-			BPF_PROG_DISABLE(skel->progs.handle_unlink);
-			BPF_PROG_DISABLE(skel->progs.handle_unlinkat);
-		}
-		if (!cfg.emit.file_truncate) {
-			BPF_PROG_DISABLE(skel->progs.handle_truncate);
-			BPF_PROG_DISABLE(skel->progs.handle_ftruncate);
-		}
-		if (!cfg.emit.file_chmod)
-			BPF_PROG_DISABLE(skel->progs.handle_fchmodat_enter);
-		if (!cfg.emit.file_chown)
-			BPF_PROG_DISABLE(skel->progs.handle_fchownat_enter);
-	}
-
-	/* ── Условное отключение process_tracking emit_* ───────────── *
-	 * exec/fork/exit/sched_switch НЕЛЬЗЯ отключать: они управляют
-	 * proc_map/proc_map (core tracking pipeline).
-	 * signal и chdir не имеют побочных эффектов — безопасны. */
-	if (!cfg.emit.signal)
-		BPF_PROG_DISABLE(skel->progs.handle_signal_generate);
-	if (!cfg.emit.chdir) {
-		BPF_PROG_DISABLE(skel->progs.handle_sys_exit_chdir);
-		BPF_PROG_DISABLE(skel->progs.handle_sys_exit_fchdir);
-	}
-
-	/* ── Условное отключение cgroup tracepoints ────────────────── */
-	if (!cfg.emit.cgroup) {
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_mkdir);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_rmdir);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_rename);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_release);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_attach_task);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_transfer_tasks);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_populated);
-		BPF_PROG_DISABLE(skel->progs.handle_cgroup_frozen);
-	}
-
-	/* ── Условное отключение security-проб ─────────────────────── */
-	if (!cfg.tcp_retransmit)
-		BPF_PROG_DISABLE(skel->progs.handle_tcp_retransmit);
-	if (!cfg.tcp_syn)
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_conn_request);
-	if (!cfg.tcp_rst) {
-		BPF_PROG_DISABLE(skel->progs.handle_tcp_send_reset);
-		BPF_PROG_DISABLE(skel->progs.kp_tcp_send_active_reset);
-		BPF_PROG_DISABLE(skel->progs.handle_tcp_receive_reset);
-	}
-	if (!cfg.icmp_tracking)
-		BPF_PROG_DISABLE(skel->progs.kp_icmp_rcv);
-
-	/* Tracepoints cgroup_freeze/cgroup_unfreeze используют другой
-	 * layout (trace_event_raw_cgroup, без поля val) и могут не
-	 * поддерживать BPF attach на некоторых ядрах (например, 6.1).
-	 * Отключаем — cgroup_notify_frozen покрывает ту же информацию. */
-	BPF_PROG_DISABLE(skel->progs.handle_cgroup_freeze);
-	BPF_PROG_DISABLE(skel->progs.handle_cgroup_unfreeze);
+		bpf_program__set_autoload(skel->progs.seed_sock_map_iter, false);
 
 	/* Загрузка BPF-программ */
 	if (process_metrics_bpf__load(skel)) {
@@ -3982,12 +3399,14 @@ int main(int argc, char *argv[])
 	}
 
 	/* Передача конфигурации отслеживания файлов в BPF-карты */
-	if (cfg.file_tracking_enabled) {
+	{
 		int file_cfg_fd = bpf_map__fd(skel->maps.file_cfg);
 		__u32 key0 = 0;
 		struct file_config fc = {
-		    .enabled = 1,
-		    .track_bytes = (__u8)cfg.file_track_bytes,
+		    .enabled = cfg.syscall.sys_openat > EVENT_CTL_BPF_ENABLE,
+		    .track_bytes = cfg.syscall.sys_read > EVENT_CTL_BPF_ENABLE ||
+				 cfg.syscall.sys_write > EVENT_CTL_BPF_ENABLE ||
+				 cfg.syscall.sys_fsync > EVENT_CTL_BPF_ENABLE,
 		    .absolute_paths_only = (__u8)cfg.file_absolute_paths_only,
 		};
 		bpf_map_update_elem(file_cfg_fd, &key0, &fc, BPF_ANY);
@@ -4007,16 +3426,13 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	/* Передача конфигурации отслеживания сети в BPF-карты.
-	 * net_cfg заполняется если нужна sock_map инфраструктура.
-	 * enabled отражает именно cfg.net_tracking_enabled
-	 * (управляет net_close/conn_snapshot, не security-пробами). */
-	if (cfg.need_sock_map) {
+	/* Передача конфигурации отслеживания сети в BPF-карты */
+	if (g_need_sock_map) {
 		int net_cfg_fd = bpf_map__fd(skel->maps.net_cfg);
 		__u32 key0 = 0;
 		struct net_config nc = {
-		    .enabled = (__u8)cfg.net_tracking_enabled,
-		    .track_bytes = (__u8)cfg.net_track_bytes,
+		    .enabled = 1,
+		    .track_bytes = cfg.syscall.tcp_sendmsg > EVENT_CTL_BPF_ENABLE,
 		};
 		bpf_map_update_elem(net_cfg_fd, &key0, &nc, BPF_ANY);
 	}
@@ -4026,10 +3442,11 @@ int main(int argc, char *argv[])
 		int sec_cfg_fd = bpf_map__fd(skel->maps.sec_cfg);
 		__u32 key0 = 0;
 		struct sec_config sc = {
-		    .tcp_retransmit = (__u8)cfg.tcp_retransmit,
-		    .tcp_syn = (__u8)cfg.tcp_syn,
-		    .tcp_rst = (__u8)cfg.tcp_rst,
-		    .icmp_tracking = (__u8)cfg.icmp_tracking,
+		    .tcp_retransmit = cfg.syscall.tcp_retransmit_skb > EVENT_CTL_BPF_ENABLE,
+		    .tcp_syn = cfg.syscall.tcp_conn_request > EVENT_CTL_BPF_ENABLE,
+		    .tcp_rst = cfg.syscall.tcp_send_reset > EVENT_CTL_BPF_ENABLE ||
+			       cfg.syscall.tcp_receive_reset > EVENT_CTL_BPF_ENABLE,
+		    .icmp_tracking = cfg.syscall.icmp_rcv > EVENT_CTL_BPF_ENABLE,
 		    .tcp_open_conns = (__u8)cfg.tcp_open_conns,
 		};
 		bpf_map_update_elem(sec_cfg_fd, &key0, &sc, BPF_ANY);
@@ -4043,7 +3460,6 @@ int main(int argc, char *argv[])
 
 	/* Получение файловых дескрипторов карт */
 	proc_map_fd = bpf_map__fd(skel->maps.proc_map);
-	missed_exec_fd = bpf_map__fd(skel->maps.missed_exec_map);
 
 	/* Ring buffers: по одному на каждый тип событий.
 	 * Каждый будет обслуживаться отдельным потоком poll. */
@@ -4119,7 +3535,7 @@ int main(int argc, char *argv[])
 	/* Однократное сканирование при запуске: поиск уже работающих процессов */
 	initial_scan();
 	/* Заполняем sock_map существующими TCP-сокетами отслеживаемых процессов */
-	if (cfg.need_sock_map)
+	if (g_need_sock_map)
 		seed_sock_map();
 	refresh_boot_to_wall();
 
@@ -4142,12 +3558,19 @@ int main(int argc, char *argv[])
 		 "file=%s%s, icmp=%s, disk=%s, ring_buffer=%lld",
 		 num_rules, cfg.snapshot_interval, cfg.refresh_interval, cfg.exec_rate_limit,
 		 cfg.http.enabled ? "on" : "off", cfg.cgroup_metrics ? "on" : "off",
-		 cfg.refresh_proc ? "on" : "off", cfg.net_tracking_enabled ? "on" : "off",
-		 cfg.net_track_bytes ? "on" : "off", cfg.tcp_retransmit ? "on" : "off",
-		 cfg.tcp_syn ? "on" : "off", cfg.tcp_rst ? "on" : "off",
-		 cfg.tcp_open_conns ? "on" : "off", cfg.file_tracking_enabled ? "on" : "off",
-		 cfg.file_track_bytes ? "+bytes" : "", cfg.icmp_tracking ? "on" : "off",
-		 cfg.disk_tracking_enabled ? "on" : "off", (long long)cfg.max_data_size);
+		 cfg.refresh_proc ? "on" : "off",
+		 g_need_sock_map ? "on" : "off",
+		 cfg.syscall.tcp_sendmsg > EVENT_CTL_BPF_ENABLE ? "on" : "off",
+		 cfg.syscall.tcp_retransmit_skb > EVENT_CTL_BPF_ENABLE ? "on" : "off",
+		 cfg.syscall.tcp_conn_request > EVENT_CTL_BPF_ENABLE ? "on" : "off",
+		 (cfg.syscall.tcp_send_reset > EVENT_CTL_BPF_ENABLE ||
+		  cfg.syscall.tcp_receive_reset > EVENT_CTL_BPF_ENABLE) ? "on" : "off",
+		 cfg.tcp_open_conns ? "on" : "off",
+		 cfg.syscall.sys_openat > EVENT_CTL_BPF_ENABLE ? "on" : "off",
+		 (cfg.syscall.sys_read > EVENT_CTL_BPF_ENABLE ||
+		  cfg.syscall.sys_write > EVENT_CTL_BPF_ENABLE) ? "+bytes" : "",
+		 cfg.syscall.icmp_rcv > EVENT_CTL_BPF_ENABLE ? "on" : "off",
+		 cfg.disk_metrics ? "on" : "off", (long long)cfg.max_data_size);
 
 	/* Главный цикл — refresh, снапшот и перезагрузка конфигурации */
 	time_t last_snapshot = 0;
@@ -4178,7 +3601,7 @@ int main(int argc, char *argv[])
 			cpu_prev_count = 0;
 			snapshot_reset();
 			initial_scan();
-			if (cfg.need_sock_map)
+			if (g_need_sock_map)
 				seed_sock_map();
 
 			/* Сбрасываем таймеры после перезагрузки */

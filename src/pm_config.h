@@ -41,14 +41,7 @@ struct pm_config {
 	long long   ringbuf_sec;
 	long long   ringbuf_cgroup;
 
-	/* ── Сеть ─────────────────────────────────────────────── */
-	int         net_tracking_enabled;
-	int         net_track_bytes;
-	int         need_sock_map;          /* net_tracking || TCP-security */
-
-	/* ── Файлы ────────────────────────────────────────────── */
-	int         file_tracking_enabled;
-	int         file_track_bytes;
+	/* ── Файлы (опции, не emit) ───────────────────────────── */
 	int         file_absolute_paths_only;
 	struct file_prefix file_include[FILE_MAX_PREFIXES];
 	int         file_include_count;
@@ -61,7 +54,7 @@ struct pm_config {
 	char        docker_daemon_json[PATH_MAX_LEN];
 
 	/* ── Диск ─────────────────────────────────────────────── */
-	int         disk_tracking_enabled;
+	int         disk_metrics;
 	char        disk_include[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
 	int         disk_include_count;
 	char        disk_exclude[DISK_MAX_PREFIXES][DISK_PREFIX_MAX];
@@ -69,40 +62,86 @@ struct pm_config {
 	char        disk_fs_types[DISK_MAX_PREFIXES][DISK_FS_TYPE_LEN];
 	int         disk_fs_types_count;
 
-	/* ── Security probes ──────────────────────────────────── */
-	int         tcp_retransmit;
-	int         tcp_syn;
-	int         tcp_rst;
-	int         icmp_tracking;
+	/* ── Прочее (subsystem-level, без event_type) ───────────── */
 	int         tcp_open_conns;
 
-	/* ── Emit flags (какие события отправлять в CSV) ──────── */
+	/* ── Настройки перехвата syscall/tracepoint (0/1/2) ───── */
+	/* Имя поля = имя перехватываемого syscall/tracepoint    */
 	struct {
-		int exec;
-		int fork;
-		int exit;
-		int oom_kill;
-		int signal;
-		int chdir;
-		int file_open;
-		int file_close;
-		int file_rename;
-		int file_unlink;
-		int file_truncate;
-		int file_chmod;
-		int file_chown;
-		int net_listen;
-		int net_connect;
-		int net_accept;
-		int net_close;
-		int tcp_retransmit;
-		int syn_recv;
-		int rst;
-		int cgroup;
-	} emit;
+		/* process_event */
+		enum event_ctl_mode sched_process_exec;
+		enum event_ctl_mode sched_process_fork;
+		enum event_ctl_mode sched_process_exit;
+		enum event_ctl_mode mark_victim;
+		enum event_ctl_mode sched_switch;
+		enum event_ctl_mode signal_generate;
+		enum event_ctl_mode sys_chdir;
+		/* file_event */
+		enum event_ctl_mode sys_openat;
+		enum event_ctl_mode sys_close;
+		enum event_ctl_mode sys_read;
+		enum event_ctl_mode sys_pread64;
+		enum event_ctl_mode sys_readv;
+		enum event_ctl_mode sys_write;
+		enum event_ctl_mode sys_pwrite64;
+		enum event_ctl_mode sys_writev;
+		enum event_ctl_mode sys_sendfile64;
+		enum event_ctl_mode sys_fsync;
+		enum event_ctl_mode sys_fdatasync;
+		enum event_ctl_mode sys_socket;
+		enum event_ctl_mode sys_rename;
+		enum event_ctl_mode sys_unlink;
+		enum event_ctl_mode sys_truncate;
+		enum event_ctl_mode sys_fchmodat;
+		enum event_ctl_mode sys_fchownat;
+		/* net_event */
+		enum event_ctl_mode inet_csk_listen_start;
+		enum event_ctl_mode tcp_connect;
+		enum event_ctl_mode inet_csk_accept;
+		enum event_ctl_mode tcp_close;
+		enum event_ctl_mode tcp_sendmsg;
+		enum event_ctl_mode tcp_recvmsg;
+		enum event_ctl_mode udp_sendmsg;
+		enum event_ctl_mode udp_recvmsg;
+		enum event_ctl_mode tcp_retransmit_skb;
+		enum event_ctl_mode tcp_conn_request;
+		enum event_ctl_mode tcp_send_reset;
+		enum event_ctl_mode tcp_receive_reset;
+		enum event_ctl_mode icmp_rcv;
+		/* cgroup_event */
+		enum event_ctl_mode cgroup_mkdir;
+		enum event_ctl_mode cgroup_rmdir;
+		enum event_ctl_mode cgroup_rename;
+		enum event_ctl_mode cgroup_release;
+		enum event_ctl_mode cgroup_attach_task;
+		enum event_ctl_mode cgroup_transfer_tasks;
+		enum event_ctl_mode cgroup_notify_populated;
+		enum event_ctl_mode cgroup_notify_frozen;
+		enum event_ctl_mode cgroup_freeze;
+		enum event_ctl_mode cgroup_unfreeze;
+	} syscall;
 };
 
 /* Глобальный экземпляр конфигурации */
 extern struct pm_config cfg;
+
+/* ── Config initialization and BPF program control ───────────────── */
+
+struct process_metrics_bpf;
+
+int  init_event_ctl(struct process_metrics_bpf *s);
+void apply_event_ctl_disable(void);
+int  compute_need_sock_map(void);
+
+/* ── Config file loading ─────────────────────────────────────────── */
+
+int load_config(const char *path);
+int parse_rules_from_config(const char *path);
+void free_rules(void);
+
+/* ── Event emission checks (used by ring buffer callbacks) ───────── */
+
+int event_emit_enabled(enum event_type type);
+int should_emit_event(enum event_type type);
 
 #endif /* PM_CONFIG_H */

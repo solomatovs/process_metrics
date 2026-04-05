@@ -45,10 +45,8 @@ static int should_emit_snapshot(void)
 
 static int should_emit_conn_snapshot(void)
 {
-	return cfg.net_tracking_enabled && cfg.http.enabled;
+	return g_need_sock_map && cfg.http.enabled;
 }
-
-
 
 /* ── snapshot-only helpers ───────────────────────────────────────── */
 
@@ -258,9 +256,8 @@ void write_snapshot(void)
 			dead_keys[dead_count++] = key;
 		}
 
-		const char *rule_name = (tracked && pi.rule_id < num_rules)
-					    ? rules[pi.rule_id].name
-					    : RULE_NOT_MATCH;
+		const char *rule_name =
+		    (tracked && pi.rule_id < num_rules) ? rules[pi.rule_id].name : RULE_NOT_MATCH;
 
 		/* Вычисление времён */
 		double uptime_sec = mono_now - (double)pi.start_ns / 1e9;
@@ -346,11 +343,13 @@ void write_snapshot(void)
 					fast_strcpy(cev.event_type, sizeof(cev.event_type),
 						    "conn_snapshot");
 					struct proc_info conn_pi;
-					if (bpf_map_lookup_elem(proc_map_fd, &si.tgid, &conn_pi) == 0) {
+					if (bpf_map_lookup_elem(proc_map_fd, &si.tgid, &conn_pi) ==
+					    0) {
 						cev.root_pid = conn_pi.root_pid;
 						cev.is_root = conn_pi.is_root;
 						if (conn_pi.rule_id < num_rules)
-							fill_rule(&cev, rules[conn_pi.rule_id].name);
+							fill_rule(&cev,
+								  rules[conn_pi.rule_id].name);
 						fill_from_proc_info(&cev, &conn_pi);
 					}
 					{
@@ -417,12 +416,11 @@ void write_snapshot(void)
 					  (rs.drop_file_ops - prev_rs.drop_file_ops) +
 					  (rs.drop_net - prev_rs.drop_net) +
 					  (rs.drop_sec - prev_rs.drop_sec) +
-					  (rs.drop_cgroup - prev_rs.drop_cgroup) +
-					  (rs.drop_missed_exec - prev_rs.drop_missed_exec);
+					  (rs.drop_cgroup - prev_rs.drop_cgroup);
 			if (new_drops > 0) {
 				LOG_WARN("ringbuf drops: proc=%llu/%llu file=%llu/%llu "
 					 "file_ops=%llu/%llu net=%llu/%llu sec=%llu/%llu "
-					 "cgroup=%llu/%llu missed_exec_overflow=%llu",
+					 "cgroup=%llu/%llu",
 					 (unsigned long long)rs.drop_proc,
 					 (unsigned long long)rs.total_proc,
 					 (unsigned long long)rs.drop_file,
@@ -434,8 +432,7 @@ void write_snapshot(void)
 					 (unsigned long long)rs.drop_sec,
 					 (unsigned long long)rs.total_sec,
 					 (unsigned long long)rs.drop_cgroup,
-					 (unsigned long long)rs.total_cgroup,
-					 (unsigned long long)rs.drop_missed_exec);
+					 (unsigned long long)rs.total_cgroup);
 			} else if (cfg.log_level >= 2) {
 				LOG_DEBUG(cfg.log_level,
 					  "ringbuf totals: proc=%llu file=%llu net=%llu sec=%llu "

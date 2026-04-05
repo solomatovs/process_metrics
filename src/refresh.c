@@ -30,7 +30,6 @@
 #include "pm_config.h"
 #include "pm_state.h"
 #include "pm_functions.h"
-#include "csv_format.h"
 #include "constants.h"
 #include "process_metrics.skel.h"
 #include "log.h"
@@ -97,8 +96,8 @@ void read_cgroup_cpu_max(const char *cg_path, long long *quota, long long *perio
 /*
  * Чтение cpu.stat: парсинг nr_periods, nr_throttled, throttled_usec.
  */
-void read_cgroup_cpu_stat(const char *cg_path, long long *nr_periods,
-			  long long *nr_throttled, long long *throttled_usec)
+void read_cgroup_cpu_stat(const char *cg_path, long long *nr_periods, long long *nr_throttled,
+			  long long *throttled_usec)
 {
 	*nr_periods = -1;
 	*nr_throttled = -1;
@@ -296,39 +295,6 @@ int flush_dead_keys(__u32 *keys, int count)
 void refresh_processes(void)
 {
 	refresh_boot_to_wall();
-
-	/* ── Drain missed_exec_map: восстановление процессов, потерянных
-	 * при ring buffer drop в handle_exec. BPF сохранил tgid→ppid,
-	 * здесь читаем cmdline из /proc и сопоставляем с правилами. */
-	{
-		__u32 tgid, next_tgid, ppid;
-		int err = bpf_map_get_next_key(missed_exec_fd, NULL, &tgid);
-		while (err == 0) {
-			/* Сохраняем следующий ключ до удаления текущего */
-			int has_next =
-			    (bpf_map_get_next_key(missed_exec_fd, &tgid, &next_tgid) == 0);
-
-			if (bpf_map_lookup_elem(missed_exec_fd, &tgid, &ppid) == 0) {
-				bpf_map_delete_elem(missed_exec_fd, &tgid);
-				pidtree_store_ts(tgid, ppid);
-				/* try_track_pid читает /proc/pid/cmdline,
-				 * сопоставляет с правилами и при совпадении
-				 * создаёт proc_map + proc_info + tags */
-				int rule = try_track_pid(tgid);
-				if (rule >= 0) {
-					pwd_read_and_store(tgid);
-					LOG_INFO("EXEC_RECOVERY: pid=%u ppid=%u"
-						 " rule=%s (ring buffer drop)",
-						 tgid, ppid, rules[rule].name);
-				}
-			}
-
-			if (!has_next)
-				break;
-			tgid = next_tgid;
-			err = 0;
-		}
-	}
 
 	/* Пакетное чтение proc_map.
 	 * all_values может быть NULL если malloc не удался (proc_info

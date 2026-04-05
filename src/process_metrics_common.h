@@ -57,7 +57,6 @@
 /* ── ёмкости BPF map (не ring buffer) ─────────────────────────────── */
 #define BPF_ARGS_MAP_SIZE    8192  /* временные аргументы syscall (per-CPU inflight) */
 #define BPF_FD_MAP_SIZE	     65536 /* отслеживание файловых дескрипторов */
-#define BPF_MISSED_EXEC_SIZE 1024  /* пропущенные exec для восстановления */
 #define BPF_ICMP_AGG_SIZE    8192  /* агрегация ICMP-трафика */
 
 /* ── poll-потоки и heartbeat ───────────────────────────────────────── */
@@ -147,7 +146,6 @@ struct ringbuf_stats {
 	__u64 total_net;	/* всего событий net */
 	__u64 total_sec;	/* всего событий sec */
 	__u64 total_cgroup;	/* всего событий cgroup */
-	__u64 drop_missed_exec; /* missed_exec_map overflow (ENOSPC) */
 };
 
 /*
@@ -194,6 +192,29 @@ enum event_type {
 	EVENT_CGROUP_UNFREEZE = 28,
 	EVENT_CGROUP_FROZEN = 29,
 };
+
+#define EVENT_TYPE_MAX 31 /* макс. значение event_type + 1 */
+
+/*
+ * enum event_ctl_mode — три уровня активации события:
+ *
+ *   bpf_enable       (0) — BPF-программа загружена (перехват работает),
+ *                           но событие НЕ генерируется в ring buffer
+ *                           и НЕ отправляется в CSV.
+ *
+ *   bpf_event_enable (1) — BPF-программа загружена + событие генерируется
+ *                           в ring buffer. Userspace обрабатывает (state
+ *                           management), но НЕ отправляет в CSV.
+ *
+ *   event_enable     (2) — полный pipeline: BPF + ring buffer + CSV emit.
+ */
+#ifndef __BPF__
+enum event_ctl_mode {
+	EVENT_CTL_BPF_ENABLE       = 0,
+	EVENT_CTL_BPF_EVENT_ENABLE = 1,
+	EVENT_CTL_EVENT_ENABLE     = 2,
+};
+#endif
 
 /* ── состояние жизненного цикла процесса ────────────────────────── */
 
@@ -249,6 +270,7 @@ struct cgroup_event {
 /*
  * Конфигурация, передаваемая из пространства пользователя в BPF через карты.
  */
+
 struct file_config {
 	__u8 enabled;		  /* 1 = отслеживать open/close */
 	__u8 track_bytes;	  /* 1 = также считать байты чтения/записи по fd */

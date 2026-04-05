@@ -82,6 +82,12 @@ static __always_inline void _bpf_copy(void *dst, const void *src, unsigned int s
 /* Макс. событий exec в секунду, отправляемых в кольцевой буфер. 0 = без ограничений. */
 volatile const __u32 max_exec_events_per_sec = 0;
 
+/* pid (tid в терминах ядра) == tgid означает group leader (основной поток) */
+static __always_inline bool is_thread(__u32 pid, __u32 tgid)
+{
+	return pid != tgid;
+}
+
 /* ── карты (maps) ─────────────────────────────────────────────────── */
 
 struct {
@@ -177,6 +183,19 @@ static __always_inline void rb_stat_inc(__u64 offset)
 		__sync_fetch_and_add((__u64 *)((char *)s + offset), 1);
 }
 
+/*
+ * Макросы статистики ring buffer'ов.
+ *
+ * Каждый BPF-обработчик вызывает RB_STAT_TOTAL_*() перед bpf_ringbuf_reserve,
+ * а при переполнении (reserve вернул NULL) — RB_STAT_DROP_*().
+ *
+ * Userspace читает эти счётчики в heartbeat и логирует дельты:
+ *   "ringbuf drops: proc=N file=M net=K ..."
+ *
+ * Реализация: __builtin_offsetof вычисляет смещение поля в struct ringbuf_stats
+ * на этапе компиляции. rb_stat_inc инкрементирует поле по смещению через
+ * __sync_fetch_and_add — атомарный инкремент, безопасный для per-CPU карты.
+ */
 #define RB_STAT_TOTAL_PROC() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_proc))
 #define RB_STAT_TOTAL_FILE() rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, total_file))
 #define RB_STAT_TOTAL_FILE_OPS() \
@@ -208,20 +227,6 @@ struct {
 	__type(key, __u32);
 	__type(value, struct proc_info);
 } scratch_pi SEC(".maps");
-
-/*
- * missed_exec_map: fallback при ring buffer drop в handle_exec.
- * Когда ringbuf_reserve не удаётся для нового (не fork-наследованного)
- * процесса, BPF сохраняет tgid → ppid в эту карту. Userspace периодически
- * дрейнит её и вызывает try_track_pid() для восстановления.
- * Без этого процесс полностью теряется — ни snapshot, ни exit не увидят его.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, BPF_MISSED_EXEC_SIZE);
-	__type(key, __u32);   /* tgid */
-	__type(value, __u32); /* ppid */
-} missed_exec_map SEC(".maps");
 
 /* ── ограничитель частоты ─────────────────────────────────────────── */
 
@@ -600,108 +605,79 @@ static __always_inline __u16 read_cmdline(struct task_struct *task, char *dst)
  * Заполняет comm = group leader, thread_name = текущий поток.
  * Для главного потока (tid == tgid) оба совпадают.
  */
-static __always_inline void read_comm_and_thread(
-	char *comm,
-	int comm_sz,
-	char *thread_name,
-	int thread_sz
-)
+static __always_inline void read_comm_and_thread_task(struct task_struct *task, char *comm,
+						      int comm_sz, char *thread_name, int thread_sz)
 {
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 	struct task_struct *leader = BPF_CORE_READ(task, group_leader);
 	if (leader)
 		bpf_probe_read_kernel_str(comm, comm_sz, &leader->comm);
 	else
-		bpf_get_current_comm(comm, comm_sz);
-	bpf_get_current_comm(thread_name, thread_sz);
+		bpf_probe_read_kernel_str(comm, comm_sz, &task->comm);
+	bpf_probe_read_kernel_str(thread_name, thread_sz, &task->comm);
 }
 
-/* ── EXEC ─────────────────────────────────────────────────────────── */
+static __always_inline void read_comm_and_thread(char *comm, int comm_sz, char *thread_name,
+						 int thread_sz)
+{
+	read_comm_and_thread_task((struct task_struct *)bpf_get_current_task(), comm, comm_sz,
+				  thread_name, thread_sz);
+}
+
+/* ── Общие хелперы заполнения событий ────────────────────────────── */
 
 /*
- * Tracepoint sched_process_exec — срабатывает при вызове execve/execveat,
- * когда процесс заменяет свой образ новой программой.
- * В этот момент PID уже существует (создан через fork), но загружается
- * новый бинарник — обновляются comm, cmdline, mm и другие метаданные.
- * Используем для перечитывания информации о процессе после exec.
+ * fill_event_base — заполняет базовые поля события.
+ * Свежие данные читаются из task_struct (comm, uid, cgroup, identity,
+ * tty, sched_policy, пространства имён).
+ * Накопленные/неизменяемые — из proc_info (ppid, start_ns, cmdline,
+ * root_pid, rule_id).
  */
-SEC("tracepoint/sched/sched_process_exec")
-int handle_exec(void *ctx)
+static __always_inline void fill_event_base(struct event *e, struct task_struct *task,
+					    const struct proc_info *pi)
 {
-	__u64 pid_tgid = bpf_get_current_pid_tgid();
-	__u32 tgid = (__u32)(pid_tgid >> 32);
-
-	/* Пропускаем задачи ядра (PID 0) сразу */
-	if (tgid == 0)
-		return 0;
-
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-
-	/* Если уже отслеживается (унаследовано через fork), обновляем
-	 * cmdline/comm в proc_map и НЕ отправляем event — userspace
-	 * всё равно вернул бы return 0 (already tracked).
-	 * Это экономит место в ring buffer при интенсивном fork+exec. */
-	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (info) {
-		read_comm_and_thread(
-			info->comm,
-			sizeof(info->comm),
-			info->thread_name,
-			sizeof(info->thread_name)
-		);
-		info->cgroup_id = bpf_get_current_cgroup_id();
-		info->cmdline_len = read_cmdline(task, info->cmdline);
-		read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
-		info->sched_policy = BPF_CORE_READ(task, policy);
-		read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum, &info->net_ns_inum,
-			      &info->cgroup_ns_inum);
-		return 0;
-	}
-
-	/* ppid */
-	struct task_struct *parent = BPF_CORE_READ(task, real_parent);
-	__u32 ppid = parent ? BPF_CORE_READ(parent, tgid) : 0;
-
-	/* Новый процесс — отправляем event для сопоставления правил в userspace */
-	RB_STAT_TOTAL_PROC();
-	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e) {
-		RB_STAT_DROP_PROC();
-		/* Сохраняем tgid→ppid в fallback-карту, чтобы userspace мог
-		 * обнаружить и отследить процесс через try_track_pid().
-		 * Без этого процесс полностью теряется. */
-		if (bpf_map_update_elem(&missed_exec_map, &tgid, &ppid, BPF_NOEXIST) != 0)
-			rb_stat_inc(__builtin_offsetof(struct ringbuf_stats, drop_missed_exec));
-		return 0;
-	}
-
-	/* Обнуляем структуру события (требование BPF-верификатора) */
-	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type = EVENT_EXEC;
-	e->tgid = tgid;
-	e->ppid = ppid;
-	/* UID текущего процесса (младшие 32 бита uid_gid) */
-	e->uid = (__u32)bpf_get_current_uid_gid();
-	/* Время с момента загрузки системы, включая suspend (нс) */
 	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	/* ID cgroup v2, в которой работает процесс */
-	e->cgroup_id = bpf_get_current_cgroup_id();
-	/* Время старта процесса из task_struct (CO-RE) */
-	e->start_ns = BPF_CORE_READ(task, start_time);
-	/* Имя процесса (group leader) и имя потока */
-	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
-	/* Полная командная строка из mm->arg_start..arg_end (читается из RAM
-	 * процесса через bpf_probe_read_user, без обращения к диску/VFS) */
-	e->cmdline_len = read_cmdline(task, e->cmdline);
-	/* loginuid, sessionid (audit) и effective UID */
+
+	/* Свежее из task */
+	read_comm_and_thread_task(task, e->comm, sizeof(e->comm), e->thread_name,
+				  sizeof(e->thread_name));
+	e->uid = BPF_CORE_READ(task, cred, uid.val);
+	e->cgroup_id = BPF_CORE_READ(task, cgroups, dfl_cgrp, kn, id);
 	read_identity(task, &e->loginuid, &e->sessionid, &e->euid);
-	/* Политика планировщика (SCHED_NORMAL, SCHED_FIFO и т.д.) */
+	e->tty_nr = read_tty_nr(task);
 	e->sched_policy = BPF_CORE_READ(task, policy);
-	/* Номера inode namespace'ов: mnt, pid, net, cgroup */
 	read_ns_inums(task, &e->mnt_ns_inum, &e->pid_ns_inum, &e->net_ns_inum, &e->cgroup_ns_inum);
 
-	bpf_ringbuf_submit(e, 0);
-	return 0;
+	/* Из proc_info (накопленное / установленное при fork) */
+	e->ppid = pi->ppid;
+	e->start_ns = pi->start_ns;
+	e->cmdline_len = pi->cmdline_len;
+	_bpf_copy(e->cmdline, pi->cmdline, CMDLINE_MAX);
+	e->root_pid = pi->root_pid;
+	e->rule_id = pi->rule_id;
+}
+
+/*
+ * fill_event_metrics — копирует накопленные метрики из proc_info.
+ * Используется в exit и oom_kill.
+ */
+static __always_inline void fill_event_metrics(struct event *e, const struct proc_info *pi)
+{
+	e->cpu_ns = pi->cpu_ns;
+	e->rss_pages = pi->rss_pages;
+	e->rss_min_pages = pi->rss_min_pages;
+	e->rss_max_pages = pi->rss_max_pages;
+	e->vsize_pages = pi->vsize_pages;
+	e->threads = pi->threads;
+	e->oom_score_adj = pi->oom_score_adj;
+	e->oom_killed = pi->oom_killed;
+	e->net_tcp_tx_bytes = pi->net_tcp_tx_bytes;
+	e->net_tcp_rx_bytes = pi->net_tcp_rx_bytes;
+	e->net_udp_tx_bytes = pi->net_udp_tx_bytes;
+	e->net_udp_rx_bytes = pi->net_udp_rx_bytes;
+	e->io_rchar = pi->io_rchar;
+	e->io_wchar = pi->io_wchar;
+	e->io_syscr = pi->io_syscr;
+	e->io_syscw = pi->io_syscw;
 }
 
 /* ── FORK (raw tracepoint для доступа к task_struct потомка) ───────── */
@@ -716,7 +692,7 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	__u32 child_tgid = BPF_CORE_READ(child, tgid);
 
 	/* Обрабатываем только fork процессов, не clone потоков */
-	if (child_pid != child_tgid)
+	if (is_thread(child_pid, child_tgid))
 		return 0;
 
 	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
@@ -769,16 +745,62 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type = EVENT_FORK;
 	e->tgid = child_tgid;
-	e->ppid = parent_tgid;
-	e->uid = child_pi->uid;
-	e->loginuid = child_pi->loginuid;
-	e->sessionid = child_pi->sessionid;
-	e->euid = child_pi->euid;
-	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	e->cgroup_id = child_pi->cgroup_id;
-	e->start_ns = child_pi->start_ns;
-	__builtin_memcpy(e->comm, child_pi->comm, sizeof(e->comm));
-	__builtin_memcpy(e->thread_name, child_pi->thread_name, sizeof(e->thread_name));
+	fill_event_base(e, child, child_pi);
+
+	bpf_ringbuf_submit(e, 0);
+	return 0;
+}
+
+/* ── EXEC ─────────────────────────────────────────────────────────── */
+
+/*
+ * Tracepoint sched_process_exec — срабатывает при вызове execve/execveat,
+ * когда процесс заменяет свой образ новой программой.
+ * В этот момент PID уже существует (создан через fork), но загружается
+ * новый бинарник — обновляются comm, cmdline, mm и другие метаданные.
+ * Используем для перечитывания информации о процессе после exec.
+ */
+SEC("tracepoint/sched/sched_process_exec")
+int handle_exec(void *ctx)
+{
+	__u64 pid_tgid = bpf_get_current_pid_tgid();
+	__u32 tgid = (__u32)(pid_tgid >> 32);
+
+	/* Пропускаем задачи ядра (PID 0) сразу */
+	if (tgid == 0)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
+	/* Если уже в proc_map (создан через fork) — обновляем метаданные после exec */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (!info)
+		return 0;
+
+	/* Обновляем proc_info: exec меняет программу, обновляем все метаданные */
+	read_comm_and_thread(info->comm, sizeof(info->comm), info->thread_name,
+			     sizeof(info->thread_name));
+	info->uid = (__u32)bpf_get_current_uid_gid();
+	info->cgroup_id = bpf_get_current_cgroup_id();
+	info->cmdline_len = read_cmdline(task, info->cmdline);
+	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
+	info->tty_nr = read_tty_nr(task);
+	info->sched_policy = BPF_CORE_READ(task, policy);
+	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum, &info->net_ns_inum,
+		      &info->cgroup_ns_inum);
+
+	/* Отправляем событие EXEC в ring buffer */
+	RB_STAT_TOTAL_PROC();
+	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
+	if (!e) {
+		RB_STAT_DROP_PROC();
+		return 0;
+	}
+
+	BPF_ZERO_PTR(e, sizeof(*e));
+	e->type = EVENT_EXEC;
+	e->tgid = tgid;
+	fill_event_base(e, task, info);
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -816,19 +838,22 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	__u32 tid = (__u32)pid_tgid;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
+	/* Пропускаем задачи ядра (PID 0) сразу */
+	if (tgid == 0)
+		return 0;
+
+	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+
 	/*
 	 * Обновляем tid_tgid_map для текущего (prev) процесса ДО проверки
 	 * proc_map: нужно знать TGID+comm всех процессов в системе,
 	 * чтобы резолвить имена потоков-вытеснителей.
-	 *
-	 * Обновляем только если TID != TGID (т.е. это дочерний поток),
-	 * потому что для главного потока comm совпадает с preempted_by_comm.
 	 */
-	if (tid != tgid) {
-		struct tid_info *existing = bpf_map_lookup_elem(&tid_tgid_map, &tid);
-		if (!existing) {
+	if (is_thread(tid, tgid)) {
+		struct tid_info *thread_id = bpf_map_lookup_elem(&tid_tgid_map, &tid);
+		if (!thread_id) {
 			struct task_struct *leader;
-			struct task_struct *curr = (struct task_struct *)bpf_get_current_task();
+			struct task_struct *curr = task;
 			struct tid_info ti = {.tgid = tgid};
 
 			leader = BPF_CORE_READ(curr, group_leader);
@@ -841,47 +866,20 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		}
 	}
 
-	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-
-	/* Если процесса нет в proc_map — создаём минимальную запись.
-	 * Это catch-all: процессы, пропущенные fork/exec/initial_scan,
-	 * попадают в proc_map при первом sched_switch. */
-	if (!info) {
-		__u32 sk = 0;
-		struct proc_info *new_pi = bpf_map_lookup_elem(&scratch_pi, &sk);
-		if (!new_pi)
-			return 0;
-		BPF_ZERO_PTR(new_pi, sizeof(*new_pi));
-		new_pi->tgid = tgid;
-		new_pi->ppid = BPF_CORE_READ(task, real_parent, tgid);
-		new_pi->uid = (__u32)bpf_get_current_uid_gid();
-		new_pi->cgroup_id = bpf_get_current_cgroup_id();
-		new_pi->start_ns = BPF_CORE_READ(task, start_time);
-		new_pi->rule_id = RULE_ID_NONE;
-		read_comm_and_thread(new_pi->comm, sizeof(new_pi->comm),
-				     new_pi->thread_name, sizeof(new_pi->thread_name));
-		read_identity(task, &new_pi->loginuid, &new_pi->sessionid, &new_pi->euid);
-		new_pi->tty_nr = read_tty_nr(task);
-		new_pi->sched_policy = BPF_CORE_READ(task, policy);
-		read_ns_inums(task, &new_pi->mnt_ns_inum, &new_pi->pid_ns_inum,
-			      &new_pi->net_ns_inum, &new_pi->cgroup_ns_inum);
-		if (bpf_map_update_elem(&proc_map, &tgid, new_pi, BPF_NOEXIST) != 0)
-			return 0;
-		info = bpf_map_lookup_elem(&proc_map, &tgid);
-		if (!info)
-			return 0;
-	}
+	struct proc_info *pid_info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (!pid_info)
+		return 0;
 
 	/* Память (страницы) — RSS, разделяемая, подкачка */
 	struct mem_info mi = read_mem_pages(task);
-	info->rss_pages = mi.rss_pages;
-	info->shmem_pages = mi.shmem_pages;
-	info->swap_pages = mi.swap_pages;
-	if (mi.rss_pages > 0 && (info->rss_min_pages == 0 || mi.rss_pages < info->rss_min_pages))
-		info->rss_min_pages = mi.rss_pages;
-	if (mi.rss_pages > info->rss_max_pages)
-		info->rss_max_pages = mi.rss_pages;
+	pid_info->rss_pages = mi.rss_pages;
+	pid_info->shmem_pages = mi.shmem_pages;
+	pid_info->swap_pages = mi.swap_pages;
+	if (mi.rss_pages > 0 &&
+	    (pid_info->rss_min_pages == 0 || mi.rss_pages < pid_info->rss_min_pages))
+		pid_info->rss_min_pages = mi.rss_pages;
+	if (mi.rss_pages > pid_info->rss_max_pages)
+		pid_info->rss_max_pages = mi.rss_pages;
 
 	/*
 	 * CPU (нс) — дельта-трекинг по task->utime + task->stime.
@@ -899,7 +897,7 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		__u64 *prev = bpf_map_lookup_elem(&thread_cpu_map, &tid);
 		if (prev) {
 			if (thr_cpu > *prev)
-				__sync_fetch_and_add(&info->cpu_ns, thr_cpu - *prev);
+				__sync_fetch_and_add(&pid_info->cpu_ns, thr_cpu - *prev);
 			*prev = thr_cpu;
 		} else {
 			bpf_map_update_elem(&thread_cpu_map, &tid, &thr_cpu, BPF_NOEXIST);
@@ -907,25 +905,25 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 	}
 
 	/* Виртуальная память (страницы) */
-	info->vsize_pages = read_vsize_pages(task);
+	pid_info->vsize_pages = read_vsize_pages(task);
 
 	/* Количество потоков */
-	info->threads = read_nr_threads(task);
+	pid_info->threads = read_nr_threads(task);
 
 	/* Корректировка OOM score */
-	info->oom_score_adj = read_oom_score_adj(task);
+	pid_info->oom_score_adj = read_oom_score_adj(task);
 
 	/* Байты IO (фактические чтения/записи на диск) */
-	read_io_bytes(task, &info->io_read_bytes, &info->io_write_bytes);
+	read_io_bytes(task, &pid_info->io_read_bytes, &pid_info->io_write_bytes);
 
 	/* Страничные отказы */
-	read_faults(task, &info->maj_flt, &info->min_flt);
+	read_faults(task, &pid_info->maj_flt, &pid_info->min_flt);
 
 	/* Переключения контекста */
-	read_ctxsw(task, &info->nvcsw, &info->nivcsw);
+	read_ctxsw(task, &pid_info->nvcsw, &pid_info->nivcsw);
 
 	/* Cgroup — может измениться при перемещении процесса между cgroup */
-	info->cgroup_id = bpf_get_current_cgroup_id();
+	pid_info->cgroup_id = bpf_get_current_cgroup_id();
 
 	/* Состояние процесса — task->__state (ядро 5.14+), task->state (ядро < 5.14) */
 	unsigned int task_state = 0;
@@ -933,25 +931,25 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		task_state = BPF_CORE_READ(task, __state);
 	else
 		task_state = (unsigned int)BPF_CORE_READ((struct task_struct___old *)task, state);
-	info->state = state_to_char(task_state);
+	pid_info->state = state_to_char(task_state);
 
 	/* UID — обновляем при каждом sched_switch (может измениться через setuid) */
-	info->uid = (__u32)bpf_get_current_uid_gid();
+	pid_info->uid = (__u32)bpf_get_current_uid_gid();
 
 	/* Identity: loginuid, sessionid, euid */
-	read_identity(task, &info->loginuid, &info->sessionid, &info->euid);
-	info->tty_nr = read_tty_nr(task);
+	read_identity(task, &pid_info->loginuid, &pid_info->sessionid, &pid_info->euid);
+	pid_info->tty_nr = read_tty_nr(task);
 
 	/* Политика планировщика */
-	info->sched_policy = BPF_CORE_READ(task, policy);
+	pid_info->sched_policy = BPF_CORE_READ(task, policy);
 
 	/* Учёт ввода-вывода (включая page cache) */
-	read_io_accounting(task, &info->io_rchar, &info->io_wchar, &info->io_syscr,
-			   &info->io_syscw);
+	read_io_accounting(task, &pid_info->io_rchar, &pid_info->io_wchar, &pid_info->io_syscr,
+			   &pid_info->io_syscw);
 
 	/* Номера inode пространств имён */
-	read_ns_inums(task, &info->mnt_ns_inum, &info->pid_ns_inum, &info->net_ns_inum,
-		      &info->cgroup_ns_inum);
+	read_ns_inums(task, &pid_info->mnt_ns_inum, &pid_info->pid_ns_inum, &pid_info->net_ns_inum,
+		      &pid_info->cgroup_ns_inum);
 
 	/*
 	 * Отслеживание вытеснения: prev_state == 0 означает TASK_RUNNING,
@@ -971,14 +969,15 @@ int handle_sched_switch(struct sched_switch_args *ctx)
 		 */
 		struct tid_info *ti = bpf_map_lookup_elem(&tid_tgid_map, &next_tid);
 		if (ti) {
-			info->preempted_by_pid = ti->tgid;
-			__builtin_memcpy(info->preempted_by_comm, ti->comm, COMM_LEN);
+			pid_info->preempted_by_pid = ti->tgid;
+			__builtin_memcpy(pid_info->preempted_by_comm, ti->comm, COMM_LEN);
 		} else {
-			info->preempted_by_pid = next_tid;
-			bpf_probe_read_kernel(info->preempted_by_comm, COMM_LEN, ctx->next_comm);
+			pid_info->preempted_by_pid = next_tid;
+			bpf_probe_read_kernel(pid_info->preempted_by_comm, COMM_LEN,
+					      ctx->next_comm);
 		}
-		info->preempted_by_comm[COMM_LEN - 1] = '\0';
-		info->preempted_by_cgroup_id = 0;
+		pid_info->preempted_by_comm[COMM_LEN - 1] = '\0';
+		pid_info->preempted_by_cgroup_id = 0;
 	}
 
 	return 0;
@@ -994,7 +993,7 @@ int handle_exit(void *ctx)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
 	/* Cleanup tid_tgid_map для завершающегося потока (до проверки tracked) */
-	if (pid != tgid)
+	if (is_thread(pid, tgid))
 		bpf_map_delete_elem(&tid_tgid_map, &pid);
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -1012,7 +1011,13 @@ int handle_exit(void *ctx)
 	}
 
 	/* Для потоков (не лидера) — только дельта+cleanup, без события */
-	if (pid != tgid)
+	if (is_thread(pid, tgid))
+		return 0;
+
+	/* Без proc_info нет данных для exit-события.
+	 * Процесс мог не попасть в proc_map (пропущен fork/exec/scan). */
+	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
+	if (!info)
 		return 0;
 
 	/* Финальный снимок метрик из task_struct */
@@ -1023,12 +1028,6 @@ int handle_exit(void *ctx)
 	__u32 final_exit_code = BPF_CORE_READ(task, exit_code);
 	__u64 exit_ts = bpf_ktime_get_boot_ns();
 
-	/* Safety: без proc_info нет данных для exit-события.
-	 * В нормальном режиме не срабатывает — sched_switch создаёт
-	 * proc_info для всех процессов. */
-	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (!info)
-		return 0;
 	info->status = PROC_STATUS_EXITED;
 	info->exit_ns = exit_ts;
 	info->exit_code = final_exit_code;
@@ -1040,62 +1039,26 @@ int handle_exit(void *ctx)
 	/* Отправляем событие EXIT в ring buffer */
 	RB_STAT_TOTAL_PROC();
 	struct event *e = bpf_ringbuf_reserve(&events_proc, sizeof(*e), 0);
-	if (!e) {
+	if (e) {
+		BPF_ZERO_PTR(e, sizeof(*e));
+		e->type = EVENT_EXIT;
+		e->tgid = tgid;
+		fill_event_base(e, task, info);
+		fill_event_metrics(e, info);
+
+		/* Финальные метрики (свежее из task, перезаписывает значения из pi) */
+		e->rss_pages = exit_mi.rss_pages;
+		e->vsize_pages = final_vsize;
+		e->threads = final_threads;
+		e->oom_score_adj = final_oom_adj;
+		e->exit_code = final_exit_code;
+
+		bpf_ringbuf_submit(e, 0);
+	} else {
 		RB_STAT_DROP_PROC();
-		bpf_map_delete_elem(&proc_map, &tgid);
-		return 0;
 	}
 
-	BPF_ZERO_PTR(e, sizeof(*e));
-	e->type = EVENT_EXIT;
-	e->tgid = tgid;
-	e->uid = (__u32)bpf_get_current_uid_gid();
-	e->timestamp_ns = exit_ts;
-	read_comm_and_thread(e->comm, sizeof(e->comm), e->thread_name, sizeof(e->thread_name));
-
-	/* Данные отслеживания (из proc_info) */
-	e->root_pid = info->root_pid;
-	e->rule_id = info->rule_id;
-
-	/* Финальные метрики */
-	e->rss_pages = exit_mi.rss_pages;
-	e->vsize_pages = final_vsize;
-	e->threads = final_threads;
-	e->oom_score_adj = final_oom_adj;
-	e->exit_code = final_exit_code;
-
-	/* Накопленные метрики из proc_info */
-	e->cpu_ns = info->cpu_ns;
-	e->rss_min_pages = info->rss_min_pages;
-	e->rss_max_pages = info->rss_max_pages;
-	e->start_ns = info->start_ns;
-	e->cgroup_id = info->cgroup_id;
-	e->ppid = info->ppid;
-	e->cmdline_len = info->cmdline_len;
-	e->oom_killed = info->oom_killed;
-	e->net_tcp_tx_bytes = info->net_tcp_tx_bytes;
-	e->net_tcp_rx_bytes = info->net_tcp_rx_bytes;
-	e->net_udp_tx_bytes = info->net_udp_tx_bytes;
-	e->net_udp_rx_bytes = info->net_udp_rx_bytes;
-	_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
-
-	e->loginuid = info->loginuid;
-	e->sessionid = info->sessionid;
-	e->euid = info->euid;
-	e->tty_nr = info->tty_nr;
-	e->sched_policy = info->sched_policy;
-	e->io_rchar = info->io_rchar;
-	e->io_wchar = info->io_wchar;
-	e->io_syscr = info->io_syscr;
-	e->io_syscw = info->io_syscw;
-	e->mnt_ns_inum = info->mnt_ns_inum;
-	e->pid_ns_inum = info->pid_ns_inum;
-	e->net_ns_inum = info->net_ns_inum;
-	e->cgroup_ns_inum = info->cgroup_ns_inum;
-
-	bpf_ringbuf_submit(e, 0);
-
-	/* proc_map удаляем после submit — info указатель использовался выше. */
+	/* proc_map удаляем всегда — процесс завершился */
 	bpf_map_delete_elem(&proc_map, &tgid);
 
 	return 0;
@@ -1114,8 +1077,9 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	__u32 tgid = BPF_CORE_READ(task, tgid);
 
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
-	if (info)
-		info->oom_killed = 1;
+	if (!info)
+		return 0;
+	info->oom_killed = 1;
 
 	/* Отправляем событие OOM_KILL в пространство пользователя */
 	RB_STAT_TOTAL_PROC();
@@ -1128,25 +1092,8 @@ int handle_mark_victim(struct bpf_raw_tracepoint_args *ctx)
 	BPF_ZERO_PTR(e, sizeof(*e));
 	e->type = EVENT_OOM_KILL;
 	e->tgid = tgid;
-	e->uid = (__u32)bpf_get_current_uid_gid();
-	e->timestamp_ns = bpf_ktime_get_boot_ns();
-	bpf_probe_read_kernel_str(e->comm, sizeof(e->comm), BPF_CORE_READ(task, comm));
-
-	if (info) {
-		e->ppid = info->ppid;
-		e->cgroup_id = info->cgroup_id;
-		e->rss_pages = info->rss_pages;
-		e->rss_min_pages = info->rss_min_pages;
-		e->rss_max_pages = info->rss_max_pages;
-		e->cpu_ns = info->cpu_ns;
-		e->start_ns = info->start_ns;
-		e->cmdline_len = info->cmdline_len;
-		e->loginuid = info->loginuid;
-		e->sessionid = info->sessionid;
-		e->euid = info->euid;
-		e->tty_nr = info->tty_nr;
-		_bpf_copy(e->cmdline, info->cmdline, CMDLINE_MAX);
-	}
+	fill_event_base(e, task, info);
+	fill_event_metrics(e, info);
 
 	bpf_ringbuf_submit(e, 0);
 	return 0;
@@ -1212,12 +1159,8 @@ int handle_signal_generate(struct bpf_raw_tracepoint_args *ctx)
 	se->sig = sig;
 	se->sig_code = code;
 	se->sig_result = result;
-	read_comm_and_thread(
-		se->sender_comm,
-		sizeof(se->sender_comm),
-		se->sender_thread_name,
-		sizeof(se->sender_thread_name)
-	);
+	read_comm_and_thread(se->sender_comm, sizeof(se->sender_comm), se->sender_thread_name,
+			     sizeof(se->sender_thread_name));
 
 	/* cgroup id получателя (target) — event привязан к target */
 	se->cgroup_id = BPF_CORE_READ(target, cgroups, dfl_cgrp, kn, id);
@@ -1554,7 +1497,6 @@ static __always_inline int do_rename(const char *oldname, const char *newname)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
 	if (!fc || !fc->enabled)
@@ -1615,7 +1557,6 @@ static __always_inline int do_unlink(const char *pathname, int unlink_flags)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -1679,7 +1620,6 @@ int handle_truncate(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
 	if (!fc || !fc->enabled)
@@ -1728,7 +1668,6 @@ int handle_ftruncate(struct trace_event_raw_sys_enter *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-
 
 	__u32 key0 = 0;
 	struct file_config *fc = bpf_map_lookup_elem(&file_cfg, &key0);
@@ -2217,7 +2156,6 @@ int handle_fchmodat_enter(struct trace_event_raw_sys_enter *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-
 	const char *filename = (const char *)ctx->args[1];
 	__u32 mode = (__u32)ctx->args[2];
 
@@ -2251,7 +2189,6 @@ int handle_fchownat_enter(struct trace_event_raw_sys_enter *ctx)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-
 
 	const char *filename = (const char *)ctx->args[1];
 	__u32 uid = (__u32)ctx->args[2];
@@ -2475,7 +2412,6 @@ int BPF_KRETPROBE(krp_tcp_v4_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-
 	struct sock_info si;
 	BPF_ZERO(si);
 	si.tgid = tgid;
@@ -2526,7 +2462,6 @@ int BPF_KRETPROBE(krp_tcp_v6_connect, int ret)
 	struct sock *sk = (struct sock *)sk_ptr;
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-
 	struct sock_info si;
 	BPF_ZERO(si);
 	si.tgid = tgid;
@@ -2561,7 +2496,6 @@ int BPF_KRETPROBE(krp_inet_csk_accept, struct sock *sk)
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 	__u64 sk_ptr = (__u64)sk;
 
-
 	struct sock_info si;
 	BPF_ZERO(si);
 	si.tgid = tgid;
@@ -2591,7 +2525,6 @@ int BPF_KPROBE(kp_inet_csk_listen_start, struct sock *sk)
 {
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
-
 
 	__u64 sk_ptr = (__u64)sk;
 	struct sock_info si;
