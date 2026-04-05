@@ -42,6 +42,7 @@
 #include "pm_config.h"
 #include "pm_state.h"
 #include "pm_functions.h"
+#include "pm_rules.h"
 #include "log.h"
 
 /*
@@ -100,11 +101,9 @@ void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 static void fill_proc_info_from_event(struct proc_info *pi, const struct event *e);
-void fill_tags(struct metric_event *cev, __u32 tgid);
 void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
 void fill_pwd(struct metric_event *cev, __u32 tgid);
 void fill_parent_pids(struct metric_event *cev);
-void ensure_tags(__u32 tgid, char *buf, int buflen);
 /* log_ts определён в log.h */
 
 /* Смещение от boot-time к wall-clock (вычисляется однократно при старте,
@@ -122,240 +121,7 @@ void refresh_boot_to_wall(void)
 	g_boot_to_wall_ns = rt_ns - bt_ns;
 }
 
-/* ── tags hash table (userspace-only, per-tgid) ──────────────────── *
- *
- * Хранит строку тегов (pipe-separated список совпавших правил) для каждого
- * отслеживаемого PID. Используется при формировании Prometheus-метрик
- * (snapshot) и event-файлов (exec/fork/exit/file_close/net_close).
- *
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  ОПТИМИЗАЦИЯ 1: Split-layout (hot/cold separation)            │
- * ├─────────────────────────────────────────────────────────────────┤
- * │  Проблема (обнаружена через perf):                            │
- * │  Исходная структура struct tags_entry { __u32 tgid;           │
- * │  char tags[512]; } — 516 байт. Массив 16384 записей = 8 МБ.  │
- * │  При linear probing каждый probe перемещался на 516 байт →    │
- * │  гарантированный L1/L2 cache miss (~100-200 тактов).          │
- * │  perf показал: tags_inherit = ~20% CPU,                       │
- * │  причём 70% времени в них — инструкции mov (чтение tgid).     │
- * │                                                                │
- * │  Решение: разделить на два параллельных массива:              │
- * │  • tags_tgid[16384] — только tgid'ы, 64 KB → в L1/L2 кэш    │
- * │  • tags_data[16384][512] — payload, 8 МБ → только при hit     │
- * │                                                                │
- * │  Probing бегает по compact tags_tgid[] (4 байта на slot) →    │
- * │  соседние слоты в одной cache line (16 tgid на 64-байтовую    │
- * │  линию), cache miss → cache hit.                              │
- * │                                                                │
- * │  Результат: proc drops с 72% до 48% при extreme нагрузке.    │
- * └─────────────────────────────────────────────────────────────────┘
- *
- * ┌─────────────────────────────────────────────────────────────────┐
- * │  ОПТИМИЗАЦИЯ 2: Murmurhash3 вместо tgid & mask                │
- * ├─────────────────────────────────────────────────────────────────┤
- * │  Проблема (обнаружена через perf после opt 1):                │
- * │  PID'ы в Linux последовательные (100500, 100501, 100502...).  │
- * │  Хэш tgid & (SIZE-1) отображает их в соседние слоты →        │
- * │  primary clustering: все PID'ы кучкуются в одном участке      │
- * │  таблицы, probe chains растут до O(n) в кластере.             │
- * │  perf показал: handle_event = 27% CPU, всё на mov — probing.  │
- * │                                                                │
- * │  Решение: murmurhash3 finalizer — битовый микшер, который     │
- * │  превращает последовательные числа в псевдослучайные индексы. │
- * │  PID 100500 → slot 8731, PID 100501 → slot 2049 и т.д.       │
- * │  Средняя длина probe chain при 10% load factor: ~1.05.        │
- * │                                                                │
- * │  Результат: proc drops с 48% до 0% (все события обработаны). │
- * │  handle_event + tags_inherit ушли из top perf полностью.      │
- * └─────────────────────────────────────────────────────────────────┘
- *
- * Итоговый эффект обеих оптимизаций:
- *   До:    585k events, 420k drops (72%), handle_event = 31% CPU
- *   После: 418k events, 0 drops   (0%),  kernel syscalls = 4.7% CPU
- */
-
-/* TAGS_MAX_LEN определён в pm_state.h */
-
-__u32 tags_tgid[TAGS_HT_SIZE];		    /*  64 KB — компактный индекс */
-char tags_data[TAGS_HT_SIZE][TAGS_MAX_LEN]; /*   8 MB — данные           */
-
-/*
- * Murmurhash3 finalizer (32-bit).
- * Принимает tgid, возвращает индекс в [0, TAGS_HT_SIZE).
- *
- * Зачем: PID'ы в Linux назначаются последовательно (N, N+1, N+2, ...).
- * Наивный хэш (tgid & mask) сохраняет последовательность → соседние PID'ы
- * попадают в соседние слоты → primary clustering при linear probing.
- *
- * Murmurhash avalanche: изменение 1 бита во входе меняет ~50% бит выхода.
- * Последовательные PID'ы рассеиваются равномерно по всей таблице.
- *
- * Константы MURMUR3_C1 и MURMUR3_C2 — из оригинального murmurhash3
- * (Austin Appleby), обеспечивают максимальную лавинность для 32-бит.
- */
-static inline __u32 tags_hash(__u32 h)
-{
-	h ^= h >> 16;
-	h *= MURMUR3_C1;
-	h ^= h >> 13;
-	h *= MURMUR3_C2;
-	h ^= h >> 16;
-	return h & (TAGS_HT_SIZE - 1);
-}
-
-/* Предварительное объявление — используется в tags_inherit() */
-int try_track_pid(__u32 pid);
-
-static void tags_store(__u32 tgid, const char *tags)
-{
-	__u32 idx = tags_hash(tgid);
-	for (int i = 0; i < TAGS_HT_SIZE; i++) {
-		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[slot] == 0 || tags_tgid[slot] == tgid) {
-			tags_tgid[slot] = tgid;
-			snprintf(tags_data[slot], TAGS_MAX_LEN, "%s", tags);
-			return;
-		}
-	}
-}
-
-static const char *tags_lookup(__u32 tgid)
-{
-	__u32 idx = tags_hash(tgid);
-	for (int i = 0; i < TAGS_HT_SIZE; i++) {
-		__u32 slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[slot] == tgid)
-			return tags_data[slot];
-		if (tags_tgid[slot] == 0)
-			return "";
-	}
-	return "";
-}
-
-/*
- * Backward-shift deletion для open addressing с linear probing.
- *
- * Простое обнуление слота разрывает цепочки проб: lookup/store
- * останавливаются на «дырке», не находя элементов за ней.
- * Со временем при fork/exit таблица деградирует — цепочки удлиняются,
- * lookup сканирует тысячи слотов.
- *
- * Алгоритм: после удаления, сдвигаем элементы из последующих
- * слотов назад, пока не встретим пустой слот или элемент,
- * который уже на своём естественном месте.
- */
-static void tags_remove(__u32 tgid)
-{
-	__u32 idx = tags_hash(tgid);
-	__u32 slot = 0;
-	int found = 0;
-
-	/* Найти элемент */
-	for (int i = 0; i < TAGS_HT_SIZE; i++) {
-		slot = (idx + i) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[slot] == tgid) {
-			found = 1;
-			break;
-		}
-		if (tags_tgid[slot] == 0)
-			return; /* не найден */
-	}
-	if (!found)
-		return;
-
-	/* Backward-shift: заполняем дырку сдвигом последующих элементов */
-	for (;;) {
-		__u32 next = (slot + 1) & (TAGS_HT_SIZE - 1);
-		if (tags_tgid[next] == 0)
-			break; /* цепочка закончилась */
-
-		/* Естественная позиция следующего элемента */
-		__u32 natural = tags_hash(tags_tgid[next]);
-
-		/* Нужно ли сдвигать next в slot?
-		 * Да, если natural позиция next находится до или на slot
-		 * (с учётом кольцевой арифметики).
-		 * Т.е. slot лежит между natural и next (включительно). */
-		__u32 d_natural_to_next = (next - natural) & (TAGS_HT_SIZE - 1);
-		__u32 d_natural_to_slot = (slot - natural) & (TAGS_HT_SIZE - 1);
-
-		if (d_natural_to_slot < d_natural_to_next) {
-			/* Сдвигаем next → slot */
-			tags_tgid[slot] = tags_tgid[next];
-			memcpy(tags_data[slot], tags_data[next], TAGS_MAX_LEN);
-			slot = next;
-		} else {
-			/* next уже на правильной стороне, дырку оставляем */
-			break;
-		}
-	}
-
-	/* Очищаем финальный пустой слот */
-	tags_tgid[slot] = 0;
-	tags_data[slot][0] = '\0';
-}
-
-/*
- * Наследование тегов от родителя к дочернему процессу.
- * ВАЖНО: НЕ вызывает try_track_pid() — это привело бы к deadlock,
- * т.к. tags_inherit_ts() уже держит wrlock на g_tags_lock, а
- * try_track_pid() → tags_store_ts() попыталась бы взять wrlock
- * повторно (pthread_rwlock_wrlock НЕ рекурсивный → UB/deadlock).
- * Резолв неизвестного родителя — ответственность вызывающего кода.
- */
-static void tags_inherit(__u32 child_tgid, __u32 parent_tgid)
-{
-	const char *pt = tags_lookup(parent_tgid);
-	if (pt[0])
-		tags_store(child_tgid, pt);
-}
-
-static void tags_clear(void)
-{
-	memset(tags_tgid, 0, sizeof(tags_tgid));
-	memset(tags_data, 0, sizeof(tags_data));
-}
-
-/*
- * Thread-safe обёртки для tags_*.
- * _ts_ версии берут g_tags_lock и копируют результат в caller-буфер.
- * Нелокированные версии используются внутри секций, где lock уже взят.
- */
-static void tags_lookup_ts(__u32 tgid, char *buf, int buflen)
-{
-	pthread_rwlock_rdlock(&g_tags_lock);
-	const char *t = tags_lookup(tgid);
-	snprintf(buf, buflen, "%s", t);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-
-static void tags_store_ts(__u32 tgid, const char *tags)
-{
-	pthread_rwlock_wrlock(&g_tags_lock);
-	tags_store(tgid, tags);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-
-void tags_inherit_ts(__u32 child, __u32 parent)
-{
-	pthread_rwlock_wrlock(&g_tags_lock);
-	tags_inherit(child, parent);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-
-void tags_remove_ts(__u32 tgid)
-{
-	pthread_rwlock_wrlock(&g_tags_lock);
-	tags_remove(tgid);
-	pthread_rwlock_unlock(&g_tags_lock);
-}
-
-static void tags_clear_ts(void)
-{
-	pthread_rwlock_wrlock(&g_tags_lock);
-	tags_clear();
-	pthread_rwlock_unlock(&g_tags_lock);
-}
+/* tags hash table, rule matching — moved to pm_rules.c */
 
 /* ── pid tree: глобальная хеш-таблица pid→ppid для цепочек предков ───
  *
@@ -777,8 +543,21 @@ static void set_event_type(struct metric_event *cev, enum event_type type)
  */
 static void store_proc_info_from_event(const struct event *e)
 {
+	/* Читаем текущий proc_info, чтобы сохранить tracking metadata
+	 * (rule_id, root_pid, is_root), назначенные при fork/initial scan. */
 	struct proc_info pi = {0};
+	bpf_map_lookup_elem(proc_map_fd, &e->tgid, &pi);
+	__u32 saved_root_pid = pi.root_pid;
+	__u16 saved_rule_id = pi.rule_id;
+	__u8 saved_is_root = pi.is_root;
+
 	fill_proc_info_from_event(&pi, e);
+
+	/* Восстанавливаем tracking metadata */
+	pi.root_pid = saved_root_pid;
+	pi.rule_id = saved_rule_id;
+	pi.is_root = saved_is_root;
+
 	bpf_map_update_elem(proc_map_fd, &e->tgid, &pi, BPF_ANY);
 }
 
@@ -863,58 +642,8 @@ void fill_rule(struct metric_event *cev, const char *rname)
 	fast_strcpy(cev->rule, sizeof(cev->rule), rname);
 }
 
-/*
- * Заполняет теги в metric_event из proc_map cmdline → match_rules.
- */
-void fill_tags(struct metric_event *cev, __u32 tgid)
-{
-	ensure_tags(tgid, cev->tags, sizeof(cev->tags));
-}
-
-/*
- * Резолвит имя правила из rule_id.
- */
-static const char *resolve_rule_name(__u16 rule_id)
-{
-	return (rule_id < num_rules) ? rules[rule_id].name : RULE_NOT_MATCH;
-}
-
-/*
- * Резолвит имя правила для pid из proc_map.
- */
-const char *resolve_rule_for_pid(__u32 tgid)
-{
-	struct proc_info pi;
-	if (is_pid_in_proc_map(tgid, &pi))
-		return resolve_rule_name(pi.rule_id);
-	return RULE_NOT_MATCH;
-}
-
-/*
- * Резолвит имя правила для процесса с fallback на родителя.
- * Используется для OOM/signal когда процесс может быть не в proc_map.
- */
-/*
- * Резолвит правило для proc event (exit/oom).
- * Порядок: BPF rule_id → proc_map → try_track → fallback ppid.
- */
-static const char *resolve_rule_for_proc_event(const struct event *e)
-{
-	/* BPF может передать валидный rule_id */
-	if (e->rule_id < num_rules)
-		return rules[e->rule_id].name;
-
-	/* Попробуем отследить процесс */
-	try_track_pid(e->tgid);
-
-	/* Lookup tgid → fallback ppid */
-	struct proc_info pi;
-	if (is_pid_in_proc_map(e->tgid, &pi))
-		return resolve_rule_name(pi.rule_id);
-	if (e->ppid > 0 && is_pid_in_proc_map(e->ppid, &pi))
-		return resolve_rule_name(pi.rule_id);
-	return RULE_NOT_MATCH;
-}
+/* fill_tags, resolve_rule_name, resolve_rule_for_pid,
+ * resolve_rule_for_proc_event — moved to pm_rules.c */
 
 static const char *event_type_name(enum event_type type)
 {
@@ -1294,35 +1023,13 @@ void pwd_read_and_store(__u32 tgid)
 	}
 }
 
-/*
- * Сопоставляет cmdline со ВСЕМИ правилами, формирует строку тегов
- * через разделитель '|'. Возвращает индекс первого совпавшего правила
- * или -1, если совпадений нет.
- */
-static int match_rules_all(const char *cmdline, char *tags, int tags_size)
-{
-	int first = -1;
-	int off = 0;
-	for (int i = 0; i < num_rules; i++) {
-		if (regexec(&rules[i].regex, cmdline, 0, NULL, 0) != 0)
-			continue;
-		if (first < 0)
-			first = i;
-		if (off > 0 && off < tags_size - 1)
-			tags[off++] = '|';
-		int n = snprintf(tags + off, tags_size - off, "%s", rules[i].name);
-		if (n > 0 && off + n < tags_size)
-			off += n;
-	}
-	if (off == 0 && tags_size > 0)
-		tags[0] = '\0';
-	return first;
-}
+/* match_rules_all, apply_rule_and_tags, try_track_pid,
+ * ensure_tags_from_cmdline, ensure_tags — moved to pm_rules.c */
 
-/* Предварительные объявления для try_track_pid */
-static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
-int read_proc_cmdline(__u32 pid, char *dst, int dstlen);
+/* Предварительные объявления */
+void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
 static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid, __u8 is_root);
+
 /*
  * Попытка начать отслеживание неизвестного PID через чтение /proc/<pid>/cmdline.
  * Вызывается, когда file_close/net_close/oom_kill/exit приходит для PID,
@@ -1340,65 +1047,8 @@ int try_track_pid(__u32 pid)
 	char cmdline_str[CMDLINE_MAX + 1];
 	cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str, sizeof(cmdline_str));
 
-	char tags_buf[TAGS_MAX_LEN];
-	int first = match_rules_all(cmdline_str, tags_buf, sizeof(tags_buf));
-	if (first < 0)
-		return -1;
-	if (rules[first].ignore)
-		return -1;
-
-	track_pid_from_proc(pid, first, pid, 1);
-	tags_store_ts(pid, tags_buf);
-	LOG_DEBUG(cfg.log_level, "LATE_TRACK: pid=%u rule=%s tags=%s cmdline=%.60s", pid,
-		  rules[first].name, tags_buf, cmdline_str);
-	return first;
-}
-
-/*
- * Гарантирует заполнение tags для PID.
- * Если tags_ht пуст (fork event ещё не обработан) — читает cmdline,
- * матчит правила и сохраняет в tags_ht + копирует в buf.
- */
-/*
- * ensure_tags_from_cmdline — матчит теги по готовому cmdline (raw, NUL-separated).
- * Общая логика для ensure_tags и ensure_tags_bpf_event.
- */
-static void ensure_tags_from_cmdline(__u32 tgid, char *buf, int buflen, const char *cmdline_raw,
-				     int cmdline_len)
-{
-	if (cmdline_len <= 0)
-		return;
-
-	char cmdline_str[CMDLINE_MAX + 1];
-	int clen = cmdline_len < CMDLINE_MAX ? cmdline_len : CMDLINE_MAX - 1;
-	cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str, sizeof(cmdline_str));
-
-	char tags_buf[TAGS_MAX_LEN];
-	if (match_rules_all(cmdline_str, tags_buf, sizeof(tags_buf)) >= 0) {
-		tags_store_ts(tgid, tags_buf);
-		snprintf(buf, buflen, "%s", tags_buf);
-	}
-}
-
-/*
- * ensure_tags — гарантирует наличие тегов для процесса.
- * Источник cmdline: proc_map BPF-карта (O(1) hash lookup).
- * Используется для событий без встроенного cmdline (file, net, signal, snapshot).
- */
-void ensure_tags(__u32 tgid, char *buf, int buflen)
-{
-	tags_lookup_ts(tgid, buf, buflen);
-	if (buf[0])
-		return;
-
-	if (proc_map_fd < 0)
-		return;
-
-	struct proc_info pi;
-	if (bpf_map_lookup_elem(proc_map_fd, &tgid, &pi) != 0 || pi.cmdline_len == 0)
-		return;
-
-	ensure_tags_from_cmdline(tgid, buf, buflen, pi.cmdline, pi.cmdline_len);
+	track_pid_from_proc(pid, RULE_ID_NONE, 0, 0);
+	return apply_rule_and_tags(pid, cmdline_str);
 }
 
 /* ── Кэш использования CPU (для вычисления отношения за интервал) ── */
@@ -2064,7 +1714,7 @@ static int handle_cgroup_event(void *ctx, void *data, size_t size)
 
 /* ── вспомогательные функции ──────────────────────────────────────── */
 
-static void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen)
+void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen)
 {
 	int n = len < outlen - 1 ? len : outlen - 1;
 	for (int i = 0; i < n; i++)
@@ -2595,13 +2245,21 @@ static __s16 read_proc_oom(__u32 pid)
 struct scan_entry {
 	__u32 pid;
 	__u32 ppid;
+	__u32 flags; /* task->flags из /proc/pid/stat (PF_KTHREAD и др.) */
 };
+
+#define PF_KTHREAD 0x00200000
+
+static inline int scan_is_kthread(const struct scan_entry *e)
+{
+	return e->flags & PF_KTHREAD;
+}
 
 /*
  * Начать отслеживание процесса: обновить tracking-поля в proc_map.
  * Если запись в proc_map уже есть — обновляет поля.
  */
-static void start_tracking(__u32 pid, int rule_id, __u32 root_pid, __u8 is_root)
+void start_tracking(__u32 pid, int rule_id, __u32 root_pid, __u8 is_root)
 {
 	struct proc_info pi;
 	if (bpf_map_lookup_elem(proc_map_fd, &pid, &pi) == 0) {
@@ -2630,23 +2288,6 @@ static void track_pid_from_proc(__u32 pid, int rule_id, __u32 root_pid, __u8 is_
 
 	/* Заполняем pwd-кэш через readlink /proc/PID/cwd */
 	pwd_read_and_store(pid);
-}
-
-static void add_descendants(struct scan_entry *entries, int count, __u32 parent, int rule_id,
-			    __u32 root_pid, int *tracked)
-{
-	for (int i = 0; i < count; i++) {
-		if (entries[i].ppid != parent)
-			continue;
-		__u32 child = entries[i].pid;
-		/* Пропускаем, если уже в proc_map */
-		if (is_pid_in_proc_map(child, NULL))
-			continue;
-		track_pid_from_proc(child, rule_id, root_pid, 0);
-		tags_inherit_ts(child, parent);
-		(*tracked)++;
-		add_descendants(entries, count, child, rule_id, root_pid, tracked);
-	}
 }
 
 /* ── seed_sock_map: заполнение sock_map существующими сокетами ─────── */
@@ -2748,6 +2389,55 @@ static void seed_sock_map(void)
 	}
 }
 
+/*
+ * scan_tree_apply — рекурсивный обход дерева процессов сверху вниз.
+ * Для каждого процесса:
+ *   1. Наследует tags от parent (tags_inherit)
+ *   2. Match rules + merge tags (apply_rule_and_tags)
+ *   3. Назначает rule если ещё нет
+ *   4. Рекурсивно обрабатывает children
+ *
+ * Порядок гарантирует: parent всегда обработан раньше child.
+ */
+static void scan_tree_apply(struct scan_entry *entries, int count,
+			    __u32 parent_pid, __u32 skip_pid)
+{
+	for (int i = 0; i < count; i++) {
+		if (entries[i].ppid != parent_pid)
+			continue;
+		__u32 pid = entries[i].pid;
+		if (pid == skip_pid || pid <= 1)
+			continue;
+		if (scan_is_kthread(&entries[i]))
+			continue;
+
+		/* 1. Наследуем tags от parent */
+		tags_inherit_ts(pid, parent_pid);
+
+		/* 2. Наследуем rule от parent (до match — унаследованный rule
+		 *    имеет приоритет над собственным match) */
+		struct proc_info pi, parent_pi;
+		if (is_pid_in_proc_map(pid, &pi) && pi.rule_id == RULE_ID_NONE &&
+		    is_pid_in_proc_map(parent_pid, &parent_pi) &&
+		    parent_pi.rule_id != RULE_ID_NONE) {
+			start_tracking(pid, parent_pi.rule_id, parent_pi.root_pid, 0);
+		}
+
+		/* 3. Match rules + merge tags (rule уже назначен — не перезапишет) */
+		char cmdline_raw[CMDLINE_MAX];
+		int clen = read_proc_cmdline(pid, cmdline_raw, sizeof(cmdline_raw));
+		if (clen > 0) {
+			char cmdline_str[CMDLINE_MAX + 1];
+			cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str,
+				       sizeof(cmdline_str));
+			apply_rule_and_tags(pid, cmdline_str);
+		}
+
+		/* 4. Рекурсия: обрабатываем children */
+		scan_tree_apply(entries, count, pid, skip_pid);
+	}
+}
+
 static void initial_scan(void)
 {
 	LOG_INFO("initial scan: reading /proc...");
@@ -2786,10 +2476,12 @@ static void initial_scan(void)
 		if (!rp)
 			continue;
 		int ppid = 0;
-		sscanf(rp + 2, "%*c %d", &ppid);
+		unsigned int flags = 0;
+		sscanf(rp + 2, "%*c %d %*d %*d %*d %*d %u", &ppid, &flags);
 
 		entries[count].pid = (__u32)pid;
 		entries[count].ppid = (__u32)ppid;
+		entries[count].flags = (__u32)flags;
 		count++;
 	}
 	closedir(pd);
@@ -2798,37 +2490,81 @@ static void initial_scan(void)
 	for (int i = 0; i < count; i++)
 		pidtree_store(entries[i].pid, entries[i].ppid);
 
-	/* Проход 2: сопоставляем cmdline с правилами, находим корневые процессы */
-	int tracked = 0;
+	/* Проход 2: добавляем все userspace-процессы, тегируем через rules */
+	int tracked = 0, kthreads = 0;
 	for (int i = 0; i < count; i++) {
 		__u32 pid = entries[i].pid;
 		if (pid == our_pid || pid <= 1)
 			continue;
 
-		char cmdline_raw[CMDLINE_MAX];
-		int clen = read_proc_cmdline(pid, cmdline_raw, sizeof(cmdline_raw));
-		if (clen <= 0)
+		/* Пропускаем ядерные потоки (PF_KTHREAD) */
+		if (scan_is_kthread(&entries[i])) {
+			kthreads++;
 			continue;
-
-		char cmdline_str[CMDLINE_MAX + 1];
-		cmdline_to_str(cmdline_raw, (__u16)clen, cmdline_str, sizeof(cmdline_str));
-
-		char tags_buf[TAGS_MAX_LEN];
-		int first = match_rules_all(cmdline_str, tags_buf, sizeof(tags_buf));
-		if (first >= 0 && !rules[first].ignore) {
-			/* Корневое совпадение */
-			track_pid_from_proc(pid, first, pid, 1);
-			tags_store_ts(pid, tags_buf);
-			tracked++;
-			LOG_DEBUG(cfg.log_level, "SCAN: pid=%u rule=%s tags=%s cmdline=%.60s", pid,
-				  rules[first].name, tags_buf, cmdline_str);
-
-			/* Находим всех потомков */
-			add_descendants(entries, count, pid, first, pid, &tracked);
 		}
+
+		/* Добавляем в proc_map без rule (RULE_ID_NONE) */
+		track_pid_from_proc(pid, RULE_ID_NONE, 0, 0);
+		tracked++;
 	}
 
-	LOG_INFO("initial scan: %d processes scanned, %d tracked", count, tracked);
+	/* Проход 3: рекурсивный обход дерева сверху вниз.
+	 * Гарантирует что parent обработан раньше child:
+	 * tags наследуются от parent, потом обогащаются match'ем child.
+	 * Находим корни: процессы чей ppid отсутствует среди pid в entries. */
+	{
+		/* Собираем hash set всех pid (open addressing, linear probing) */
+		#define PID_SET_SIZE 16384
+		static __u32 pid_set[PID_SET_SIZE];
+		memset(pid_set, 0, sizeof(pid_set));
+		for (int i = 0; i < count; i++) {
+			__u32 p = entries[i].pid;
+			__u32 h = p & (PID_SET_SIZE - 1);
+			for (int j = 0; j < PID_SET_SIZE; j++) {
+				__u32 slot = (h + j) & (PID_SET_SIZE - 1);
+				if (pid_set[slot] == 0) { pid_set[slot] = p; break; }
+				if (pid_set[slot] == p) break;
+			}
+		}
+		/* Lookup */
+		#define PID_SET_HAS(p) ({ \
+			int _found = 0; \
+			__u32 _h = (p) & (PID_SET_SIZE - 1); \
+			for (int _j = 0; _j < PID_SET_SIZE && pid_set[(_h + _j) & (PID_SET_SIZE - 1)]; _j++) { \
+				if (pid_set[(_h + _j) & (PID_SET_SIZE - 1)] == (p)) { _found = 1; break; } \
+			} \
+			_found; \
+		})
+		/* Находим к��рни: процессы чей ppid не в pid_set */
+		for (int i = 0; i < count; i++) {
+			__u32 ppid = entries[i].ppid;
+			if (!PID_SET_HAS(ppid)) {
+				__u32 pid = entries[i].pid;
+				if (pid == our_pid) continue;
+				if (scan_is_kthread(&entries[i])) continue;
+				/* Обработать сам корень (пропускаем pid<=1 для rule/tags,
+				 * но всё равно рекурсируем в потомков) */
+				if (pid > 1) {
+					char cmdline_raw[CMDLINE_MAX];
+					int clen = read_proc_cmdline(pid, cmdline_raw,
+								     sizeof(cmdline_raw));
+					if (clen > 0) {
+						char cmdline_str[CMDLINE_MAX + 1];
+						cmdline_to_str(cmdline_raw, (__u16)clen,
+							       cmdline_str, sizeof(cmdline_str));
+						apply_rule_and_tags(pid, cmdline_str);
+					}
+				}
+				/* Обработать потомков (всегда, даже для pid=1) */
+				scan_tree_apply(entries, count, pid, our_pid);
+			}
+		}
+		#undef PID_SET_SIZE
+		#undef PID_SET_HAS
+	}
+
+	LOG_INFO("initial scan: %d processes, %d tracked, %d kernel threads skipped",
+		 count, tracked, kthreads);
 }
 
 /* ── обработчик событий кольцевого буфера ─────────────────────────── */
@@ -3039,43 +2775,26 @@ static int handle_event(void *ctx, void *data, size_t size)
 		if (size < sizeof(struct event))
 			return 0;
 		const struct event *e = data;
-		/* Обновляем глобальное дерево pid (exec может быть первым появлением) */
 		pidtree_store_ts(e->tgid, e->ppid);
 
-		/* Уже в proc_map? BPF обновил proc_info, нам делать нечего */
-		if (is_pid_in_proc_map(e->tgid, NULL))
-			return 0;
-
-		/* Преобразуем cmdline из BPF (нуль-разделённые аргументы) в строку */
+		/* exec меняет программу — match rules, обогатить tags,
+		 * назначить rule если ещё нет (RULE_ID_NONE). */
 		char cmdline[CMDLINE_MAX + 1];
 		cmdline_to_str(e->cmdline, e->cmdline_len, cmdline, sizeof(cmdline));
+		apply_rule_and_tags(e->tgid, cmdline);
 
-		/* Проверяем все правила (regexec × N правил) — тяжёлый, но exec редкий */
-		char tags_buf[TAGS_MAX_LEN];
-		int first = match_rules_all(cmdline, tags_buf, sizeof(tags_buf));
+		pwd_read_and_store(e->tgid);
+		store_proc_info_from_event(e);
 
-		if (first >= 0 && !rules[first].ignore) {
-			/* Совпадение — начинаем отслеживание */
-			start_tracking(e->tgid, first, e->tgid, 1);
-			tags_store_ts(e->tgid, tags_buf);
-			pwd_read_and_store(e->tgid);
-
-			store_proc_info_from_event(e);
-
-			LOG_DEBUG(cfg.log_level, "TRACK: pid=%u rule=%s tags=%s comm=%.16s",
-				  e->tgid, rules[first].name, tags_buf, e->comm);
-
-			/* Отправляем exec-событие в буферный файл (→ ClickHouse) */
-			if (should_emit_event(EVENT_EXEC)) {
-				struct metric_event cev;
-				struct event_ctx ctx = {EVENT_EXEC,	 e->tgid,      e->uid,
-							e->timestamp_ns, e->cgroup_id, e->comm,
-							e->thread_name};
-				prepare_metric_event(&cev, &ctx);
-				fill_from_proc_event(&cev, e);
-				finalize_metric_event(&cev, e->tgid);
-				ef_append(&cev, cfg.hostname);
-			}
+		if (should_emit_event(EVENT_EXEC)) {
+			struct metric_event cev;
+			struct event_ctx ctx = {EVENT_EXEC,	 e->tgid,      e->uid,
+						e->timestamp_ns, e->cgroup_id, e->comm,
+						e->thread_name};
+			prepare_metric_event(&cev, &ctx);
+			fill_from_proc_event(&cev, e);
+			finalize_metric_event(&cev, e->tgid);
+			ef_append(&cev, cfg.hostname);
 		}
 		return 0;
 	}

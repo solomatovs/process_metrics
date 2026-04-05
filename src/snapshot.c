@@ -25,6 +25,7 @@
 #include "pm_config.h"
 #include "pm_state.h"
 #include "pm_functions.h"
+#include "pm_rules.h"
 #include "constants.h"
 #include "process_metrics.skel.h"
 #include "log.h"

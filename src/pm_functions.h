@@ -47,7 +47,6 @@ void fill_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_identity_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_metrics_from_proc_info(struct metric_event *cev, const struct proc_info *pi);
 void fill_from_sock_info(struct metric_event *cev, const struct sock_info *si, __u64 boot_ns);
-void fill_tags(struct metric_event *cev, __u32 tgid);
 void fill_cgroup(struct metric_event *cev, __u64 cgroup_id);
 void fill_cgroup_metrics(struct metric_event *cev);
 void fill_pwd(struct metric_event *cev, __u32 tgid);
@@ -56,10 +55,7 @@ void fill_pwd(struct metric_event *cev, __u32 tgid);
 void fast_strcpy(char *dst, int cap, const char *src);
 void cmdline_split(const char *raw, __u16 len, char *exec_out, int exec_len,
 		   char *args_out, int args_len);
-
-/* ── Tags ────────────────────────────────────────────────────────── */
-void ensure_tags(__u32 tgid, char *buf, int buflen);
-void tags_inherit_ts(__u32 child, __u32 parent);
+void cmdline_to_str(const char *raw, __u16 len, char *out, int outlen);
 
 /* ── Pidtree ─────────────────────────────────────────────────────── */
 __u32 pidtree_lookup_in(const __u32 *p_pid, const __u32 *p_ppid, __u32 pid);
@@ -72,7 +68,6 @@ void pwd_inherit_ts(__u32 child, __u32 parent);
 
 /* ── Proc map ────────────────────────────────────────────────────── */
 int is_pid_in_proc_map(__u32 tgid, struct proc_info *pi);
-const char *resolve_rule_for_pid(__u32 tgid);
 
 /* ── CPU prev cache ──────────────────────────────────────────────── */
 __u64 cpu_prev_lookup(__u32 tgid);
@@ -81,7 +76,6 @@ void cpu_prev_update(__u32 tgid, __u64 cpu_ns);
 /* ── Cache removal (thread-safe wrappers) ────────────────────────── */
 void cpu_prev_remove(__u32 tgid);
 void pwd_remove_ts(__u32 tgid);
-void tags_remove_ts(__u32 tgid);
 void pidtree_remove_ts(__u32 pid);
 
 /* ── Dead keys flush ─────────────────────────────────────────────── */

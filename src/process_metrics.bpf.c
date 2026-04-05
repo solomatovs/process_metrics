@@ -88,6 +88,14 @@ static __always_inline bool is_thread(__u32 pid, __u32 tgid)
 	return pid != tgid;
 }
 
+/* Ядерный поток: task->flags & PF_KTHREAD (не имеет userspace-образа) */
+#define PF_KTHREAD 0x00200000
+
+static __always_inline bool is_kthread(struct task_struct *task)
+{
+	return BPF_CORE_READ(task, flags) & PF_KTHREAD;
+}
+
 /* ── карты (maps) ─────────────────────────────────────────────────── */
 
 struct {
@@ -695,6 +703,10 @@ int handle_fork(struct bpf_raw_tracepoint_args *ctx)
 	if (is_thread(child_pid, child_tgid))
 		return 0;
 
+	/* Ядерные потоки не отслеживаются */
+	if (is_kthread(child))
+		return 0;
+
 	__u32 parent_tgid = BPF_CORE_READ(parent, tgid);
 
 	/* Создаём proc_info для потомка через per-CPU scratch buffer
@@ -766,11 +778,13 @@ int handle_exec(void *ctx)
 	__u64 pid_tgid = bpf_get_current_pid_tgid();
 	__u32 tgid = (__u32)(pid_tgid >> 32);
 
-	/* Пропускаем задачи ядра (PID 0) сразу */
+	/* Пропускаем задачи ядра (PID 0) и ядерные потоки */
 	if (tgid == 0)
 		return 0;
 
 	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+	if (is_kthread(task))
+		return 0;
 
 	/* Если уже в proc_map (создан через fork) — обновляем метаданные после exec */
 	struct proc_info *info = bpf_map_lookup_elem(&proc_map, &tgid);
